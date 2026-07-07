@@ -126,10 +126,12 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 #endregion
 
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
-# IMPORTANT: bump this on EVERY push to euc-reports-collectors - the self-update check compares it.
+# IMPORTANT: bump this on EVERY release; the published .version file is derived from it.
 $script:_version      = '2026-07-09.1'
-# Public raw URL the launch-time self-update check reads to see if a newer version exists.
-$script:_updateUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/main/Get-OnPremComponentsData.ps1'
+# Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
+# downloads the full script if a newer version is actually available.
+$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/main/Get-OnPremComponentsData.version'
+$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/main/Get-OnPremComponentsData.ps1'
 $script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
@@ -327,22 +329,28 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
 }
 
 function Invoke-OnPremUpdateCheck {
-    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_updateUrl) { return }
+    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_updateVersionUrl) { return }
     $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
     if (-not $self) { return }
     try {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-        $resp = Invoke-WebRequest -Uri $script:_updateUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
+        # Step 1 (lightweight): read just the tiny version file - a few bytes.
+        $vresp = Invoke-WebRequest -Uri $script:_updateVersionUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
+        $remoteVer = (("$($vresp.Content)" -split "`r?`n") | Where-Object { "$_".Trim() } | Select-Object -First 1)
+        $remoteVer = "$remoteVer".Trim()
+        $rv = ConvertTo-CollectorVersion $remoteVer; $lv = ConvertTo-CollectorVersion $script:_version
+        if (-not $rv) { Write-Log "Update check: unrecognised remote version '$remoteVer' - skipping" 'WARN'; return }
+        if (-not $lv -or $rv -le $lv) { Write-Log "Update check: up to date (local $($script:_version), remote $remoteVer)"; return }
+        Write-Log "Update check: newer version available - local $($script:_version), remote $remoteVer"
+        if (-not (Show-UpdatePrompt $script:_version $remoteVer)) { Write-Log 'Update check: user chose Not now'; return }
+        # Step 2 (only when updating): download the full script.
+        $resp = Invoke-WebRequest -Uri $script:_updateScriptUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
         $content = "$($resp.Content)"
         # Sanity: recognisably our collector, and carries a version line.
         if ($content.Length -lt 20000 -or $content -notmatch 'Get-OnPremComponentsData' -or $content -notmatch "\`$script:_version\s*=\s*'([^']+)'") {
-            Write-Log 'Update check: response not recognised as the collector - skipping' 'WARN'; return
+            Show-MsgBox 'Could not download a valid update; keeping the current version.' -Icon Warning
+            Write-Log 'Update check: downloaded script not recognised - aborting' 'WARN'; return
         }
-        $remoteVer = $matches[1]
-        $rv = ConvertTo-CollectorVersion $remoteVer; $lv = ConvertTo-CollectorVersion $script:_version
-        if (-not $rv -or -not $lv -or $rv -le $lv) { Write-Log "Update check: up to date (local $($script:_version), remote $remoteVer)"; return }
-        Write-Log "Update check: newer version available - local $($script:_version), remote $remoteVer"
-        if (-not (Show-UpdatePrompt $script:_version $remoteVer)) { Write-Log 'Update check: user chose Not now'; return }
         # Validate the download parses before replacing anything.
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ("OnPremCollector-$([guid]::NewGuid().ToString('N')).ps1")
         Set-Content -Path $tmp -Value $content -Encoding UTF8
