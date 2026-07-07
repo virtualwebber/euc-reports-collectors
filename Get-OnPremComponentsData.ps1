@@ -130,8 +130,8 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 $script:_version      = '2026-07-09.1'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
-$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/main/Get-OnPremComponentsData.version'
-$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/main/Get-OnPremComponentsData.ps1'
+$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
+$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.ps1'
 $script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
