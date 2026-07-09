@@ -37,6 +37,13 @@ check is very lightweight.
 | `Get-ProfilesData.ps1` | The user-profile storage collector (the full download served on update). |
 | `Get-ProfilesData.version` | Tiny version marker for the profiles collector. |
 
+## Version numbers
+
+The **authoritative version** of each collector is the plain `YYYY-MM-DD` (or `YYYY-MM-DD.rev`) string held in
+its **`*.version`** file — the same value as the script's `# Version:` header and `$script:_version`. There is
+**no `v` prefix**. A `v` shown anywhere else (the collector's launch dialog, the report footer, or a Git commit
+message) is cosmetic display only; the un-prefixed string in the `.version` file is canonical.
+
 ## Releasing
 
 1. Bump `$script:_version` in the script (`YYYY-MM-DD` or `YYYY-MM-DD.rev`) — it must increase
