@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-09.2   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-09.3   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-09.2'
+$script:_version      = '2026-07-09.3'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -379,7 +379,7 @@ function Show-Splash {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="User Profiles Collector" Height="170" Width="460"
+        Title="User Profiles Collector" Height="170" Width="520"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
         AllowsTransparency="True" Background="Transparent" Topmost="True"
         ShowInTaskbar="True" FontFamily="Segoe UI">
@@ -393,7 +393,8 @@ function Show-Splash {
                        HorizontalAlignment="Center" Margin="0,0,0,6"/>
             <TextBlock x:Name="StatusText" Text="Starting..."
                        FontSize="12" Foreground="#555"
-                       HorizontalAlignment="Center" Margin="0,0,0,18"/>
+                       HorizontalAlignment="Stretch" TextAlignment="Center"
+                       TextTrimming="CharacterEllipsis" Margin="0,0,0,18"/>
             <ProgressBar x:Name="Bar" IsIndeterminate="True"
                          Height="3" Background="#E8EAED" Foreground="#0078D4"
                          BorderThickness="0"/>
