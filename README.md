@@ -9,6 +9,10 @@ Public distribution and **self-update source** for the EUC Reports data collecto
   StoreFront + IIS/TLS hardening, FAS configuration & health (incl. KB5014754 strong certificate
   binding), PVS farm, and performance sampling. Produces one `OnPrem-<server>-<timestamp>.json`
   per server for the Citrix DaaS report.
+- **`Get-ProfilesData.ps1`** — User-profile storage collector (FSLogix / Citrix Profile Management
+  shares, on Azure Files and on-premises SMB): share and root NTFS permissions, per-folder size/file
+  inventory, and evidence of which profile solution is in use. Produces one
+  `<Customer>-Profiles-Data-<timestamp>.json` for the User Profiles report.
 
 ## Self-update
 
@@ -30,6 +34,8 @@ check is very lightweight.
 |---|---|
 | `Get-OnPremComponentsData.ps1` | The collector script (the full download served on update). |
 | `Get-OnPremComponentsData.version` | Tiny version marker read by the launch-time check (a few bytes). |
+| `Get-ProfilesData.ps1` | The user-profile storage collector (the full download served on update). |
+| `Get-ProfilesData.version` | Tiny version marker for the profiles collector. |
 
 ## Releasing
 
