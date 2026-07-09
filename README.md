@@ -13,6 +13,10 @@ Public distribution and **self-update source** for the EUC Reports data collecto
   shares, on Azure Files and on-premises SMB): share and root NTFS permissions, per-folder size/file
   inventory, and evidence of which profile solution is in use. Produces one
   `<Customer>-Profiles-Data-<timestamp>.json` for the User Profiles report.
+- **`Get-AVDData.ps1`** — Azure Virtual Desktop collector (host pools, session hosts, application
+  groups, workspaces, scaling plans, FSLogix storage, Key Vaults, Log Analytics, RBAC) across the
+  selected subscriptions via the Azure ARM APIs. Produces one `<Customer>-AVD-Data-<timestamp>.json`
+  for the AVD report.
 
 ## Self-update
 
@@ -36,6 +40,8 @@ check is very lightweight.
 | `Get-OnPremComponentsData.version` | Tiny version marker read by the launch-time check (a few bytes). |
 | `Get-ProfilesData.ps1` | The user-profile storage collector (the full download served on update). |
 | `Get-ProfilesData.version` | Tiny version marker for the profiles collector. |
+| `Get-AVDData.ps1` | The Azure Virtual Desktop collector (the full download served on update). |
+| `Get-AVDData.version` | Tiny version marker for the AVD collector. |
 
 ## Version numbers
 
