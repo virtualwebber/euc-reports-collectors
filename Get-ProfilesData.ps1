@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Version: 2026-07-09.1   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
