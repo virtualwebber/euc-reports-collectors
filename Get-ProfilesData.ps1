@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# Version: 2026-07-09   (keep in lock-step with $script:_version below and the published .version file)
+﻿#Requires -Version 5.1
+# Version: 2026-07-09.1   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-09'
+$script:_version      = '2026-07-09.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -958,14 +958,18 @@ function Show-ProfilesDialog {
         <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
         <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
 
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-            <Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/>
-            <Button x:Name="OkBtn" Content="Start" Width="100" Padding="0,7" Style="{StaticResource BlueBtn}"/>
-        </StackPanel>
+        <Grid>
+            <TextBlock x:Name="VersionText" Text="" FontSize="10" Foreground="#8a8f98" VerticalAlignment="Center" HorizontalAlignment="Left"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/>
+                <Button x:Name="OkBtn" Content="Start" Width="100" Padding="0,7" Style="{StaticResource BlueBtn}"/>
+            </StackPanel>
+        </Grid>
     </StackPanel>
 </Window>
 '@
     $win = New-ThemedWindow $xaml
+    $win.FindName('VersionText').Text = "v$($script:_version)"
     $customerBox = $win.FindName('CustomerBox')
     $sharesBox   = $win.FindName('SharesBox')
     $fullChk     = $win.FindName('FullChk')
