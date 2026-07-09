@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-09.1   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-09.2   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-09.1'
+$script:_version      = '2026-07-09.2'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -106,6 +106,33 @@ public class ProfilesDwm {
 
 $script:_dwmAttr   = 33
 $script:_dwmSquare = 1
+
+# GetDiskFreeSpaceEx P/Invoke: read a path's hosting-volume capacity + free space. Works on UNC shares
+# over SMB with only read access (no admin/remoting on the file server) and on local paths.
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ProfilesDisk {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetDiskFreeSpaceEx(string lpDirectoryName, out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
+}
+'@
+} catch {}
+
+# Returns @{ CapacityBytes; FreeBytes } for the volume hosting $Path, or $null if it can't be read.
+function Get-PathCapacity ([string]$Path) {
+    if (-not $Path) { return $null }
+    $dir = if ($Path.EndsWith('\')) { $Path } else { "$Path\" }
+    try {
+        $free = [uint64]0; $total = [uint64]0; $totalFree = [uint64]0
+        if ([ProfilesDisk]::GetDiskFreeSpaceEx($dir, [ref]$free, [ref]$total, [ref]$totalFree)) {
+            return @{ CapacityBytes = [long]$total; FreeBytes = [long]$totalFree }
+        }
+    } catch {}
+    return $null
+}
 
 function Set-SquareCorners ([System.Windows.Window]$Window) {
     $Window.Add_SourceInitialized({
@@ -1032,6 +1059,8 @@ function Invoke-ShareCollection ([string]$Entry, [bool]$Full, [bool]$AzAvailable
         RootFiles       = @()
         TotalBytes      = [long]0
         TotalFiles      = [long]0
+        CapacityBytes   = $null
+        FreeBytes       = $null
         FolderCount     = 0
         Errors          = @()
         DurationSec     = 0
@@ -1113,6 +1142,15 @@ function Invoke-ShareCollection ([string]$Entry, [bool]$Full, [bool]$AzAvailable
     # ── Reachability + root NTFS ACL ──
     $smbReachable = $false
     try { $smbReachable = Test-Path -LiteralPath $path -ErrorAction Stop } catch { $smbReachable = $false }
+
+    # Share capacity ("max size"). Azure: derived from the share quota; on-prem/local: the hosting volume.
+    if ($share['AzureShare'] -and $share['AzureShare'].QuotaGiB) {
+        $share['CapacityBytes'] = [long]$share['AzureShare'].QuotaGiB * 1GB
+        if ($null -ne $share['AzureShare'].UsageBytes) { $share['FreeBytes'] = [long]$share['CapacityBytes'] - [long]$share['AzureShare'].UsageBytes }
+    } elseif ($smbReachable) {
+        $cap = Get-PathCapacity $path
+        if ($cap) { $share['CapacityBytes'] = $cap.CapacityBytes; $share['FreeBytes'] = $cap.FreeBytes }
+    }
     $share['Reachable'] = [bool]$smbReachable
     if ($smbReachable) {
         $share['RootAcl'] = Get-RootNtfsAcl $path
