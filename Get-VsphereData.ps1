@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-10   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-10.1   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -40,6 +40,10 @@ param(
     [string]$Customer,
     [string]$OutputPath,
     [int]$ReadySamples = 15,
+    [int]$DurationMinutes = 30,
+    [switch]$NoPerf,
+    [switch]$HostsOnly,
+    [switch]$NoLiveView,
     [System.Security.SecureString]$EncryptPassword,
     [switch]$NoSplash,
     [switch]$SkipUpdateCheck
@@ -48,7 +52,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-10'
+$script:_version = '2026-07-10.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -69,7 +73,25 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     $script:_iwrExtra['SkipCertificateCheck'] = $true
     $script:_iwrExtra['SkipHttpErrorCheck']   = $true
 } else {
-    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
+    # 5.1: use a COMPILED delegate (not a PS scriptblock) so certificate validation also succeeds on the
+    # background polling runspace's thread - a scriptblock callback is bound to its origin runspace and
+    # fails when the TLS handshake runs on another thread.
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'VsphereCertBypass').Type) {
+            Add-Type -TypeDefinition @'
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class VsphereCertBypass {
+    public static readonly RemoteCertificateValidationCallback Cb =
+        delegate (object s, X509Certificate c, X509Chain ch, SslPolicyErrors e) { return true; };
+}
+'@
+        }
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [VsphereCertBypass]::Cb
+    } catch {
+        try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
+    }
 }
 
 #region -- Data-file encryption (opt-in, self-contained) ----------------------
@@ -259,7 +281,7 @@ $script:_sdk = $null; $script:_ws = $null; $script:_svc = $null
 function Invoke-Vim ([string]$Inner) {
     $body = "<?xml version=`"1.0`" encoding=`"UTF-8`"?><soapenv:Envelope xmlns:soapenv=`"http://schemas.xmlsoap.org/soap/envelope/`" xmlns:urn=`"urn:vim25`" xmlns:xsi=`"http://www.w3.org/2001/XMLSchema-instance`"><soapenv:Body>$Inner</soapenv:Body></soapenv:Envelope>"
     try {
-        $r = Invoke-WebRequest -Uri $script:_sdk -Method Post -Body $body -ContentType 'text/xml; charset=utf-8' -Headers @{ SOAPAction = 'urn:vim25' } -WebSession $script:_ws -TimeoutSec 90 @script:_iwrExtra
+        $r = Invoke-WebRequest -Uri $script:_sdk -Method Post -Body $body -ContentType 'text/xml; charset=utf-8' -Headers @{ SOAPAction = 'urn:vim25' } -WebSession $script:_ws -TimeoutSec 90 -UseBasicParsing @script:_iwrExtra
         $content = "$($r.Content)"
     } catch {
         $resp = $_.Exception.Response
@@ -272,7 +294,7 @@ function Invoke-Vim ([string]$Inner) {
 function Connect-Vsphere ([string]$VC, [string]$User, [string]$PwPlain) {
     $script:_sdk = "https://$VC/sdk"
     $rsc = "<?xml version=`"1.0`" encoding=`"UTF-8`"?><soapenv:Envelope xmlns:soapenv=`"http://schemas.xmlsoap.org/soap/envelope/`" xmlns:urn=`"urn:vim25`"><soapenv:Body><urn:RetrieveServiceContent><urn:_this type=`"ServiceInstance`">ServiceInstance</urn:_this></urn:RetrieveServiceContent></soapenv:Body></soapenv:Envelope>"
-    $r = Invoke-WebRequest -Uri $script:_sdk -Method Post -Body $rsc -ContentType 'text/xml; charset=utf-8' -Headers @{ SOAPAction = 'urn:vim25' } -SessionVariable ws -TimeoutSec 30 @script:_iwrExtra
+    $r = Invoke-WebRequest -Uri $script:_sdk -Method Post -Body $rsc -ContentType 'text/xml; charset=utf-8' -Headers @{ SOAPAction = 'urn:vim25' } -SessionVariable ws -TimeoutSec 30 -UseBasicParsing @script:_iwrExtra
     $script:_ws = $ws
     [xml]$x = "$($r.Content)"
     $script:_svc = $x.Envelope.Body.RetrieveServiceContentResponse.returnval
@@ -323,6 +345,289 @@ function Get-CpuReadyMs ([string[]]$VmMoRefs, [string]$CounterId, [int]$Samples)
     }
     $ready
 }
+# All perf counters (fetched once), for both CPU Ready and the host perf series.
+function Get-AllPerfCounters {
+    $r = Invoke-Vim "<urn:RetrieveProperties><urn:_this type=`"PropertyCollector`">$($script:_svc.propertyCollector.'#text')</urn:_this><urn:specSet><urn:propSet><urn:type>PerformanceManager</urn:type><urn:pathSet>perfCounter</urn:pathSet></urn:propSet><urn:objectSet><urn:obj type=`"PerformanceManager`">$($script:_svc.perfManager.'#text')</urn:obj></urn:objectSet></urn:specSet></urn:RetrieveProperties>"
+    @($r.Envelope.Body.RetrievePropertiesResponse.returnval.propSet.val.PerfCounterInfo)
+}
+# Resolve a perf counter's id by group/name/rollup (e.g. cpu/usage/average).
+function Get-PerfCounterId ([object]$Counters, [string]$Group, [string]$Name, [string]$Rollup) {
+    (@($Counters) | Where-Object { $_.groupInfo.key -eq $Group -and $_.nameInfo.key -eq $Name -and $_.rollupType -eq $Rollup } | Select-Object -First 1).key
+}
+# --- Background transport: run the perf QueryPerf POST in a reused runspace so the UI thread stays
+#     responsive during network I/O. The main thread pumps the window's dispatcher while it waits. ---
+$script:_perfRs = $null
+function Start-PerfRunspace {
+    try { $script:_perfRs = [runspacefactory]::CreateRunspace(); $script:_perfRs.Open() }
+    catch { Write-Log "Perf runspace unavailable (using synchronous polling): $_" 'WARN'; $script:_perfRs = $null }
+}
+function Stop-PerfRunspace {
+    if ($script:_perfRs) { try { $script:_perfRs.Close(); $script:_perfRs.Dispose() } catch {} ; $script:_perfRs = $null }
+}
+# Like Invoke-Vim, but the POST runs in the background runspace and the UI is pumped while waiting. Falls
+# back to synchronous Invoke-Vim when there's no runspace (headless). Returns $null if the user closed
+# the live view mid-request.
+function Invoke-VimPumped ([string]$Inner) {
+    if (-not $script:_perfRs) { return Invoke-Vim $Inner }
+    $body = "<?xml version=`"1.0`" encoding=`"UTF-8`"?><soapenv:Envelope xmlns:soapenv=`"http://schemas.xmlsoap.org/soap/envelope/`" xmlns:urn=`"urn:vim25`" xmlns:xsi=`"http://www.w3.org/2001/XMLSchema-instance`"><soapenv:Body>$Inner</soapenv:Body></soapenv:Envelope>"
+    $ps = [powershell]::Create(); $ps.Runspace = $script:_perfRs
+    [void]$ps.AddScript({
+        param($body, $sdk, $ws, $iwrExtra)
+        try {
+            $r = Invoke-WebRequest -Uri $sdk -Method Post -Body $body -ContentType 'text/xml; charset=utf-8' -Headers @{ SOAPAction = 'urn:vim25' } -WebSession $ws -TimeoutSec 90 -UseBasicParsing @iwrExtra
+            "$($r.Content)"
+        } catch {
+            $resp = $_.Exception.Response
+            if ($resp) { $sr = New-Object System.IO.StreamReader($resp.GetResponseStream()); $c = $sr.ReadToEnd(); $sr.Close(); $c } else { throw }
+        }
+    }).AddArgument($body).AddArgument($script:_sdk).AddArgument($script:_ws).AddArgument($script:_iwrExtra)
+    $h = $ps.BeginInvoke()
+    $stopped = $false
+    while (-not $h.IsCompleted) {
+        if ($script:_perfViewClosed) { $stopped = $true; break }
+        $w = if ($script:_perfWin) { $script:_perfWin } else { $script:_splash }
+        if ($w) { try { $w.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {} }
+        Start-Sleep -Milliseconds 40
+    }
+    if ($stopped) { try { $ps.Stop() } catch {} ; $ps.Dispose(); return $null }
+    $content = ''
+    try { $content = ($ps.EndInvoke($h) | Select-Object -First 1) } finally { $ps.Dispose() }
+    [xml]$x = "$content"
+    if ($x.Envelope.Body.Fault) { throw "vSphere API fault: $($x.Envelope.Body.Fault.faultstring)" }
+    return $x
+}
+# Latest real-time (20s) sample for many targets (host + VMs) in one QueryPerf.
+# Returns moRef -> @{ Time; Cpu(%); Ram(%); Disk(MB/s); Net(Mbps) }. 'percent' counters are hundredths.
+function Get-PerfLatest ($Targets, [hashtable]$Ids) {
+    $out = @{}
+    $idList = @($Ids.Values | Where-Object { $_ })
+    if (@($Targets).Count -eq 0 -or $idList.Count -eq 0) { return $out }
+    $metricIds = ($idList | ForEach-Object { "<urn:metricId><urn:counterId>$_</urn:counterId><urn:instance></urn:instance></urn:metricId>" }) -join ''
+    $specs = (@($Targets) | ForEach-Object { "<urn:querySpec><urn:entity type=`"$($_.Type)`">$($_.Key)</urn:entity><urn:maxSample>1</urn:maxSample>$metricIds<urn:intervalId>20</urn:intervalId></urn:querySpec>" }) -join ''
+    $r = Invoke-VimPumped "<urn:QueryPerf><urn:_this type=`"PerformanceManager`">$($script:_svc.perfManager.'#text')</urn:_this>$specs</urn:QueryPerf>"
+    if (-not $r) { return $out }
+    foreach ($rv in @($r.Envelope.Body.QueryPerfResponse.returnval)) {
+        $mo = "$($rv.entity.'#text')"
+        $tArr = @($rv.sampleInfo | ForEach-Object { "$($_.timestamp)" })
+        $byId = @{}
+        foreach ($series in @($rv.value)) { $vv = @($series.value | ForEach-Object { [double]$_ }); $byId["$($series.id.counterId)"] = if ($vv.Count) { $vv[$vv.Count - 1] } else { $null } }
+        $cpu = $byId["$($Ids.Cpu)"]; $ram = $byId["$($Ids.Ram)"]; $dsk = $byId["$($Ids.Disk)"]; $net = $byId["$($Ids.Net)"]; $rdy = $byId["$($Ids.Ready)"]
+        $out[$mo] = @{
+            Time = if ($tArr.Count) { $tArr[$tArr.Count - 1] } else { '' }
+            Cpu  = if ($null -ne $cpu) { [math]::Round($cpu / 100, 1) } else { 0 }
+            Ram  = if ($null -ne $ram) { [math]::Round($ram / 100, 1) } else { 0 }
+            Disk = if ($null -ne $dsk) { [math]::Round($dsk / 1024, 2) } else { 0 }
+            Net  = if ($null -ne $net) { [math]::Round($net * 8 / 1000, 2) } else { 0 }
+            ReadyMs = if ($null -ne $rdy) { [double]$rdy } else { $null }   # raw summation ms; -> %RDY/vCPU in the loop
+        }
+    }
+    $out
+}
+# Empty, List-backed perf series (mutated in place during monitoring; serialises to JSON arrays).
+function New-PerfSeries {
+    [ordered]@{
+        SampleCount = 0; IntervalSec = 20; StartTime = ''; EndTime = ''
+        Times    = New-Object System.Collections.Generic.List[string]
+        CpuPct   = New-Object System.Collections.Generic.List[double]
+        RamPct   = New-Object System.Collections.Generic.List[double]
+        DiskMBps = New-Object System.Collections.Generic.List[double]
+        NetMbps  = New-Object System.Collections.Generic.List[double]
+        ReadyPct = New-Object System.Collections.Generic.List[double]   # per-vCPU %RDY (VMs only)
+    }
+}
+# Sleep in short slices, pumping the live/splash dispatcher so the UI repaints and Windows doesn't flag it hung.
+function Start-SleepResponsive ([int]$Seconds) {
+    $sliceMs = 250; $slices = [math]::Max(1, [int][math]::Round(($Seconds * 1000) / $sliceMs))
+    for ($n = 0; $n -lt $slices; $n++) {
+        if ($script:_perfViewClosed) { return }   # user closed the live view - stop waiting immediately
+        Start-Sleep -Milliseconds $sliceMs
+        $w = if ($script:_perfWin) { $script:_perfWin } else { $script:_splash }
+        if ($w) { try { $w.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {} }
+    }
+}
+
+#region -- Live performance view (WPF) ----------------------------------------
+$script:_perfWin = $null; $script:_perfStatus = $null; $script:_perfBar = $null; $script:_perfRows = @{}; $script:_perfViewClosed = $false
+$script:_perfMetrics = @(
+    @{ Key = 'Cpu';  Cap = 'CPU %';     Color = '#2563eb'; Max = 100; Unit = '%' }
+    @{ Key = 'Ram';  Cap = 'RAM %';     Color = '#16a34a'; Max = 100; Unit = '%' }
+    @{ Key = 'Disk'; Cap = 'Disk MB/s'; Color = '#9333ea'; Max = 0;   Unit = '' }
+    @{ Key = 'Net';  Cap = 'Net Mbps';  Color = '#0891b2'; Max = 0;   Unit = '' }
+    @{ Key = 'Ready'; Cap = 'CPU Rdy %'; Color = '#dc2626'; Max = 0;  Unit = '%' }
+)
+$script:_perfBrushCache = @{}
+function Get-LiveBrush ([string]$Hex) {
+    $b = $script:_perfBrushCache[$Hex]
+    if (-not $b) { $b = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString($Hex)); $b.Freeze(); $script:_perfBrushCache[$Hex] = $b }
+    $b
+}
+function Show-VspherePerfView ($Targets) {
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="vSphere - Live Performance" Height="640" Width="1080" WindowStartupLocation="CenterScreen" Background="#F4F6F9" FontFamily="Segoe UI">
+    <DockPanel Margin="16">
+        <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
+            <TextBlock Text="vSphere - Live Performance" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+            <TextBlock x:Name="StatusText" Text="Starting..." FontSize="12" Foreground="#555" Margin="0,3,0,8"/>
+            <ProgressBar x:Name="Bar" Minimum="0" Maximum="100" Value="0" Height="4" Background="#E8EAED" Foreground="#0078D4" BorderThickness="0"/>
+        </StackPanel>
+        <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="RowsPanel"/></ScrollViewer>
+    </DockPanel>
+</Window>
+'@
+    $win = New-ThemedWindow $xaml
+    $script:_perfWin = $win; $script:_perfStatus = $win.FindName('StatusText'); $script:_perfBar = $win.FindName('Bar'); $script:_perfViewClosed = $false; $script:_perfRows = @{}
+    $rowsPanel = $win.FindName('RowsPanel')
+    $lastKind = ''
+    foreach ($tgt in $Targets) {
+        $key = "$($tgt.Key)"
+        if ($script:_perfRows.ContainsKey($key)) { continue }
+        if ("$($tgt.Kind)" -ne $lastKind) {
+            $hdrText = if ($tgt.Kind -eq 'Host') { 'Host' } else { 'Virtual Machines' }
+            $hdr = [System.Windows.Markup.XamlReader]::Parse("<TextBlock xmlns=`"http://schemas.microsoft.com/winfx/2006/xaml/presentation`" Text=`"$hdrText`" FontSize=`"13`" FontWeight=`"Bold`" Foreground=`"#0F2C43`" Margin=`"2,14,0,6`"/>")
+            [void]$rowsPanel.Children.Add($hdr)
+            $lastKind = "$($tgt.Kind)"
+        }
+        $nameEsc = [System.Security.SecurityElement]::Escape("$($tgt.Name)")
+        $kindEsc = [System.Security.SecurityElement]::Escape("$($tgt.Kind)")
+        $kindColor = if ($tgt.Kind -eq 'Host') { '#0F6E6E' } else { '#6B7280' }
+        $boxes = ''
+        foreach ($m in $script:_perfMetrics) {
+            $boxes += @"
+<StackPanel Margin="0,0,10,0">
+  <TextBlock Text="$($m.Cap)" FontSize="10" Foreground="#888"/>
+  <TextBlock x:Name="$($m.Key)Val" Text="-" FontSize="12" FontWeight="SemiBold" Foreground="#1F2937"/>
+  <Border Background="#F7F8FA" BorderBrush="#E8EAED" BorderThickness="1" CornerRadius="3" Margin="0,2,0,0">
+    <Canvas Width="140" Height="38"><Polyline x:Name="$($m.Key)Poly" Stroke="$($m.Color)" StrokeThickness="1.5"/></Canvas>
+  </Border>
+</StackPanel>
+"@
+        }
+        $rowXaml = @"
+<Border xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Background="White" BorderBrush="#DDE1E7" BorderThickness="1" CornerRadius="6" Margin="0,0,0,8" Padding="12,10">
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,10,0">
+      <TextBlock Text="$nameEsc" FontWeight="Bold" FontSize="13" Foreground="#1F2937" TextTrimming="CharacterEllipsis"/>
+      <Border Background="$kindColor" CornerRadius="3" Padding="6,2" HorizontalAlignment="Left" Margin="0,4,0,0">
+        <TextBlock Text="$kindEsc" FontSize="10" FontWeight="SemiBold" Foreground="White"/>
+      </Border>
+    </StackPanel>
+    <StackPanel Grid.Column="1" Orientation="Horizontal">$boxes</StackPanel>
+  </Grid>
+</Border>
+"@
+        $row = [System.Windows.Markup.XamlReader]::Parse($rowXaml)
+        $entry = @{ Metrics = @{} }
+        foreach ($m in $script:_perfMetrics) {
+            $entry.Metrics[$m.Key] = @{
+                Poly  = $row.FindName("$($m.Key)Poly")
+                Label = $row.FindName("$($m.Key)Val")
+                Vals  = [System.Collections.Generic.Queue[double]]::new()
+                Max   = [double]$m.Max
+                Unit  = "$($m.Unit)"
+            }
+        }
+        $script:_perfRows[$key] = $entry
+        [void]$rowsPanel.Children.Add($row)
+    }
+    $win.Add_Closed({ $script:_perfViewClosed = $true })
+    $win.Show(); [void]$win.Activate()
+    $win.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+    $win.Topmost = $false
+    Write-Log "Live performance view shown ($(@($Targets).Count) objects)"
+}
+function Set-VspherePerfStatus ([string]$Text) {
+    Write-Log $Text
+    if ($script:_perfWin -and $script:_perfStatus) { try { $script:_perfWin.Dispatcher.Invoke([Action]{ $script:_perfStatus.Text = $Text }, [System.Windows.Threading.DispatcherPriority]::Background) } catch {} }
+}
+# One async, batched UI update per tick (all rows + progress) so the sampling loop never blocks on the
+# UI thread. BeginInvoke at Background priority repaints when the thread is idle (during the sleep pump).
+function Update-VspherePerfBatch ([hashtable]$Samples, [double]$ProgressPct) {
+    if (-not $script:_perfWin) { return }
+    $rows = $script:_perfRows; $bar = $script:_perfBar
+    $script:_perfWin.Dispatcher.Invoke([Action]{
+        if ($bar) { $bar.Value = $ProgressPct }
+        foreach ($key in $Samples.Keys) {
+            $row = $rows["$key"]; if (-not $row) { continue }
+            $vals = $Samples[$key]
+            foreach ($id in @('Cpu', 'Ram', 'Disk', 'Net', 'Ready')) {
+                $e = $row.Metrics[$id]; if (-not $e) { continue }
+                $sv = $vals[$id]; if ($null -eq $sv) { continue }   # e.g. hosts have no CPU Ready
+                $v = [double]$sv
+                $q = $e.Vals; $q.Enqueue($v); while ($q.Count -gt 60) { [void]$q.Dequeue() }
+                $arr = $q.ToArray(); $n = $arr.Length
+                $w = 140.0; $h = 38.0
+                if ($e.Max -gt 0) { $top = [double]$e.Max } else { $top = 0.0; for ($k = 0; $k -lt $n; $k++) { if ($arr[$k] -gt $top) { $top = $arr[$k] } }; if ($top -le 0) { $top = 1.0 } }
+                $pts = New-Object System.Windows.Media.PointCollection
+                for ($i = 0; $i -lt $n; $i++) {
+                    $x = if ($n -le 1) { 0.0 } else { $w * $i / ($n - 1) }
+                    $cv = [math]::Min($arr[$i], $top); $y = $h - ($h * ($cv / $top))
+                    [void]$pts.Add([System.Windows.Point]::new($x, $y))
+                }
+                if ($n -le 1) { [void]$pts.Add([System.Windows.Point]::new($w, $pts[0].Y)) }
+                $pts.Freeze(); $e.Poly.Points = $pts
+                $e.Label.Text = if ($e.Max -eq 100) { '{0:N0}{1}' -f $v, $e.Unit } else { '{0:N1}' -f $v }
+            }
+        }
+    }, [System.Windows.Threading.DispatcherPriority]::Render)
+}
+function Close-VspherePerfView {
+    if ($script:_perfWin) { try { $script:_perfWin.Close() } catch {} ; $script:_perfWin = $null }
+}
+#endregion
+
+# Active perf monitoring over -DurationMinutes: sample every 20s, append to each target's series,
+# feed the live view, and write incrementally via $OnTick. Stops early if the user closes the live window.
+function Invoke-PerfMonitor ($Targets, [hashtable]$Ids, $Data, [scriptblock]$OnTick) {
+    $intervalSec = 20
+    $ticks = [math]::Max(1, [int][math]::Round(($DurationMinutes * 60) / $intervalSec))
+    $showLive = (-not $NoLiveView) -and (-not $script:_noSplash)
+    if ($showLive) { try { Show-VspherePerfView $Targets; Close-Splash } catch { Write-Log "Live view failed: $_" 'WARN' } }   # one window: hide the splash behind the live view
+    if (-not $script:_noSplash) { Start-PerfRunspace }   # poll the network off the UI thread so the window stays responsive
+    for ($t = 0; $t -lt $ticks; $t++) {
+        if ($script:_perfViewClosed) { break }
+        Set-SplashStatus "Monitoring performance - sample $($t + 1) of $ticks..."
+        Set-VspherePerfStatus "Monitoring - sample $($t + 1) of $ticks (every ${intervalSec}s) - $($Targets.Count) objects"
+        $tickSamples = @{}
+        try {
+            $latest = Get-PerfLatest $Targets $Ids
+            foreach ($tgt in $Targets) {
+                $s = $latest["$($tgt.Key)"]; if (-not $s) { continue }
+                $series = $tgt.Series
+                # CPU Ready is VM-only: convert the summation ms to per-vCPU %RDY (null for hosts).
+                $rp = if ("$($tgt.Kind)" -eq 'VM') {
+                    $nc = [int]$tgt.Rec.NumCpu
+                    if ($null -ne $s.ReadyMs -and $nc -gt 0) { [math]::Round($s.ReadyMs / 20000 * 100 / $nc, 2) } else { 0 }
+                } else { $null }
+                $s.Ready = $rp   # per-vCPU %RDY for the live view (null on hosts -> shown as '-')
+                $last = if ($series.Times.Count) { $series.Times[$series.Times.Count - 1] } else { '' }
+                if ("$($s.Time)" -and "$($s.Time)" -ne $last) {
+                    $series.Times.Add("$($s.Time)")
+                    $series.CpuPct.Add([double]$s.Cpu); $series.RamPct.Add([double]$s.Ram); $series.DiskMBps.Add([double]$s.Disk); $series.NetMbps.Add([double]$s.Net)
+                    if ($null -ne $rp) { $series.ReadyPct.Add([double]$rp) }
+                    $series.SampleCount = $series.Times.Count
+                    if (-not $series.StartTime) { $series.StartTime = $series.Times[0] }
+                    $series.EndTime = $series.Times[$series.Times.Count - 1]
+                }
+                $tickSamples["$($tgt.Key)"] = $s
+            }
+        } catch {
+            Write-Log "Perf sample $($t + 1) failed: $_" 'WARN'
+            if ($script:_perfRs) { Write-Log 'Perf polling: switching to synchronous mode after a background failure.' 'WARN'; Stop-PerfRunspace }
+        }
+        if ($showLive) { Update-VspherePerfBatch $tickSamples (100.0 * ($t + 1) / $ticks) }
+        # Throttle the incremental write (full JSON serialise + disk) to ~once a minute + first/last tick
+        # so it doesn't stall the UI thread every 20s.
+        if ($OnTick -and ($t -eq ($ticks - 1) -or ($t % 3) -eq 0)) { try { & $OnTick $Data } catch { Write-Log "Incremental write failed: $_" 'WARN' } }
+        if ($script:_perfViewClosed) { Write-Log 'Live view closed - stopping monitoring early'; break }
+        if ($t -lt ($ticks - 1)) { Start-SleepResponsive $intervalSec }
+    }
+    Stop-PerfRunspace
+    Close-VspherePerfView
+    foreach ($tgt in $Targets) { if ($tgt.Series.Times.Count -eq 0) { $tgt.Rec['Perf'] = $null } }
+}
 #endregion
 
 #region -- Collection ---------------------------------------------------------
@@ -335,7 +640,7 @@ function Get-MoRefName ([string]$Type, [string]$MoRef) {
     if ($o) { return (Get-Prop $o 'name') } ; ''
 }
 
-function Collect-VsphereData {
+function Collect-VsphereData ([scriptblock]$OnTick) {
     $rootFolder = $script:_svc.rootFolder.'#text'
     $scopeType = ''; $scopeName = ''
     $hostObjs = @(); $vmObjs = @()
@@ -363,23 +668,36 @@ function Collect-VsphereData {
         $scopeType = 'Host'; $scopeName = $VMHost
     } else { throw 'Specify -Cluster or -VMHost.' }
 
-    # CPU Ready for powered-on VMs (one QueryPerf across all)
-    Set-SplashStatus 'Querying CPU Ready (performance counters)...'
-    $counterId = Get-CpuReadyCounterId
+    # Performance counters (fetched once): CPU Ready for powered-on VMs + host/VM live-monitoring counters.
+    Set-SplashStatus 'Querying performance counters...'
+    $allCtrs = Get-AllPerfCounters
+    $counterId = Get-PerfCounterId $allCtrs 'cpu' 'ready' 'summation'
     $onVmMo = @($vmObjs | Where-Object { (Get-Prop $_ 'runtime.powerState') -eq 'poweredOn' } | ForEach-Object { "$($_.obj.'#text')" })
     $readyMs = Get-CpuReadyMs $onVmMo $counterId $ReadySamples
+    $perfIds = @{
+        Cpu   = Get-PerfCounterId $allCtrs 'cpu'  'usage' 'average'
+        Ram   = Get-PerfCounterId $allCtrs 'mem'  'usage' 'average'
+        Disk  = Get-PerfCounterId $allCtrs 'disk' 'usage' 'average'
+        Net   = Get-PerfCounterId $allCtrs 'net'  'usage' 'average'
+        Ready = $counterId   # cpu.ready.summation (VM-only; hosts return it but it's ignored)
+    }
 
-    # collect VM metadata; associate to hosts by Where-Object (avoids a PS quirk indexing List-valued hashtables)
+    # Monitoring targets (host + powered-on VMs): each carries a record reference + an empty series
+    # that Invoke-PerfMonitor appends to over the duration.
+    $targets = New-Object System.Collections.Generic.List[object]
+
+    # VM records; associate to hosts by Where-Object (avoids a PS quirk indexing List-valued hashtables)
     $vmMeta = New-Object System.Collections.Generic.List[object]
     foreach ($v in @($vmObjs)) {
         $mo = "$($v.obj.'#text')"
+        $vmName = "$(Get-Prop $v 'name')"
         $numCpu = [int](Get-Prop $v 'config.hardware.numCPU')
         $on = (Get-Prop $v 'runtime.powerState') -eq 'poweredOn'
         $rMs = if ($readyMs.ContainsKey($mo)) { [double]$readyMs[$mo] } else { $null }
         $readyPct = if ($null -ne $rMs) { [math]::Round($rMs / 20000 * 100, 2) } else { $null }              # total across vCPUs
         $readyPerV = if ($null -ne $rMs -and $numCpu -gt 0) { [math]::Round($rMs / 20000 * 100 / $numCpu, 2) } else { $null }
         $rec = [ordered]@{
-            Name         = "$(Get-Prop $v 'name')"
+            Name         = $vmName
             PowerState   = "$(Get-Prop $v 'runtime.powerState')"
             NumCpu       = $numCpu
             MemoryMB     = [int](Get-Prop $v 'config.hardware.memoryMB')
@@ -389,14 +707,20 @@ function Collect-VsphereData {
             CpuReadyPct  = $readyPct
             CpuReadyPerVcpuPct = $readyPerV
             GuestOs      = "$(Get-Prop $v 'config.guestFullName')"
+            Perf         = $null
         }
         $vmMeta.Add([pscustomobject]@{ Mo = $mo; HostMo = "$(Get-Prop $v 'runtime.host')"; On = $on; NumCpu = $numCpu; Record = $rec })
+        if ($on -and -not $NoPerf -and -not $HostsOnly) {
+            $rec['Perf'] = New-PerfSeries
+            $targets.Add(@{ Key = $mo; Type = 'VirtualMachine'; Name = $vmName; Kind = 'VM'; Rec = $rec; Series = $rec['Perf'] })
+        }
     }
 
-    # build host records
+    # host records
     $hostList = New-Object System.Collections.Generic.List[object]
     foreach ($h in @($hostObjs)) {
         $hMo = "$($h.obj.'#text')"
+        $hName = "$(Get-Prop $h 'name')"
         $cores = [int](Get-Prop $h 'summary.hardware.numCpuCores')
         $mhz   = [int](Get-Prop $h 'summary.hardware.cpuMhz')
         $totMhz = $cores * $mhz
@@ -408,8 +732,8 @@ function Collect-VsphereData {
         $vcpuOn = (@($myVms | Where-Object { $_.On }) | ForEach-Object { [int]$_.NumCpu } | Measure-Object -Sum).Sum
         $vcpuOn = [int]$vcpuOn
         $clusterName = if ($scopeType -eq 'Cluster') { $scopeName } else { Get-MoRefName 'ClusterComputeResource' "$(Get-Prop $h 'parent')" }
-        $hostList.Add([ordered]@{
-            Name            = "$(Get-Prop $h 'name')"
+        $hrec = [ordered]@{
+            Name            = $hName
             Cluster         = $clusterName
             ConnectionState = "$(Get-Prop $h 'runtime.connectionState')"
             PowerState      = "$(Get-Prop $h 'runtime.powerState')"
@@ -431,7 +755,13 @@ function Collect-VsphereData {
             VcpuAllocated   = $vcpuOn
             CpuOvercommit   = if ($cores) { [math]::Round($vcpuOn / $cores, 2) } else { 0 }
             Vms             = @(@($myVms | Sort-Object { -1 * [int]$_.NumCpu }) | ForEach-Object { $_.Record })
-        })
+            Perf            = $null
+        }
+        $hostList.Add($hrec)
+        if (-not $NoPerf) {
+            $hrec['Perf'] = New-PerfSeries
+            $targets.Add(@{ Key = $hMo; Type = 'HostSystem'; Name = $hName; Kind = 'Host'; Rec = $hrec; Series = $hrec['Perf'] })
+        }
     }
 
     $hostArr = $hostList.ToArray()   # never wrap a List[object] in @() - throws "Argument types do not match" on this PS
@@ -442,7 +772,7 @@ function Collect-VsphereData {
     $avgCpu   = if (@($hostArr).Count) { [math]::Round((@($hostArr) | ForEach-Object { [double]$_.CpuUsagePct } | Measure-Object -Average).Average, 1) } else { 0 }
     $avgMem   = if (@($hostArr).Count) { [math]::Round((@($hostArr) | ForEach-Object { [double]$_.MemoryUsagePct } | Measure-Object -Average).Average, 1) } else { 0 }
 
-    [ordered]@{
+    $data = [ordered]@{
         SchemaType     = 'VsphereHosting'
         CollectorVersion = $script:_version
         GeneratedAt    = (Get-Date).ToString('o')
@@ -453,6 +783,8 @@ function Collect-VsphereData {
         VCenterVersion = "$($script:_svc.about.fullName)"
         Scope          = [ordered]@{ Type = $scopeType; Name = $scopeName }
         ReadySampleWindowSec = $ReadySamples * 20
+        PerfDurationMinutes  = if ($NoPerf) { 0 } else { $DurationMinutes }
+        PerfIntervalSec      = 20
         Summary        = [ordered]@{
             HostCount = @($hostArr).Count; VmCount = [int]$totVms; PoweredOnVmCount = [int]$totOn
             TotalCores = [int]$totCores; TotalVcpuAllocated = [int]$totVcpu
@@ -461,6 +793,16 @@ function Collect-VsphereData {
         }
         Hosts          = @($hostArr)
     }
+
+    # Active performance monitoring over the chosen duration (with a live view when interactive).
+    # Host(s) first so the live view leads with the host in its own section, then the VMs.
+    $targetArr = $targets.ToArray()
+    $targetArr = @(@($targetArr | Where-Object { $_.Kind -eq 'Host' }) + @($targetArr | Where-Object { $_.Kind -ne 'Host' }))
+    if (-not $NoPerf -and $targetArr.Count -gt 0) {
+        Invoke-PerfMonitor $targetArr $perfIds $data $OnTick
+    }
+
+    return $data
 }
 #endregion
 
@@ -473,7 +815,7 @@ function Show-VsphereDialog {
     <Style x:Key="BlueBtn" TargetType="Button"><Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/><Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
     <Style x:Key="GreyBtn" TargetType="Button"><Setter Property="Background" Value="#E1E4EA"/><Setter Property="Foreground" Value="#1F2937"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#CDD0D8"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
   </Window.Resources>
-  <Border CornerRadius="6" Background="White" BorderBrush="#DDE1E7" BorderThickness="1"><StackPanel Margin="26,22">
+  <Border Background="#F4F6F9" BorderThickness="0"><StackPanel Margin="26,22">
     <TextBlock Text="vSphere Data Collector" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
     <TextBlock Text="Host + VM utilisation, CPU Ready and overcommit from a vCenter (VCSA)" FontSize="12" Foreground="#555" Margin="0,2,0,16"/>
     <TextBlock Text="vCenter (VCSA) address" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
@@ -490,8 +832,20 @@ function Show-VsphereDialog {
     <TextBox x:Name="CustBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,12"/>
     <TextBlock Text="Encrypt output (optional - blank = plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
     <PasswordBox x:Name="EncBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
+    <Border Background="#F0F6FC" BorderBrush="#CFE4F7" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,16">
+      <StackPanel>
+        <CheckBox x:Name="PerfChk" Content="Capture live performance (host + VMs)" IsChecked="True" Foreground="#1F2937" FontSize="12"/>
+        <StackPanel Orientation="Horizontal" Margin="22,8,0,0">
+          <TextBlock Text="Monitor for" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="0,0,6,0"/>
+          <TextBox x:Name="DurBox" Text="30" Width="46" Padding="6,3" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" VerticalAlignment="Center"/>
+          <TextBlock Text="minutes  (20s samples)" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="6,0,0,0"/>
+        </StackPanel>
+        <CheckBox x:Name="LiveChk" Content="Show live view during monitoring" IsChecked="True" Foreground="#1F2937" FontSize="12" Margin="22,8,0,0"/>
+        <CheckBox x:Name="HostsOnlyChk" Content="Hosts only (skip per-VM performance)" Foreground="#1F2937" FontSize="12" Margin="22,8,0,0"/>
+      </StackPanel>
+    </Border>
     <Grid><TextBlock x:Name="VersionText" Text="" FontSize="10" Foreground="#8a8f98" VerticalAlignment="Center" HorizontalAlignment="Left"/>
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"><Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/><Button x:Name="OkBtn" Content="Collect" Width="100" Padding="0,7" Style="{StaticResource BlueBtn}"/></StackPanel></Grid>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right"><Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/><Button x:Name="OkBtn" Content="Start" Width="100" Padding="0,7" Style="{StaticResource BlueBtn}"/></StackPanel></Grid>
   </StackPanel></Border>
 </Window>
 '@
@@ -499,6 +853,7 @@ function Show-VsphereDialog {
     $win.FindName('VersionText').Text = "v$($script:_version)"
     $vcBox = $win.FindName('VcBox'); $userBox = $win.FindName('UserBox'); $pwBox = $win.FindName('PwBox')
     $rbCluster = $win.FindName('RbCluster'); $scopeBox = $win.FindName('ScopeBox'); $custBox = $win.FindName('CustBox'); $encBox = $win.FindName('EncBox')
+    $perfChk = $win.FindName('PerfChk'); $durBox = $win.FindName('DurBox'); $liveChk = $win.FindName('LiveChk'); $hostsOnlyChk = $win.FindName('HostsOnlyChk')
     if ($VCenter) { $vcBox.Text = $VCenter }; if ($Username) { $userBox.Text = $Username }; if ($Cluster) { $scopeBox.Text = $Cluster }; if ($VMHost) { $win.FindName('RbHost').IsChecked = $true; $scopeBox.Text = $VMHost }
     $result = @{ Action = 'Cancel' }
     $win.FindName('OkBtn').Add_Click({
@@ -507,6 +862,11 @@ function Show-VsphereDialog {
         $result.Password = ConvertTo-SecureString $pwBox.Password -AsPlainText -Force
         $result.ScopeType = if ($rbCluster.IsChecked) { 'Cluster' } else { 'Host' }; $result.Scope = $scopeBox.Text.Trim(); $result.Customer = $custBox.Text.Trim()
         $result.Encrypt = if ($encBox.Password) { ConvertTo-SecureString $encBox.Password -AsPlainText -Force } else { $null }
+        $result.NoPerf = -not $perfChk.IsChecked
+        $dm = 30; [void][int]::TryParse($durBox.Text.Trim(), [ref]$dm); if ($dm -lt 1) { $dm = 1 }
+        $result.DurationMinutes = $dm
+        $result.NoLiveView = -not $liveChk.IsChecked
+        $result.HostsOnly = [bool]$hostsOnlyChk.IsChecked
         $win.Close()
     })
     $win.FindName('CancelBtn').Add_Click({ $win.Close() })
@@ -529,8 +889,28 @@ if ($needDialog) {
     $VCenter = $sel.VCenter; $Username = $sel.Username; $Password = $sel.Password; $Customer = $sel.Customer
     if ($sel.ScopeType -eq 'Cluster') { $Cluster = $sel.Scope; $VMHost = '' } else { $VMHost = $sel.Scope; $Cluster = '' }
     if ($sel.Encrypt) { $EncryptPassword = $sel.Encrypt }
+    $NoPerf = [bool]$sel.NoPerf
+    $NoLiveView = [bool]$sel.NoLiveView
+    $HostsOnly = [bool]$sel.HostsOnly
+    if ($sel.DurationMinutes) { $DurationMinutes = [int]$sel.DurationMinutes }
 }
 if (-not $VCenter -or -not $Username -or -not $Password -or (-not $Cluster -and -not $VMHost)) { throw 'Missing -VCenter / -Username / -Password / scope (-Cluster or -VMHost).' }
+
+# Output target computed up-front so the monitoring loop can write incrementally (crash-safe long runs).
+$encrypt = ($EncryptPassword -and $EncryptPassword.Length -gt 0)
+$safeCustomer = if ($Customer) { ($Customer -replace '[^\w\-. ]', '_').Trim() } else { '' }
+$outDir = if ($safeCustomer) { Join-Path $script:_outputDir $safeCustomer } else { $script:_outputDir }
+if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$base = if ($safeCustomer) { "$safeCustomer-Vsphere-Data-$stamp" } else { "Vsphere-Data-$stamp" }
+$ext = if ($encrypt) { '.cdenc' } else { '.json' }
+$outFile = Join-Path $outDir "$base$ext"
+$writer = {
+    param($d)
+    $j = $d | ConvertTo-Json -Depth 12
+    if ($encrypt) { Set-Content -Path $outFile -Value (Protect-ReportData $j $EncryptPassword) -Encoding UTF8 }
+    else { Set-Content -Path $outFile -Value $j -Encoding UTF8 }
+}
 
 Show-Splash
 $data = $null
@@ -540,7 +920,7 @@ try {
     $null = Connect-Vsphere $VCenter $Username $pwPlain
     $pwPlain = $null
     Write-Log "Connected to $VCenter as $Username"
-    $data = Collect-VsphereData
+    $data = Collect-VsphereData $writer
 } catch {
     Close-Splash
     Write-Log "Collection failed: $($_.Exception.Message)" 'ERROR'
@@ -551,19 +931,9 @@ try {
 }
 Disconnect-Vsphere
 
-# Write output
-$encrypt = ($EncryptPassword -and $EncryptPassword.Length -gt 0)
-$json = $data | ConvertTo-Json -Depth 12
-$safeCustomer = if ($Customer) { ($Customer -replace '[^\w\-. ]', '_').Trim() } else { '' }
-$outDir = if ($safeCustomer) { Join-Path $script:_outputDir $safeCustomer } else { $script:_outputDir }
-if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$base = if ($safeCustomer) { "$safeCustomer-Vsphere-Data-$stamp" } else { "Vsphere-Data-$stamp" }
-$ext = if ($encrypt) { '.cdenc' } else { '.json' }
-$outFile = Join-Path $outDir "$base$ext"
+# Final write (idempotent - the monitoring loop already wrote each tick).
 try {
-    if ($encrypt) { Set-Content -Path $outFile -Value (Protect-ReportData $json $EncryptPassword) -Encoding UTF8 }
-    else { Set-Content -Path $outFile -Value $json -Encoding UTF8 }
+    & $writer $data
     Write-Log "Output written: $outFile ($([math]::Round((Get-Item $outFile).Length/1KB,1)) KB)$(if ($encrypt) { ' [encrypted]' })"
 } catch { Write-Log "Failed to write output: $_" 'ERROR'; Show-MsgBox "Failed to write output:`n$($_.Exception.Message)" -Icon Error; exit 1 }
 

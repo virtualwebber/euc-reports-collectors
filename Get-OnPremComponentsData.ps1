@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-07   (must match $script:_version below and the published .version file)
+# Version: 2026-07-10   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-07'
+$script:_version      = '2026-07-10'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 $script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
@@ -702,18 +702,6 @@ function Show-OnPremDialog {
         <TextBox x:Name="ServersBox" AcceptsReturn="True" TextWrapping="Wrap" Height="92" VerticalScrollBarVisibility="Auto"
                  Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,14"/>
 
-        <Grid Margin="0,0,0,14">
-            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0">
-                <TextBlock Text="Monitor duration (minutes)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
-                <TextBox x:Name="DurationBox" Text="30" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12"/>
-            </StackPanel>
-            <StackPanel Grid.Column="2">
-                <TextBlock Text="Sample interval" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
-                <TextBox Text="Every 30 seconds (fixed)" IsEnabled="False" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="#EEF0F3" FontSize="12" Foreground="#888"/>
-            </StackPanel>
-        </Grid>
-
         <Rectangle Height="1" Fill="#DDE1E7" Margin="0,0,0,12"/>
         <TextBlock Text="Remote credentials (optional - blank uses the current user; remote needs WinRM)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
         <Grid Margin="0,0,0,16">
@@ -725,10 +713,17 @@ function Show-OnPremDialog {
         <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
         <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
 
-        <CheckBox x:Name="PerfChk" Content="Collect performance samples (every 30 seconds)" IsChecked="True"
-                  Foreground="#1F2937" FontSize="12" Margin="0,0,0,10"/>
-        <CheckBox x:Name="LiveViewChk" Content="Show live performance view during collection"
-                  Foreground="#1F2937" FontSize="12" Margin="0,0,0,16"/>
+        <Border Background="#F0F6FC" BorderBrush="#CFE4F7" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,16">
+            <StackPanel>
+                <CheckBox x:Name="PerfChk" Content="Capture live performance (per server)" IsChecked="True" Foreground="#1F2937" FontSize="12"/>
+                <StackPanel Orientation="Horizontal" Margin="22,8,0,0">
+                    <TextBlock Text="Monitor for" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="DurationBox" Text="30" Width="46" Padding="6,3" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" VerticalAlignment="Center"/>
+                    <TextBlock Text="minutes  (30s samples)" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                </StackPanel>
+                <CheckBox x:Name="LiveViewChk" Content="Show live view during monitoring" IsChecked="True" Foreground="#1F2937" FontSize="12" Margin="22,8,0,0"/>
+            </StackPanel>
+        </Border>
 
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/>
@@ -855,7 +850,10 @@ $script:_versionBlock = {
     # DisplayVersion "2407.0.100.16") - the authoritative CVAD match, no guessing.
     $targets = @(
         @{ Name = 'Cloud Connector'; Match = 'Citrix Cloud Connector'; CvadLabel = $null }
-        @{ Name = 'StoreFront';      Match = 'Citrix StoreFront';       CvadLabel = 'StoreFront' }
+        # The real StoreFront product is exactly "Citrix StoreFront". A Delivery Controller ships several
+        # StoreFront *sub-services* ("Citrix Storefront Service", "...Privileged Administration Service",
+        # "...PowerShell snap-in") - exclude those so a DDC is not mis-detected as a StoreFront server.
+        @{ Name = 'StoreFront';      Match = 'Citrix StoreFront'; ExcludeRegex = '(?i)Privileged|Administration|Service|snap-in'; CvadLabel = 'StoreFront' }
         @{ Name = 'FAS';             Match = 'Citrix Federated Authentication Service'; CvadLabel = 'Federated Authentication Service' }
         @{ Name = 'VDA';             Match = 'Citrix Virtual Delivery Agent'; CvadLabel = 'Virtual Delivery Agent' }
         # PVS server product name varies by release/branding - "Citrix Provisioning Server <YYMM>"
@@ -864,6 +862,13 @@ $script:_versionBlock = {
         # match it anywhere, excluding the Console / Target Device (a VDA with the PVS target must not
         # be mistaken for a PVS server).
         @{ Name = 'Provisioning Server'; MatchRegex = '(?i)Provisioning (Server|Services)'; ExcludeRegex = '(?i)Console|Target|Client|Device'; CvadLabel = $null }
+        # License Server - uninstall DisplayName "Citrix Licensing"; version is the Flexera scheme
+        # (e.g. "11.17.2.0 build 47000"), not a CVAD YYMM release, so CvadLabel stays $null. Detecting
+        # it here both lists its version and adds the 'License Server' role (drives the licensing block).
+        @{ Name = 'License Server'; Match = 'Citrix Licensing'; CvadLabel = $null }
+        # Delivery Controller - "Citrix Broker Service" is the tightest "this box is a Controller" signal;
+        # CvadLabel also catches the CVAD bundle entry + YYMM release. Drives the site (Broker SDK) block.
+        @{ Name = 'Delivery Controller'; Match = 'Citrix Broker Service'; CvadLabel = 'Delivery Controller' }
     )
     $out = @()
     foreach ($t in $targets) {
@@ -871,7 +876,7 @@ $script:_versionBlock = {
             $m = $apps | Where-Object { "$($_.DisplayName)" -match $t.MatchRegex -and ($null -eq $t.ExcludeRegex -or "$($_.DisplayName)" -notmatch $t.ExcludeRegex) } | Select-Object -First 1
         } else {
             $m = $apps | Where-Object { "$($_.DisplayName)" -eq $t.Match } | Select-Object -First 1
-            if (-not $m) { $m = $apps | Where-Object { "$($_.DisplayName)" -like "*$($t.Match)*" } | Select-Object -First 1 }
+            if (-not $m) { $m = $apps | Where-Object { "$($_.DisplayName)" -like "*$($t.Match)*" -and ($null -eq $t.ExcludeRegex -or "$($_.DisplayName)" -notmatch $t.ExcludeRegex) } | Select-Object -First 1 }
         }
         $cvadRelease = ''; $cvadVersion = ''
         if ($t.CvadLabel) {
@@ -991,12 +996,24 @@ $script:_eventBlock = {
         if ($latest -and ($latest.Id -eq 3502 -or $latest.Id -eq 3507)) { $lhcInOutage = $true }
     }
 
+    # Top 10 most-recent Error/Critical Citrix events (first line of the message) for the report.
+    $topEvents = @($uniq | Sort-Object TimeCreated -Descending | Select-Object -First 10 | ForEach-Object {
+        [ordered]@{
+            Time     = $_.TimeCreated.ToString('o')
+            Level    = "$($_.LevelDisplayName)"
+            Provider = "$($_.ProviderName)"
+            Id       = [int]$_.Id
+            Message  = (("$($_.Message)" -split "`r?`n" | Where-Object { "$_".Trim() } | Select-Object -First 1) -replace '\s+', ' ').Trim()
+        }
+    })
+
     [pscustomobject]@{
         Count24h    = $count24
         Count7d     = $count7
         WindowHours = 24
         WindowDays  = 7
         LogsScanned = @($scanned)
+        TopEvents    = $topEvents
         LhcActivated = $lhcActivated
         LhcCount     = $lhcCount
         LhcLast      = $lhcLast
@@ -1381,6 +1398,346 @@ $script:_pvsBlock = {
     [pscustomobject]$pvs
 }
 
+# Runs ON a Citrix License Server to capture licensing health + inventory. Two independent sources, both
+# local to the box (works over a normal WinRM hop - no double-hop concern):
+#   1. FlexNet "served" inventory (root\CitrixLicensing WMI): the traditional installed licence files.
+#      Citrix_GT_License = counts/type/expiry/SA date; Citrix_GT_License_Pool = in-use/available/overdraft.
+#      A modern licence server often shows only CTXLSDIAG here (the built-in diagnostic licence).
+#   2. License Activation Service (LAS) entitlements: the modern cloud-activated products, which do NOT
+#      appear in FlexNet/WMI. Served by the Citrix Licensing Manager web service on :8083 and exposed by
+#      the public WSLGetLasInventoryRequest SOAP op on /wsl_unauth/lcs - no access code / token / cloud
+#      call, so it works unattended. This is the authoritative product inventory on current servers.
+# CIM datetimes convert via ManagementDateTimeConverter; '9999-12-31' / year>=2037 mean "permanent" (''),
+# LAS saDate is 'YYYY.MMDD'. DiagnosticOnly = no real product licence in EITHER source (report gates the
+# real-licence checks on it so they never vacuously pass).
+$script:_licensingBlock = {
+    $lic = [ordered]@{
+        Version        = ''
+        Services       = [ordered]@{}
+        WmiAvailable   = $false
+        Licenses       = @()
+        Pools          = @()
+        LasLicenses    = @()
+        LasAvailable   = $false
+        DiagnosticOnly = $true
+        Messages       = @()
+    }
+    # LS version from the licensing install registry (WOW6432Node - the LS is 32-bit).
+    try {
+        $reg = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Citrix\LicenseServer\Install' -ErrorAction Stop
+        $lic['Version'] = "$($reg.Version)"
+    } catch { }
+    # Service states (present + running?). The WMI provider (Citrix_GTLicensingProv) starts on demand,
+    # so its state is informational - WmiAvailable below is based on the query actually succeeding.
+    foreach ($svc in 'Citrix Licensing', 'CitrixWebServicesforLicensing', 'Citrix_GTLicensingProv') {
+        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        $lic['Services'][$svc] = if ($s) { "$($s.Status)" } else { 'NotInstalled' }
+    }
+    # CIM datetime -> yyyy-MM-dd; '' for permanent (9999 / year>=2037) or unparseable.
+    $toDate = {
+        param($v)
+        if (-not "$v") { return '' }
+        try { $d = [System.Management.ManagementDateTimeConverter]::ToDateTime("$v"); if ($d.Year -ge 2037) { return '' }; return $d.ToString('yyyy-MM-dd') } catch { return '' }
+    }
+    # Installed licence files.
+    try {
+        $rows = @(Get-WmiObject -Namespace 'root\CitrixLicensing' -Class Citrix_GT_License -ErrorAction Stop)
+        $lic['WmiAvailable'] = $true
+        $lic['Licenses'] = @($rows | ForEach-Object {
+            [ordered]@{
+                PLD              = "$($_.PLD)"
+                PLDFullName      = "$($_.PLDFullName)"
+                Count            = [int]$_.Count
+                LicenseType      = "$($_.LicenseType)"
+                Overdraft        = [int]$_.Overdraft
+                SerialNumber     = "$($_.SerialNumber)"
+                ExpirationDate   = (& $toDate $_.ExpirationDate)
+                SubscriptionDate = (& $toDate $_.SubscriptionDate)
+            }
+        })
+    } catch { $lic['Messages'] += "Citrix_GT_License: $($_.Exception.Message)" }
+    # Live pool usage (in-use / available / overdraft) per product.
+    try {
+        $pools = @(Get-WmiObject -Namespace 'root\CitrixLicensing' -Class Citrix_GT_License_Pool -ErrorAction Stop)
+        $lic['WmiAvailable'] = $true
+        $lic['Pools'] = @($pools | ForEach-Object {
+            [ordered]@{
+                PLD             = "$($_.PLD)"
+                PLDFullName     = "$($_.PLDFullName)"
+                Count           = [int]$_.Count
+                InUseCount      = [int]$_.InUseCount
+                PooledAvailable = [int]$_.PooledAvailable
+                Overdraft       = [int]$_.Overdraft
+            }
+        })
+    } catch { $lic['Messages'] += "Citrix_GT_License_Pool: $($_.Exception.Message)" }
+    # License Activation Service (LAS) entitlements via the Citrix Licensing Manager web service (:8083).
+    # WSLGetLasInventoryRequest on the PUBLIC /wsl_unauth/lcs channel returns the activated products with
+    # no access code / session token (reads local state). loc MUST be the 'WSL_LOCALE_EN' constant.
+    # saDate 'YYYY.MMDD' -> yyyy-MM-dd.
+    $saConv = {
+        param($v)
+        if ("$v" -match '^(\d{4})\.(\d{2})(\d{2})$') { "$($matches[1])-$($matches[2])-$($matches[3])" } else { "$v" }
+    }
+    $prevCb = $null
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+        $prevCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        $fqdn = try { [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName } catch { "$env:COMPUTERNAME" }
+        $body = '<soapenv:Envelope xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope"><soapenv:Body><WSLGetLasInventoryRequest><loc>WSL_LOCALE_EN</loc><IncludeFutureStartDate>false</IncludeFutureStartDate></WSLGetLasInventoryRequest></soapenv:Body></soapenv:Envelope>'
+        $resp = $null
+        foreach ($h in @($fqdn, "$env:COMPUTERNAME", 'localhost') | Where-Object { $_ } | Select-Object -Unique) {
+            try {
+                $r = Invoke-WebRequest -Uri "https://${h}:8083/wsl_unauth/lcs" -Method Post -Body $body -ContentType 'application/soap+xml; charset=UTF-8;' -Headers @{ 'X-Requested-With' = 'XMLHttpRequest' } -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+                if ("$($r.Content)" -match 'WSLGetLasInventoryResult') { $resp = $r; break }
+            } catch { }
+        }
+        if ($resp) {
+            # Localized fields are CDATA (XmlElement) - use InnerText; plain fields stringify directly.
+            $xt = { param($n) if ($null -eq $n) { '' } elseif ($n -is [System.Xml.XmlElement]) { "$($n.InnerText)" } else { "$n" } }
+            [xml]$xml = $resp.Content
+            $items = @($xml.Envelope.Body.WSLGetLasInventoryResult.WSLLasInventory)
+            $lic['LasLicenses'] = @($items | ForEach-Object {
+                [ordered]@{
+                    ProductCode  = (& $xt $_.productName)
+                    ProductName  = (& $xt $_.localizedProductName)
+                    Edition      = (& $xt $_.localizedEdition)
+                    LicenseType  = (& $xt $_.localizedLicenseType)
+                    LicenseModel = (& $xt $_.localizedLicenseModel)
+                    Available    = [int](& $xt $_.available)
+                    InUse        = [int](& $xt $_.inUse)
+                    Overdraft    = [int](& $xt $_.overdraft)
+                    ExpiryDate   = (& $xt $_.expirationDateTick)
+                    SaDate       = (& $saConv (& $xt $_.saDate))
+                }
+            })
+            $lic['LasAvailable'] = $true
+        }
+    } catch { $lic['Messages'] += "LAS inventory: $($_.Exception.Message)" }
+    finally { try { [Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCb } catch {} }
+    # Real product licences = a LAS entitlement, or a FlexNet PLD that isn't the built-in diagnostic one.
+    $realPlds = @(@($lic['Licenses']) | Where-Object { "$($_.PLD)" -and "$($_.PLD)" -ne 'CTXLSDIAG' })
+    $lic['DiagnosticOnly'] = (@($lic['LasLicenses']).Count -eq 0) -and ($realPlds.Count -eq 0)
+    [pscustomobject]$lic
+}
+
+# Runs ON a Citrix Delivery Controller (in-session; single WinRM hop - the Broker service uses the machine
+# account to reach the site SQL DB, so no FAS-style double-hop). Collects the SITE-WIDE inventory via the
+# Citrix Broker/Config/Host/MachineCreation/DelegatedAdmin SDK and maps it to the SAME field shape the
+# cloud collector (Get-CitrixCloudData.ps1) produces, so the report renders + health-checks it unchanged.
+# Site data is identical from any controller, so the caller runs this ONCE (first reachable DDC). The
+# WinRM identity must be a Citrix (read) administrator on the controller. Policies (Citrix GPO) are a
+# deferred follow-up (the on-prem GPO provider differs from the cloud API).
+$script:_brokerBlock = {
+    $site = [ordered]@{
+        SdkAvailable       = $false
+        SiteName           = ''
+        SiteId             = ''
+        ProductEdition     = ''
+        ProductVersion     = ''
+        Settings           = [ordered]@{}
+        Controllers        = @()
+        Zones              = @()
+        DeliveryGroups     = @()
+        MachineCatalogs    = @()
+        Machines           = @()
+        HostingConnections = @()
+        Applications       = @()
+        ApplicationGroups  = @()
+        Administrators     = @()
+        Databases          = @()
+        SqlExpressInstalled = $false
+        SqlExpressInstances = @()
+        Messages           = @()
+    }
+    foreach ($sn in 'Citrix.Broker.Admin.V2', 'Citrix.Configuration.Admin.V2', 'Citrix.Host.Admin.V2', 'Citrix.MachineCreation.Admin.V2', 'Citrix.DelegatedAdmin.Admin.V1', 'Citrix.Monitor.Admin.V1', 'Citrix.ConfigurationLogging.Admin.V1') {
+        try { Add-PSSnapin $sn -ErrorAction Stop } catch { }
+    }
+    if (-not (Get-Command Get-BrokerSite -ErrorAction SilentlyContinue)) {
+        $site['Messages'] += 'Citrix Broker SDK (Citrix.Broker.Admin.V2) not available on this controller.'
+        return [pscustomobject]$site
+    }
+    $site['SdkAvailable'] = $true
+    $str = { param($v) if ($null -eq $v) { '' } else { "$v" } }
+    $iso = { param($v) if ($v) { try { ([datetime]$v).ToString('o') } catch { "$v" } } else { '' } }
+
+    # Zones (also build a Uid->Name map for catalogs/machines/hosting).
+    $zoneName = @{}
+    try {
+        $zones = @(Get-ConfigZone -ErrorAction Stop)
+        foreach ($z in $zones) { if ($z.Uid) { $zoneName["$($z.Uid)"] = "$($z.Name)" } }
+        $site['Zones'] = @($zones | ForEach-Object {
+            [ordered]@{ ZoneId = "$($_.Uid)"; ZoneName = "$($_.Name)"; Description = (& $str $_.Description); IsPrimary = ([bool]($null -eq $_.ExternalUid) -and (@($_.ControllerNames).Count -gt 0)) }
+        })
+    } catch { $site['Messages'] += "Get-ConfigZone: $($_.Exception.Message)" }
+
+    # Site + settings (a curated set of health-relevant scalars; the report renders Settings generically).
+    try {
+        $bs = Get-BrokerSite -ErrorAction Stop
+        $site['SiteName']       = "$($bs.Name)"
+        $site['SiteId']         = "$($bs.BrokerServiceGroupUid)"
+        $site['ProductEdition'] = "$($bs.LicenseEdition)"
+        $s = [ordered]@{}
+        foreach ($p in 'LocalHostCacheEnabled', 'ConnectionLeasingEnabled', 'SecureIcaRequired', 'LicenseModel', 'LicenseServerName', 'LicenseServerPort', 'LicenseEdition', 'LicensingGracePeriodActive', 'TrustRequestsSentToTheXmlServicePort', 'TrustManagedAnonymousXmlServiceRequests', 'DnsResolutionEnabled', 'ColorDepth', 'DefaultMinimumFunctionalLevel', 'ResourceLeasingEnabled', 'ReuseMachinesWithoutShutdownInOutageAllowed') {
+            $v = $bs.$p
+            if ($null -eq $v) { continue }
+            # Enums serialize as {value,Value} objects (case-colliding under PS7 ConvertFrom-Json) - stringify
+            # them; keep genuine bool/numeric scalars as-is so the report formats them correctly.
+            if ($v -is [bool] -or $v -is [int] -or $v -is [long] -or $v -is [double]) { $s[$p] = $v }
+            else { $s[$p] = "$v" }
+        }
+        $site['Settings'] = $s
+    } catch { $site['Messages'] += "Get-BrokerSite: $($_.Exception.Message)" }
+
+    # Delivery Controllers.
+    try {
+        $site['Controllers'] = @(Get-BrokerController -ErrorAction Stop | ForEach-Object {
+            [ordered]@{
+                DNSName            = "$($_.DNSName)"
+                State              = "$($_.State)"
+                DesktopsRegistered = [int]$_.DesktopsRegistered
+                ControllerVersion  = "$($_.ControllerVersion)"
+                LastActivityTime   = (& $iso $_.LastActivityTime)
+                ActiveSiteServices = @($_.ActiveSiteServices | ForEach-Object { "$_" })
+            }
+        })
+        if (-not "$($site['ProductVersion'])" -and @($site['Controllers']).Count) { $site['ProductVersion'] = "$(@($site['Controllers'])[0].ControllerVersion)" }
+    } catch { $site['Messages'] += "Get-BrokerController: $($_.Exception.Message)" }
+
+    # Delivery Groups (build a Uid->Name map for applications).
+    $dgName = @{}
+    try {
+        $site['DeliveryGroups'] = @(Get-BrokerDesktopGroup -ErrorAction Stop | ForEach-Object {
+            $dgName["$($_.Uid)"] = "$($_.Name)"
+            [ordered]@{
+                Id = "$($_.Uid)"; Name = "$($_.Name)"; Description = (& $str $_.Description)
+                Enabled = [bool]$_.Enabled; InMaintenanceMode = [bool]$_.InMaintenanceMode
+                DeliveryType = "$($_.DeliveryType)"; SessionSupport = "$($_.SessionSupport)"
+                TotalMachines = [int]$_.TotalDesktops; RegisteredMachines = [int]$_.DesktopsRegistered
+                SessionCount = [int]$_.Sessions; DisconnectedSessionCount = [int]$_.DesktopsDisconnected
+                MinimumFunctionalLevel = "$($_.MinimumFunctionalLevel)"
+                Scopes = @($_.Scopes | ForEach-Object { "$_" }); Tags = @($_.Tags | ForEach-Object { "$_" })
+            }
+        })
+    } catch { $site['Messages'] += "Get-BrokerDesktopGroup: $($_.Exception.Message)" }
+
+    # Provisioning schemes -> catalog master image / hosting unit.
+    $provByName = @{}
+    try { foreach ($ps in @(Get-ProvScheme -ErrorAction SilentlyContinue)) { if ("$($ps.ProvisioningSchemeName)") { $provByName["$($ps.ProvisioningSchemeName)"] = $ps } } } catch {}
+
+    # Machine Catalogs.
+    try {
+        $site['MachineCatalogs'] = @(Get-BrokerCatalog -ErrorAction Stop | ForEach-Object {
+            $ps = $provByName["$($_.Name)"]
+            $zn = if ("$($_.ZoneName)") { "$($_.ZoneName)" } else { $zoneName["$($_.ZoneUid)"] }
+            [ordered]@{
+                Id = "$($_.Uid)"; Name = "$($_.Name)"; Description = (& $str $_.Description)
+                AllocationType = "$($_.AllocationType)"; PersistUserChanges = "$($_.PersistUserChanges)"
+                ProvisioningType = "$($_.ProvisioningType)"; SessionSupport = "$($_.SessionSupport)"
+                TotalCount = ([int]$_.UsedCount + [int]$_.UnusedCount); UsedCount = [int]$_.UsedCount; UnassignedCount = [int]$_.UnusedCount
+                MinimumFunctionalLevel = "$($_.MinimumFunctionalLevel)"
+                IdentityType = $(if ($ps) { "$($ps.IdentityType)" } else { '' })
+                ZoneName = (& $str $zn)
+                HypervisorConnection = $(if ($ps) { "$($ps.HostingUnitName)" } else { '' })
+                MasterImagePath = $(if ($ps) { "$($ps.MasterImageVM)" } else { '' })
+                Scopes = @($_.Scopes | ForEach-Object { "$_" }); Tags = @($_.Tags | ForEach-Object { "$_" })
+            }
+        })
+    } catch { $site['Messages'] += "Get-BrokerCatalog: $($_.Exception.Message)" }
+
+    # Machines.
+    try {
+        $site['Machines'] = @(Get-BrokerMachine -ErrorAction Stop | ForEach-Object {
+            [ordered]@{
+                Id = "$($_.Uid)"; Name = "$($_.MachineName)"; DnsName = "$($_.DNSName)"; IPAddress = "$($_.IPAddress)"
+                MachineCatalog = "$($_.CatalogName)"; DeliveryGroup = "$($_.DesktopGroupName)"; ZoneName = "$($_.ZoneName)"
+                RegistrationState = "$($_.RegistrationState)"; PowerState = "$($_.PowerState)"; SummaryState = "$($_.SummaryState)"
+                InMaintenanceMode = [bool]$_.InMaintenanceMode; AgentVersion = "$($_.AgentVersion)"
+                OSType = "$($_.OSType)"; SessionCount = [int]$_.SessionCount
+                AssociatedUsers = @($_.AssociatedUserFullNames | ForEach-Object { "$_" })
+                HostedMachineName = "$($_.HostedMachineName)"; LastDeregisteredReason = "$($_.LastDeregistrationReason)"
+            }
+        })
+    } catch { $site['Messages'] += "Get-BrokerMachine: $($_.Exception.Message)" }
+
+    # Hosting connections. State derived from IsReady / FaultState (matches the cloud 'State' field).
+    try {
+        $site['HostingConnections'] = @(Get-BrokerHypervisorConnection -ErrorAction Stop | ForEach-Object {
+            $state = if ([bool]$_.IsReady) { 'Healthy' } elseif ("$($_.FaultState)") { "$($_.FaultState)" } else { 'Unavailable' }
+            [ordered]@{
+                Id = "$($_.Uid)"; Name = "$($_.Name)"; ConnectionType = "$($_.HypervisorConnectionType)"
+                State = $state; FaultReason = "$($_.FaultReason)"; InMaintenanceMode = [bool]$_.InMaintenanceMode
+                ZoneName = (& $str $zoneName["$($_.ZoneUid)"]); Scopes = @($_.Scopes | ForEach-Object { "$_" })
+            }
+        })
+    } catch { $site['Messages'] += "Get-BrokerHypervisorConnection: $($_.Exception.Message)" }
+
+    # Applications + application groups.
+    try {
+        $site['Applications'] = @(Get-BrokerApplication -ErrorAction Stop | ForEach-Object {
+            $dgs = @($_.AssociatedDesktopGroupUids | ForEach-Object { $dgName["$_"] } | Where-Object { $_ })
+            [ordered]@{
+                Id = "$($_.Uid)"; Name = "$($_.Name)"; PublishedName = "$($_.PublishedName)"; Description = (& $str $_.Description)
+                Enabled = [bool]$_.Enabled; Visible = [bool]$_.Visible; ApplicationType = "$($_.ApplicationType)"
+                InstalledAppProperties = [ordered]@{ CommandLineExecutable = "$($_.CommandLineExecutable)"; CommandLineArguments = "$($_.CommandLineArguments)"; WorkingDirectory = "$($_.WorkingDirectory)" }
+                DeliveryGroups = $dgs; FolderPath = "$($_.AdminFolderName)"; Tags = @($_.Tags | ForEach-Object { "$_" })
+            }
+        })
+    } catch { $site['Messages'] += "Get-BrokerApplication: $($_.Exception.Message)" }
+    try {
+        $site['ApplicationGroups'] = @(Get-BrokerApplicationGroup -ErrorAction Stop | ForEach-Object {
+            $dgs = @($_.AssociatedDesktopGroupUids | ForEach-Object { $dgName["$_"] } | Where-Object { $_ })
+            [ordered]@{ Id = "$($_.Uid)"; Name = "$($_.Name)"; Description = (& $str $_.Description); Enabled = [bool]$_.Enabled; RestrictToTag = "$($_.RestrictToTag)"; TotalApplications = [int]$_.TotalApplications; DeliveryGroups = $dgs }
+        })
+    } catch { $site['Messages'] += "Get-BrokerApplicationGroup: $($_.Exception.Message)" }
+
+    # Delegated administrators.
+    try {
+        $site['Administrators'] = @(Get-AdminAdministrator -ErrorAction Stop | ForEach-Object {
+            [ordered]@{
+                Id = "$($_.Sid)"; Name = "$($_.Name)"; UPN = ''; Sid = "$($_.Sid)"; Enabled = [bool]$_.Enabled
+                Rights = @($_.Rights | ForEach-Object { [ordered]@{ RoleName = "$($_.RoleName)"; ScopeName = "$($_.ScopeName)" } })
+            }
+        })
+    } catch { $site['Messages'] += "Get-AdminAdministrator: $($_.Exception.Message)" }
+
+    # Databases + SQL Express. The three CVAD databases (Site / Monitoring / Configuration Logging) each
+    # expose their connection string via the SDK. SQL Server Express (10 GB cap, no SQL Agent, no supported
+    # HA) is fine for a POC but not production - flag when a database is hosted on a LOCALLY-INSTALLED SQL
+    # Express instance on this controller (confirmed via the SQL registry Edition, so it's factual).
+    $sqlExpress = @()
+    try {
+        $names = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction Stop
+        foreach ($p in $names.PSObject.Properties) {
+            if ($p.Name -match '^PS') { continue }
+            $ed = try { (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($p.Value)\Setup" -ErrorAction Stop).Edition } catch { '' }
+            if ("$ed" -match '(?i)Express') { $sqlExpress += "$($p.Name)" }
+        }
+    } catch { }
+    $site['SqlExpressInstalled'] = ($sqlExpress.Count -gt 0)
+    $site['SqlExpressInstances'] = @($sqlExpress)
+    $localNames = @("$env:COMPUTERNAME", 'localhost', '.', '(local)')
+    try { $lf = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName; if ($lf) { $localNames += "$lf" } } catch { }
+    $dbConns = @()
+    foreach ($d in @(@{ n = 'Site'; c = 'Get-BrokerDBConnection' }, @{ n = 'Monitoring'; c = 'Get-MonitorDBConnection' }, @{ n = 'Configuration Logging'; c = 'Get-LogDBConnection' })) {
+        try {
+            $cs = & $d.c -ErrorAction Stop
+            if (-not "$cs") { continue }
+            $srv = ''; if ("$cs" -match '(?i)(?:Server|Data Source)\s*=\s*([^;]+)') { $srv = $matches[1].Trim() }
+            $db  = ''; if ("$cs" -match '(?i)(?:Initial Catalog|Database)\s*=\s*([^;]+)') { $db = $matches[1].Trim() }
+            $dbHost = $srv; $inst = ''
+            if ($srv -match '^(.*?)\\(.+)$') { $dbHost = $matches[1].Trim(); $inst = $matches[2].Trim() }
+            $isLocal = ($localNames | Where-Object { $_ -ieq $dbHost }).Count -gt 0
+            $isExpress = ($isLocal -and (($sqlExpress | Where-Object { $_ -ieq $inst }).Count -gt 0))
+            $dbConns += [ordered]@{ Type = $d.n; Server = $srv; Instance = $inst; Database = $db; IsLocalSqlExpress = [bool]$isExpress }
+        } catch { $site['Messages'] += "$($d.c): $($_.Exception.Message)" }
+    }
+    $site['Databases'] = @($dbConns)
+
+    [pscustomobject]$site
+}
+
 # Runs ON a FAS server (local or via the WinRM session) to capture the FAS baseline that
 # needs NO FAS admin SDK: service state, install/config presence, and the applied FAS GPO
 # address list. The GPO state is itself a key health signal - a FAS server absent from the
@@ -1718,6 +2075,7 @@ function Invoke-WithTimeout ([scriptblock]$Script, [int]$TimeoutSec = 15, [objec
 
 function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [System.Management.Automation.PSCredential]$Cred, [switch]$NoPerf) {
     $files = [System.Collections.Generic.List[string]]::new()
+    $script:_siteCollected = $false   # site (Broker) data is collected once, from the first reachable DDC
     $intervalSec  = 30
     $sampleCount  = if ($NoPerf) { 0 } else { [math]::Max(1, [int][math]::Round(($DurationMin * 60) / $intervalSec)) }
     $runStamp     = (Get-Date).ToString('yyyyMMdd-HHmmss')   # one stable file name per server per run
@@ -1920,6 +2278,36 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
                 } catch { Write-Log "PVS collection failed on ${display}: $_" 'WARN' }
             }
 
+            # License Server: version/service health + installed-licence inventory (WMI) via the licensing block.
+            $licensing = $null
+            if ($roles -contains 'License Server') {
+                Set-LiveServerStep $server 'Collecting Citrix Licensing inventory...'
+                Set-SplashStatus "Collecting Citrix Licensing inventory on $display..."
+                try {
+                    $licensing = Invoke-OnTarget $session $script:_licensingBlock
+                    Write-Log "Licensing ${display}: ver=$($licensing.Version) wmi=$($licensing.WmiAvailable) licenses=$(@($licensing.Licenses).Count) pools=$(@($licensing.Pools).Count) diagnosticOnly=$($licensing.DiagnosticOnly)"
+                    if (@($licensing.Messages).Count) { Write-Log ("Licensing ${display} messages: " + (@($licensing.Messages) -join ' || ')) }
+                } catch { Write-Log "Licensing collection failed on ${display}: $_" 'WARN' }
+            }
+
+            # Delivery Controller: site-wide inventory (Broker SDK), collected ONCE from the first reachable
+            # DDC (identical from any controller) and written to its own cloud-shape site file.
+            if (($roles -contains 'Delivery Controller') -and -not $script:_siteCollected) {
+                Set-LiveServerStep $server 'Collecting Citrix site (delivery groups / catalogs / machines / controllers)...'
+                Set-SplashStatus "Collecting Citrix site from $display..."
+                try {
+                    $site = Invoke-OnTarget $session $script:_brokerBlock
+                    if ([bool]$site.SdkAvailable) {
+                        Write-Log "Site ${display}: name='$($site.SiteName)' controllers=$(@($site.Controllers).Count) dgs=$(@($site.DeliveryGroups).Count) catalogs=$(@($site.MachineCatalogs).Count) machines=$(@($site.Machines).Count) hosting=$(@($site.HostingConnections).Count) admins=$(@($site.Administrators).Count)"
+                        if (@($site.Messages).Count) { Write-Log ("Site ${display} messages: " + (@($site.Messages) -join ' || ')) }
+                        Write-OnPremSiteJson -Site $site -Files $files
+                        $script:_siteCollected = $true
+                    } else {
+                        Write-Log "Site ${display}: Broker SDK not available - $((@($site.Messages) | Where-Object { $_ }) -join '; ')" 'WARN'
+                    }
+                } catch { Write-Log "Site collection failed on ${display}: $_" 'WARN' }
+            }
+
             $ctx = [ordered]@{
                 Server        = $server
                 Display       = $display
@@ -1935,11 +2323,12 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
                 Patch         = $patch
                 VdaComponents = $vdaComponents
                 Sessions      = $sessions
+                Licensing     = $licensing
                 OutFile       = Join-Path $script:_outputDir "OnPrem-$safe-$runStamp.json"
                 Samples       = [System.Collections.Generic.List[object]]::new()
             }
             # Write an initial file (0 samples) so it exists straight away.
-            Write-OnPremJson -Server $server -ReachedVia $reached -Spec $spec -Components $comps -Roles $roles -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $fas -Events $events -StoreFront $storeFront -Pvs $pvs -Patch $patch -VdaComponents $vdaComponents -Sessions $sessions
+            Write-OnPremJson -Server $server -ReachedVia $reached -Spec $spec -Components $comps -Roles $roles -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $fas -Events $events -StoreFront $storeFront -Pvs $pvs -Patch $patch -VdaComponents $vdaComponents -Sessions $sessions -Licensing $licensing
             [void]$contexts.Add($ctx)
             Set-LiveServerStep $server $(if ($NoPerf) { 'Static data collected.' } else { "Static data collected - sampling performance every ${intervalSec}s..." })
         } catch {
@@ -1975,7 +2364,7 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
                     }
                     [void]$ctx['Samples'].Add($entry)
                     Update-LiveSample $ctx['Server'] $smp.CpuPct $smp.RamPct $smp.DiskQueueLen $smp.DiskMBps $smp.NetMbps $sessCount
-                    Write-OnPremJson -Server $ctx['Server'] -ReachedVia $ctx['Reached'] -Spec $ctx['Spec'] -Components $ctx['Comps'] -Roles $ctx['Roles'] -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $ctx['Fas'] -Events $ctx['Events'] -StoreFront $ctx['StoreFront'] -Pvs $ctx['Pvs'] -Patch $ctx['Patch'] -VdaComponents $ctx['VdaComponents'] -Sessions $ctx['Sessions']
+                    Write-OnPremJson -Server $ctx['Server'] -ReachedVia $ctx['Reached'] -Spec $ctx['Spec'] -Components $ctx['Comps'] -Roles $ctx['Roles'] -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $ctx['Fas'] -Events $ctx['Events'] -StoreFront $ctx['StoreFront'] -Pvs $ctx['Pvs'] -Patch $ctx['Patch'] -VdaComponents $ctx['VdaComponents'] -Sessions $ctx['Sessions'] -Licensing $ctx['Licensing']
                 } catch { Write-Log "Sample $($i + 1) failed on $($ctx['Display']): $_" 'WARN' }
             }
             if ($i -lt ($sampleCount - 1)) { Start-SleepResponsive ($intervalSec - 1) }   # -1 for the Get-Counter second
@@ -1993,7 +2382,63 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
 # Build the per-server output object and write it to a JSON file. $OutFile is a stable
 # path computed once per server, so repeated calls (one per sample tick) overwrite the
 # same file in place rather than creating a new timestamped file each time.
-function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Roles, $Samples, [int]$DurationMin, $Files, [string]$OutFile, $Fas, $Events, $StoreFront, $Pvs, $Patch, $VdaComponents, $Sessions) {
+# Writes the site-wide Broker inventory as its OWN file in the SAME top-level shape the cloud collector
+# produces, so the report consumes it via -DataFile with no changes. Cloud-only collections are emitted
+# empty (arrays) or omitted (WorkspaceConfig/Licensing) so their sections/checks stay absent - never a
+# vacuous pass. Written ONCE (not per perf tick). Honours -EncryptPassword via Protect-CitrixData.
+function Write-OnPremSiteJson ($Site, $Files) {
+    $now = Get-Date
+    $output = [ordered]@{
+        GeneratedAt            = $now.ToString('o')
+        CollectorVersion       = $script:_version
+        CustomerName           = "$($script:_customer)"
+        CustomerId             = ''
+        CollectionErrors       = @($Site.Messages).Count
+        CollectionStatus       = [ordered]@{}
+        SessionDetailCollected = $false
+        Source                 = 'OnPremSite'
+        # Cloud-platform collections with no on-prem equivalent - emitted empty so the report's cloud-only
+        # sections/checks render as absent rather than vacuously passing.
+        ResourceLocations       = @()
+        NetworkLocations        = @()
+        IdentityProviders       = @()
+        ConditionalAuthPolicies = @()
+        CloudAdministrators     = @()
+        ServicePrincipals       = @()
+        SecureClients           = @()
+        ProductRegistrations    = @()
+        IdentityDomains         = @()
+        # Site collections from the Delivery Controller.
+        Sites = @([ordered]@{ SiteId = "$($Site.SiteId)"; SiteName = "$($Site.SiteName)"; ProductCode = 'XDT'; ProductEdition = "$($Site.ProductEdition)"; ProductVersion = "$($Site.ProductVersion)"; Settings = $Site.Settings })
+        Zones              = @($Site.Zones)
+        DeliveryGroups     = @($Site.DeliveryGroups)
+        MachineCatalogs    = @($Site.MachineCatalogs)
+        Machines           = @($Site.Machines)
+        Applications       = @($Site.Applications)
+        ApplicationGroups  = @($Site.ApplicationGroups)
+        Sessions           = @()
+        Policies           = @()
+        HostingConnections = @($Site.HostingConnections)
+        Administrators     = @($Site.Administrators)
+        Controllers        = @($Site.Controllers)
+        Databases          = @($Site.Databases)
+        SqlExpressInstalled = [bool]$Site.SqlExpressInstalled
+        SqlExpressInstances = @($Site.SqlExpressInstances)
+        LogonPerformance   = @()
+    }
+    $safe = ("$($script:_customer)" -replace '[^\w\-]', '_').Trim('_'); if (-not $safe) { $safe = 'OnPrem' }
+    $outFile = Join-Path $script:_outputDir "$safe-CVAD-Site-$($now.ToString('yyyyMMdd-HHmmss')).json"
+    $encrypt = ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
+    if ($encrypt) { $outFile = [System.IO.Path]::ChangeExtension($outFile, 'cdenc') }
+    try {
+        $json = $output | ConvertTo-Json -Depth 20
+        if ($encrypt) { $json = Protect-CitrixData $json $script:_encryptPassword }
+        Set-Content -Path $outFile -Value $json -Encoding UTF8
+        if (-not $Files.Contains($outFile)) { Write-Log "Site data written: $outFile (site '$($Site.SiteName)', controllers=$(@($Site.Controllers).Count), DGs=$(@($Site.DeliveryGroups).Count))"; [void]$Files.Add($outFile) }
+    } catch { Write-Log "Failed to write site JSON: $_" 'ERROR' }
+}
+
+function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Roles, $Samples, [int]$DurationMin, $Files, [string]$OutFile, $Fas, $Events, $StoreFront, $Pvs, $Patch, $VdaComponents, $Sessions, $Licensing) {
     $name = if (Test-IsLocalTarget $Server) { "$env:COMPUTERNAME" } else { $Server }
     $disks = @(if ($Spec) { $Spec.Disks } )
 
@@ -2039,6 +2484,9 @@ function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Ro
             WindowHours = [int]$Events.WindowHours
             WindowDays  = [int]$Events.WindowDays
             LogsScanned = @($Events.LogsScanned | Where-Object { $_ })
+            TopEvents   = @(@($Events.TopEvents) | Where-Object { $_ } | ForEach-Object {
+                [ordered]@{ Time = "$($_.Time)"; Level = "$($_.Level)"; Provider = "$($_.Provider)"; Id = [int]$_.Id; Message = "$($_.Message)" }
+            })
         }
         # Local Host Cache activation is only meaningful on a Cloud Connector.
         if (@($Roles) -contains 'Cloud Connector') {
@@ -2072,6 +2520,7 @@ function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Ro
     if ($Fas) { $output['Fas'] = $Fas }
     if ($StoreFront) { $output['StoreFront'] = $StoreFront }
     if ($Pvs) { $output['Pvs'] = $Pvs }
+    if ($Licensing) { $output['Licensing'] = $Licensing }
 
     if ($OutFile) {
         $outFile = $OutFile
@@ -2160,6 +2609,7 @@ if (-not (Test-Path $script:_outputDir)) { New-Item -ItemType Directory -Path $s
 # Live dashboard (opt-in, GUI only) runs collection in a background runspace so the window stays
 # responsive; the plain splash / headless paths run synchronously on this thread.
 $useLive = $liveView -and -not $noPerf -and -not $script:_noSplash
+$script:_customer = $customer   # used by Write-OnPremSiteJson for the site file name / CustomerName
 Write-Log "Targets: $($targets -join ', '); duration=$(if ($noPerf) { 'n/a (NoPerf)' } else { "${duration}m" }); cred=$([bool]$cred); noSplash=$([bool]$NoSplash); liveView=$useLive"
 if ($useLive) { Show-LiveView -Servers $targets } else { Show-Splash }
 $files = Invoke-OnPremCollection -ServerList $targets -DurationMin $duration -Cred $cred -NoPerf:$noPerf
