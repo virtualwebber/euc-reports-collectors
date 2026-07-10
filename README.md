@@ -17,6 +17,10 @@ Public distribution and **self-update source** for the EUC Reports data collecto
   groups, workspaces, scaling plans, FSLogix storage, Key Vaults, Log Analytics, RBAC) across the
   selected subscriptions via the Azure ARM APIs. Produces one `<Customer>-AVD-Data-<timestamp>.json`
   for the AVD report.
+- **`Get-VsphereData.ps1`** — VMware vSphere hosting collector (host + VM utilisation for a cluster or a
+  single host via a vCenter/VCSA): host CPU/memory, per-VM vCPU/RAM, live CPU usage, CPU Ready time, and
+  vCPU:core overcommit. **API only — no PowerCLI or any module** (vSphere Web Services SOAP API over
+  HTTPS). Produces one `<Customer>-Vsphere-Data-<timestamp>.json` for the Hosting report.
 
 ## Self-update
 
@@ -42,6 +46,8 @@ check is very lightweight.
 | `Get-ProfilesData.version` | Tiny version marker for the profiles collector. |
 | `Get-AVDData.ps1` | The Azure Virtual Desktop collector (the full download served on update). |
 | `Get-AVDData.version` | Tiny version marker for the AVD collector. |
+| `Get-VsphereData.ps1` | The VMware vSphere hosting collector (the full download served on update). |
+| `Get-VsphereData.version` | Tiny version marker for the vSphere collector. |
 
 ## Version numbers
 
