@@ -15,6 +15,10 @@
     Runs offline of the report: it writes one JSON that Report\Get-HostingReport.ps1 renders with no
     vCenter access. Optionally encrypts the output (.cdenc), shared format with the other EUC reports.
 
+.NOTES
+    Compatibility: tested against vCenter / vSphere 8. It uses the vSphere Web Services (vim25 SOAP)
+    API, which still exists in vSphere 9 but has NOT been tested against vSphere 9.
+
 .PARAMETER VCenter        vCenter (VCSA) address - FQDN or IP.
 .PARAMETER Username       vCenter user, e.g. administrator@vsphere.local (SSO domain usually required).
 .PARAMETER Password       vCenter password (SecureString). Prompted in the dialog if omitted.
