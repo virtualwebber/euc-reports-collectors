@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-10   (must match $script:_version below and the published .version file)
+# Version: 2026-07-13   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-10'
+$script:_version      = '2026-07-13'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 $script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
@@ -439,6 +439,7 @@ function Start-SleepResponsive ([int]$Seconds) {
     $sliceMs = 250
     $slices  = [math]::Max(1, [int][math]::Round(($Seconds * 1000) / $sliceMs))
     for ($n = 0; $n -lt $slices; $n++) {
+        if ($script:_liveClosed) { return }   # user closed the live view - stop waiting immediately
         Start-Sleep -Milliseconds $sliceMs
         $w = if ($script:_liveWin) { $script:_liveWin } else { $script:_splash }
         if ($w) {
@@ -586,6 +587,12 @@ function Set-LiveServerState ([string]$Server, [string]$Text, [string]$Color = '
         $row.BadgeBorder.Background = Get-LiveBrush $Color
         if ($PSBoundParameters.ContainsKey('Role')) { $row.RoleText.Text = $Role }
     }, [System.Windows.Threading.DispatcherPriority]::Render)
+    # Setting the properties only schedules a repaint; if the caller then blocks the UI thread (the next
+    # WinRM/connect call) the frame is never presented - so on a fast server the badge appears to jump
+    # straight to its final state. Pump at Background priority to force the render pass now, exactly as
+    # Set-SplashStatus does. Without this, the intermediate connect states are only ever visible on the
+    # first (slow, cold-Kerberos) server.
+    $script:_liveWin.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
 }
 
 # Update a server's fine-grained step line (what is being attempted right now) so a hang is
@@ -595,39 +602,64 @@ function Set-LiveServerStep ([string]$Server, [string]$Text) {
     if (-not $script:_liveWin) { return }
     $row = $script:_liveRows["$Server"]; if (-not $row -or -not $row.StepText) { return }
     $script:_liveWin.Dispatcher.Invoke([Action]{ $row.StepText.Text = $Text }, [System.Windows.Threading.DispatcherPriority]::Render)
+    # Force the render pass now (see Set-LiveServerState) - otherwise each "Testing WinRM port..." /
+    # "WS-Man handshake..." step is set but never painted before the next blocking call, so on a fast
+    # server the step line skips straight to its last value.
+    $script:_liveWin.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
 }
 
-# Append one tick's sample to a server's sparklines + value labels. $Sessions >= 0 (VDA only)
-# reveals + feeds the Sessions box; -1 leaves it hidden.
+# Pure sparkline/label math for one row's metrics - assumes the caller is already on the UI thread
+# (no Dispatcher call here). $Vals is a hashtable of metric-id -> value, e.g. @{ Cpu=...; Sess=... }.
+function Update-LiveRowMetrics ($Row, [hashtable]$Vals) {
+    if ($Vals.ContainsKey('Sess') -and $Row.Metrics['Sess'].Box) { $Row.Metrics['Sess'].Box.Visibility = 'Visible' }
+    foreach ($id in $Vals.Keys) {
+        $e = $Row.Metrics[$id]; if (-not $e) { continue }
+        $v = [double]$Vals[$id]
+        # O(1) ring buffer (Queue) capped at 60 - a 150px sparkline can't show more, and this avoids the
+        # O(n) List.RemoveAt(0) shift every tick.
+        $q = $e.Vals; $q.Enqueue($v); while ($q.Count -gt 60) { [void]$q.Dequeue() }
+        $arr = $q.ToArray(); $n = $arr.Length
+        $w = 150.0; $h = 40.0
+        # Fixed scale (CPU/RAM) uses Max; auto-scale metrics take a cheap manual max (no Measure-Object).
+        if ($e.Max -gt 0) { $top = [double]$e.Max }
+        else { $top = 0.0; for ($k = 0; $k -lt $n; $k++) { if ($arr[$k] -gt $top) { $top = $arr[$k] } }; if ($top -le 0) { $top = 1.0 } }
+        $pts = New-Object System.Windows.Media.PointCollection
+        for ($i = 0; $i -lt $n; $i++) {
+            $x = if ($n -le 1) { 0.0 } else { $w * $i / ($n - 1) }
+            $cv = [math]::Min($arr[$i], $top)
+            $y = $h - ($h * ($cv / $top))
+            [void]$pts.Add([System.Windows.Point]::new($x, $y))
+        }
+        if ($n -le 1) { [void]$pts.Add([System.Windows.Point]::new($w, $pts[0].Y)) }
+        $pts.Freeze()   # frozen point collection renders without per-point change notifications
+        $e.Poly.Points = $pts
+        $e.Label.Text = if ($e.Max -eq 100) { '{0:N0}{1}' -f $v, $e.Unit } else { '{0:N1}' -f $v }
+    }
+}
+
+# Append one tick's sample to a single server's sparklines + value labels. $Sessions >= 0 (VDA only)
+# reveals + feeds the Sessions box; -1 leaves it hidden. Kept for compatibility / single-row callers;
+# the tick loop uses the batched Update-LiveSampleBatch below instead.
 function Update-LiveSample ([string]$Server, [double]$Cpu, [double]$Ram, [double]$Dq, [double]$Dm, [double]$Net, [int]$Sessions = -1) {
     if (-not $script:_liveWin) { return }
     $row = $script:_liveRows["$Server"]; if (-not $row) { return }
     $vals = @{ Cpu = $Cpu; Ram = $Ram; Dq = $Dq; Dm = $Dm; Net = $Net }
     if ($Sessions -ge 0) { $vals['Sess'] = $Sessions }
+    $script:_liveWin.Dispatcher.Invoke([Action]{ Update-LiveRowMetrics $row $vals }, [System.Windows.Threading.DispatcherPriority]::Render)
+}
+
+# Batched per-tick UI update: ONE dispatcher call covering every server sampled this tick, plus the
+# determinate progress bar (see the Phase 1/Phase 2 progress-bar flip in Invoke-OnPremCollection).
+# Must be a SYNCHRONOUS Dispatcher.Invoke, not BeginInvoke - an async dispatcher callback silently
+# no-ops on tick-local closures in this PS version. No-ops entirely when there's no live view (e.g.
+# headless or plain-splash-without-rows runs), so callers can call it unconditionally.
+function Update-LiveSampleBatch ([hashtable]$TickSamples, [double]$ProgressPct) {
+    if (-not $script:_liveWin) { return }
+    $rows = $script:_liveRows; $bar = $script:_liveBar
     $script:_liveWin.Dispatcher.Invoke([Action]{
-        if ($Sessions -ge 0 -and $row.Metrics['Sess'].Box) { $row.Metrics['Sess'].Box.Visibility = 'Visible' }
-        foreach ($id in $vals.Keys) {
-            $e = $row.Metrics[$id]; if (-not $e) { continue }
-            $v = [double]$vals[$id]
-            # O(1) ring buffer (Queue) capped at 60 - a 150px sparkline can't show more, and this avoids the
-            # O(n) List.RemoveAt(0) shift every tick.
-            $q = $e.Vals; $q.Enqueue($v); while ($q.Count -gt 60) { [void]$q.Dequeue() }
-            $arr = $q.ToArray(); $n = $arr.Length
-            $w = 150.0; $h = 40.0
-            # Fixed scale (CPU/RAM) uses Max; auto-scale metrics take a cheap manual max (no Measure-Object).
-            if ($e.Max -gt 0) { $top = [double]$e.Max }
-            else { $top = 0.0; for ($k = 0; $k -lt $n; $k++) { if ($arr[$k] -gt $top) { $top = $arr[$k] } }; if ($top -le 0) { $top = 1.0 } }
-            $pts = New-Object System.Windows.Media.PointCollection
-            for ($i = 0; $i -lt $n; $i++) {
-                $x = if ($n -le 1) { 0.0 } else { $w * $i / ($n - 1) }
-                $cv = [math]::Min($arr[$i], $top)
-                $y = $h - ($h * ($cv / $top))
-                [void]$pts.Add([System.Windows.Point]::new($x, $y))
-            }
-            if ($n -le 1) { [void]$pts.Add([System.Windows.Point]::new($w, $pts[0].Y)) }
-            $pts.Freeze()   # frozen point collection renders without per-point change notifications
-            $e.Poly.Points = $pts
-            $e.Label.Text = if ($e.Max -eq 100) { '{0:N0}{1}' -f $v, $e.Unit } else { '{0:N1}' -f $v }
+        if ($bar -and -not $bar.IsIndeterminate) { $bar.Value = $ProgressPct }
+        foreach ($server in $TickSamples.Keys) {
+            $row = $rows["$server"]; if ($row) { Update-LiveRowMetrics $row $TickSamples[$server] }
         }
     }, [System.Windows.Threading.DispatcherPriority]::Render)
 }
@@ -637,6 +669,104 @@ function Close-LiveView {
         try { $script:_liveWin.Close() } catch {}
         $script:_liveWin = $null
     }
+}
+
+# ── Background performance polling (mirrors Get-VsphereData.ps1's Invoke-VimPumped/Start-PerfRunspace) ──
+# Backgrounds Phase 2's per-tick WinRM sampling so the live view / splash window stays responsive. Reuses
+# ONE persistent local runspace for the whole monitoring run. That runspace never opens/closes a PSSession
+# itself - it only drives Invoke-Command against sessions already opened on the MAIN runspace in Phase 1.
+# A PSSession is a client-side handle to a remote WSMan connection (not a closure bound to its creating
+# runspace the way a scriptblock-to-delegate conversion is - see the ServerCertificateValidationCallback
+# fix in the vSphere collector for that different, unrelated failure mode); using an already-open session
+# from a different local runspace is safe as long as the same session is never driven from two runspaces
+# concurrently, which holds here since only this background pipeline touches ctx.Session during Phase 2,
+# one server at a time, sequentially - exactly like the original inline loop did.
+$script:_onPremPerfRs = $null
+function Start-OnPremPerfRunspace {
+    try {
+        # CreateDefault2() (not the parameterless CreateRunspace()/CreateDefault()) - a second runspace in
+        # this process re-importing Microsoft.PowerShell.Diagnostics' default type data (needed by
+        # Get-Counter, used by the local-target fallback below) throws "member is already present" against
+        # CreateDefault()'s eager registration; CreateDefault2()'s lazy module loading avoids the collision.
+        # ImportPSModule explicitly, rather than relying on command-not-found autoload - autoload timing
+        # for this module proved unreliable in testing (worked standalone, failed once other WPF assemblies
+        # were already loaded in the process).
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault2()
+        $iss.ImportPSModule(@('Microsoft.PowerShell.Diagnostics'))
+        $script:_onPremPerfRs = [runspacefactory]::CreateRunspace($iss)
+        $script:_onPremPerfRs.Open()
+    }
+    catch { Write-Log "On-prem perf runspace unavailable (using synchronous polling): $_" 'WARN'; $script:_onPremPerfRs = $null }
+}
+function Stop-OnPremPerfRunspace {
+    if ($script:_onPremPerfRs) { try { $script:_onPremPerfRs.Close(); $script:_onPremPerfRs.Dispose() } catch {} ; $script:_onPremPerfRs = $null }
+}
+
+# Runs $SampleBlock (and, for VDA targets, $SessionBlock) against every target in $Targets, in one
+# background pipeline, sequentially - same per-target try/catch isolation as the original inline loop.
+# $Targets: array of @{ Server; Session; NeedsSessions } (index-paired with the caller's $contexts, not
+# name-keyed - server names are not guaranteed unique). Returns an array of result objects in the SAME
+# order as $Targets, or $null if there's no background runspace or the live view was closed mid-wait (the
+# caller falls back to Invoke-OnPremTickSync). The background script is fully self-contained - Write-Log
+# and every other main-script function are unreachable from a different runspace's session state, so all
+# logging/UI/JSON work happens back on the main thread after EndInvoke, not inside this scriptblock.
+function Invoke-OnPremTickPumped ($Targets, [scriptblock]$SampleBlock, [scriptblock]$SessionBlock) {
+    if (-not $script:_onPremPerfRs) { return $null }
+    $ps = [powershell]::Create(); $ps.Runspace = $script:_onPremPerfRs
+    [void]$ps.AddScript({
+        param($targets, $sampleBlockText, $sessionBlockText)
+        # Reconstruct from source text rather than invoking the caller's live [scriptblock] object - a
+        # scriptblock retains a "home" session-state reference from where it was parsed, which broke
+        # command/module autoload (Get-Counter) when invoked via & in this different runspace, even
+        # though Invoke-Command -ScriptBlock (the remote path) was unaffected. Confirmed via isolated
+        # testing before rolling this out - see the perf-polling design notes in Invoke-OnPremCollection.
+        $sampleBlock = [scriptblock]::Create($sampleBlockText)
+        $sessionBlock = [scriptblock]::Create($sessionBlockText)
+        foreach ($t in $targets) {
+            $res = [ordered]@{ Server = $t.Server; Ok = $false; Error = $null; Cpu = $null; Ram = $null; Dq = $null; Dm = $null; Net = $null; Sessions = -1 }
+            try {
+                $smp = if ($t.Session) { Invoke-Command -Session $t.Session -ScriptBlock $sampleBlock -ErrorAction Stop } else { & $sampleBlock }
+                $res.Cpu = $smp.CpuPct; $res.Ram = $smp.RamPct; $res.Dq = $smp.DiskQueueLen; $res.Dm = $smp.DiskMBps; $res.Net = $smp.NetMbps
+                if ($t.NeedsSessions) {
+                    try {
+                        $ss = if ($t.Session) { Invoke-Command -Session $t.Session -ScriptBlock $sessionBlock -ErrorAction Stop } else { & $sessionBlock }
+                        $res.Sessions = [int]$ss.Total
+                    } catch {}
+                }
+                $res.Ok = $true
+            } catch { $res.Error = "$_" }
+            [pscustomobject]$res
+        }
+    }).AddArgument($Targets).AddArgument($SampleBlock.ToString()).AddArgument($SessionBlock.ToString())
+
+    $h = $ps.BeginInvoke()
+    while (-not $h.IsCompleted) {
+        if ($script:_liveClosed) { try { $ps.Stop() } catch {} ; $ps.Dispose(); return $null }
+        $w = if ($script:_liveWin) { $script:_liveWin } else { $script:_splash }
+        if ($w) { try { $w.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {} }
+        Start-Sleep -Milliseconds 40
+    }
+    try { return @($ps.EndInvoke($h)) } finally { $ps.Dispose() }
+}
+
+# Synchronous fallback for the interactive tick loop (used after a background-pipeline failure, for the
+# rest of that run). Same per-target logic and result shape/order as Invoke-OnPremTickPumped, run on the
+# calling (main) runspace via the existing Invoke-OnTarget helper.
+function Invoke-OnPremTickSync ($Targets, [scriptblock]$SampleBlock, [scriptblock]$SessionBlock) {
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($t in $Targets) {
+        $res = [ordered]@{ Server = $t.Server; Ok = $false; Error = $null; Cpu = $null; Ram = $null; Dq = $null; Dm = $null; Net = $null; Sessions = -1 }
+        try {
+            $smp = Invoke-OnTarget $t.Session $SampleBlock
+            $res.Cpu = $smp.CpuPct; $res.Ram = $smp.RamPct; $res.Dq = $smp.DiskQueueLen; $res.Dm = $smp.DiskMBps; $res.Net = $smp.NetMbps
+            if ($t.NeedsSessions) {
+                try { $ss = Invoke-OnTarget $t.Session $SessionBlock; $res.Sessions = [int]$ss.Total } catch {}
+            }
+            $res.Ok = $true
+        } catch { $res.Error = "$_" }
+        $out.Add([pscustomobject]$res)
+    }
+    $out.ToArray()   # never wrap a List[object] in @() - throws "Argument types do not match" on this PS
 }
 
 #endregion
@@ -2036,6 +2166,23 @@ function Get-FasData ([string]$Address, [bool]$IsLocal, [string[]]$ExtraAddresse
     return [pscustomobject]$r
 }
 
+# Wait on a WaitHandle in short slices, pumping the WPF dispatcher (live view or splash) between slices so
+# the window keeps repainting and stays responsive instead of freezing for the whole timeout. Same contract
+# as WaitHandle.WaitOne(int): returns $true if it signalled within $TimeoutMs, $false on timeout. When no
+# window is shown (headless -NoSplash) it degrades to the original single blocking WaitOne - identical
+# behaviour, no slicing overhead.
+function Wait-HandleResponsive ([System.Threading.WaitHandle]$Handle, [int]$TimeoutMs, [int]$SliceMs = 100) {
+    $w = if ($script:_liveWin) { $script:_liveWin } elseif ($script:_splash) { $script:_splash } else { $null }
+    if (-not $w) { return $Handle.WaitOne($TimeoutMs) }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $remaining = $TimeoutMs - [int]$sw.ElapsedMilliseconds
+        if ($remaining -le 0) { return $false }
+        if ($Handle.WaitOne([math]::Min($SliceMs, $remaining))) { return $true }
+        try { $w.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background) } catch {}
+    }
+}
+
 # Fast TCP reachability probe for the WinRM HTTP port (5985) with an explicit timeout, so a
 # filtered/blocked port fails in a few seconds with a clear reason instead of New-PSSession
 # blocking on the default WS-Man open. Uses BeginConnect + a bounded wait (deterministic).
@@ -2043,7 +2190,7 @@ function Test-WinRmPort ([string]$ComputerName, [int]$Port = 5985, [int]$Timeout
     $client = [System.Net.Sockets.TcpClient]::new()
     try {
         $iar = $client.BeginConnect($ComputerName, $Port, $null, $null)
-        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }   # timed out
+        if (-not (Wait-HandleResponsive $iar.AsyncWaitHandle $TimeoutMs)) { return $false }   # timed out
         $client.EndConnect($iar)                                               # throws if refused
         return $true
     } catch { return $false } finally { $client.Close() }
@@ -2058,7 +2205,7 @@ function Invoke-WithTimeout ([scriptblock]$Script, [int]$TimeoutSec = 15, [objec
         [void]$ps.AddScript($Script)
         foreach ($a in @($ArgumentList)) { [void]$ps.AddArgument($a) }
         $async = $ps.BeginInvoke()
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+        if (-not (Wait-HandleResponsive $async.AsyncWaitHandle ($TimeoutSec * 1000))) {
             try { [void]$ps.BeginStop($null, $null) } catch {}   # abandon the stuck call
             return @{ TimedOut = $true; Error = "no response within ${TimeoutSec}s"; Result = $null }
         }
@@ -2074,6 +2221,17 @@ function Invoke-WithTimeout ([scriptblock]$Script, [int]$TimeoutSec = 15, [objec
 }
 
 function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [System.Management.Automation.PSCredential]$Cred, [switch]$NoPerf) {
+    # Pre-warm Microsoft.WSMan.Management (backs Test-WSMan, used by Invoke-WithTimeout below) in THIS
+    # runspace, once, before Phase 1's per-server loop starts. Invoke-WithTimeout's [powershell]::Create()
+    # gives every WS-Man handshake check its own brand-new, ephemeral runspace - loading a module into a
+    # fresh runspace for the first time in the process pays a real (if modest, ~30ms) assembly-load/JIT
+    # cost; every runspace after that benefits since the assembly is already loaded process-wide. Without
+    # this, that cost lands on whichever server happens to be first in the list, not on any of the others.
+    # NB: this measured effect is tens of milliseconds, not seconds - most of the visible delay on a real
+    # domain-joined first connection is very likely Kerberos ticket/KDC-discovery overhead for the first
+    # authenticated connection of the process, which no amount of module pre-warming can pre-pay.
+    try { Import-Module Microsoft.WSMan.Management -ErrorAction Stop } catch { Write-Log "Pre-warm of Microsoft.WSMan.Management failed (non-fatal, first WS-Man check may be slightly slower): $_" 'WARN' }
+
     $files = [System.Collections.Generic.List[string]]::new()
     $script:_siteCollected = $false   # site (Broker) data is collected once, from the first reachable DDC
     $intervalSec  = 30
@@ -2342,7 +2500,14 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
     # ── Phase 2: interleaved sampling - one sample from EVERY server per tick, so all
     # servers are measured over the same window. Each server's JSON is rewritten as it
     # goes, so the file on disk is always valid and current even if the run is interrupted.
-    if ($contexts.Count -gt 0) {
+    #
+    # Headless (-NoSplash) runs use the original, fully synchronous per-server loop unchanged - there is
+    # no UI to protect, and it's likely the unattended/scheduled path against production infrastructure,
+    # so it stays byte-for-byte identical to before this change. Interactive runs (live view or plain
+    # splash) background the WinRM round-trips per tick so the window stays responsive - see
+    # Invoke-OnPremTickPumped / Invoke-OnPremTickSync above.
+    $backgroundLive = (-not $script:_noSplash) -and ($sampleCount -gt 0) -and ($contexts.Count -gt 0)
+    if ($contexts.Count -gt 0 -and -not $backgroundLive) {
         for ($i = 0; $i -lt $sampleCount; $i++) {
             Set-SplashStatus "Sampling all servers (tick $($i + 1) of $sampleCount)..."
             Set-LiveStatus "Sampling - tick $($i + 1) of $sampleCount (every ${intervalSec}s)..."
@@ -2369,6 +2534,74 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
             }
             if ($i -lt ($sampleCount - 1)) { Start-SleepResponsive ($intervalSec - 1) }   # -1 for the Get-Counter second
         }
+    }
+    elseif ($backgroundLive) {
+        # $targets is index-paired with $contexts (built once - roles/sessions don't change across ticks).
+        $targets = @($contexts | ForEach-Object { [pscustomobject]@{ Server = $_['Server']; Session = $_['Session']; NeedsSessions = ($_['Roles'] -contains 'VDA') } })
+        $writeThrottleTicks = 2   # ~60s worst-case on-disk staleness at this file's 30s sample interval
+        $useBackground = $true
+        Start-OnPremPerfRunspace
+        if (-not $script:_onPremPerfRs) { $useBackground = $false }
+        # Flip the progress bar to determinate now that Phase 2 (a bounded tick/total run) is starting;
+        # Phase 1 has no fixed unit of work, so it stays indeterminate up to this point.
+        if ($script:_liveBar) { $script:_liveWin.Dispatcher.Invoke([Action]{ $script:_liveBar.IsIndeterminate = $false }, [System.Windows.Threading.DispatcherPriority]::Render) }
+
+        for ($i = 0; $i -lt $sampleCount; $i++) {
+            if ($script:_liveClosed) { break }
+            Set-SplashStatus "Sampling all servers (tick $($i + 1) of $sampleCount)..."
+            Set-LiveStatus "Sampling - tick $($i + 1) of $sampleCount (every ${intervalSec}s)..."
+
+            $results = if ($useBackground) { Invoke-OnPremTickPumped $targets $script:_sampleBlock $script:_sessionBlock } else { $null }
+            if (-not $results) {
+                if ($useBackground) {
+                    Write-Log 'On-prem perf polling: switching to synchronous mode after a background failure/close.' 'WARN'
+                    Stop-OnPremPerfRunspace; $useBackground = $false
+                }
+                if ($script:_liveClosed) { break }
+                $results = Invoke-OnPremTickSync $targets $script:_sampleBlock $script:_sessionBlock
+            }
+
+            $tickSamples = @{}
+            for ($k = 0; $k -lt $contexts.Count; $k++) {
+                $ctx = $contexts[$k]; $res = $results[$k]
+                if (-not $res -or -not $res.Ok) { Write-Log "Sample $($i + 1) failed on $($ctx['Display']): $($res.Error)" 'WARN'; continue }
+                $entry = [ordered]@{
+                    Timestamp    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    CpuPct       = $res.Cpu
+                    RamPct       = $res.Ram
+                    DiskQueueLen = $res.Dq
+                    DiskMBps     = $res.Dm
+                    NetMbps      = $res.Net
+                }
+                # UI ring-buffer keys (Cpu/Ram/Dq/Dm/Net/Sess) intentionally differ from the JSON field
+                # names above (CpuPct/RamPct/...) - matches $script:_liveMetrics' Id values.
+                $tv = @{ Cpu = $res.Cpu; Ram = $res.Ram; Dq = $res.Dq; Dm = $res.Dm; Net = $res.Net }
+                if ($res.Sessions -ge 0) { $entry['Sessions'] = $res.Sessions; $tv['Sess'] = $res.Sessions }
+                [void]$ctx['Samples'].Add($entry)
+                $tickSamples[$ctx['Server']] = $tv
+            }
+            Update-LiveSampleBatch $tickSamples (100.0 * ($i + 1) / $sampleCount)
+
+            $isLastTick = ($i -eq ($sampleCount - 1))
+            if (($i % $writeThrottleTicks -eq 0) -or $isLastTick) {
+                foreach ($ctx in $contexts) {
+                    Write-OnPremJson -Server $ctx['Server'] -ReachedVia $ctx['Reached'] -Spec $ctx['Spec'] -Components $ctx['Comps'] -Roles $ctx['Roles'] -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $ctx['Fas'] -Events $ctx['Events'] -StoreFront $ctx['StoreFront'] -Pvs $ctx['Pvs'] -Patch $ctx['Patch'] -VdaComponents $ctx['VdaComponents'] -Sessions $ctx['Sessions'] -Licensing $ctx['Licensing']
+                }
+            }
+
+            if ($script:_liveClosed) { break }
+            if ($i -lt ($sampleCount - 1)) { Start-SleepResponsive ($intervalSec - 1) }   # -1 for the Get-Counter second
+        }
+
+        if ($script:_liveClosed) {
+            # Early exit: unthrottled final flush - closing the live view mid-run is a plausible real
+            # event on production infra, so don't leave any context's on-disk sample count stale
+            # relative to what was actually captured in memory.
+            foreach ($ctx in $contexts) {
+                Write-OnPremJson -Server $ctx['Server'] -ReachedVia $ctx['Reached'] -Spec $ctx['Spec'] -Components $ctx['Comps'] -Roles $ctx['Roles'] -Samples $ctx['Samples'] -DurationMin $DurationMin -Files $files -OutFile $ctx['OutFile'] -Fas $ctx['Fas'] -Events $ctx['Events'] -StoreFront $ctx['StoreFront'] -Pvs $ctx['Pvs'] -Patch $ctx['Patch'] -VdaComponents $ctx['VdaComponents'] -Sessions $ctx['Sessions'] -Licensing $ctx['Licensing']
+            }
+        }
+        Stop-OnPremPerfRunspace
     }
 
     # ── Phase 3: files are already final (last tick wrote them); just close sessions.
@@ -2606,8 +2839,9 @@ $safeCustomer = ("$customer" -replace '[^\w\-. ]', '_').Trim().TrimEnd('.')
 if ($safeCustomer) { $script:_outputDir = Join-Path $script:_outputDir $safeCustomer }
 if (-not (Test-Path $script:_outputDir)) { New-Item -ItemType Directory -Path $script:_outputDir -Force | Out-Null }
 
-# Live dashboard (opt-in, GUI only) runs collection in a background runspace so the window stays
-# responsive; the plain splash / headless paths run synchronously on this thread.
+# Live dashboard / plain splash (GUI only): Phase 2's performance sampling backgrounds its WinRM round
+# trips in a background runspace so the window stays responsive (see Invoke-OnPremTickPumped). Phase 1
+# (connect + static collection) and headless (-NoSplash) runs stay fully synchronous on this thread.
 $useLive = $liveView -and -not $noPerf -and -not $script:_noSplash
 $script:_customer = $customer   # used by Write-OnPremSiteJson for the site file name / CustomerName
 Write-Log "Targets: $($targets -join ', '); duration=$(if ($noPerf) { 'n/a (NoPerf)' } else { "${duration}m" }); cred=$([bool]$cred); noSplash=$([bool]$NoSplash); liveView=$useLive"

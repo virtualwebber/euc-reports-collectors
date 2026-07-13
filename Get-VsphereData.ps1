@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-10.1   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-13   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -52,7 +52,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-10.1'
+$script:_version = '2026-07-13'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -668,6 +668,45 @@ function Collect-VsphereData ([scriptblock]$OnTick) {
         $scopeType = 'Host'; $scopeName = $VMHost
     } else { throw 'Specify -Cluster or -VMHost.' }
 
+    # Choose which enumerated hosts / powered-on VMs get LIVE performance capture. Interactive only - the
+    # launch dialog runs before we connect, so this is the first point we have the real inventory. Selection
+    # populates $selHostMo / $selVmMo (MoRef sets) which gate the $targets loops below; the full host/VM
+    # records + CPU Ready are still built for everything. Headless/param path keeps the prior behaviour.
+    $selHostMo = New-Object System.Collections.Generic.HashSet[string]
+    $selVmMo   = New-Object System.Collections.Generic.HashSet[string]
+    if ((-not $NoPerf) -and (-not $script:_noSplash)) {
+        $hostNameByMo = @{}
+        $hostItems = foreach ($h in @($hostObjs)) {
+            $mo = "$($h.obj.'#text')"; $nm = "$(Get-Prop $h 'name')"; $hostNameByMo[$mo] = $nm
+            $model = "$(Get-Prop $h 'summary.hardware.model')"; $cores = [int](Get-Prop $h 'summary.hardware.numCpuCores')
+            [pscustomobject]@{ Mo = $mo; Name = $nm; Sub = (@($model, $(if ($cores) { "$cores cores" })) | Where-Object { $_ }) -join '  ' }
+        }
+        $vmItems = foreach ($v in @($vmObjs)) {
+            if ((Get-Prop $v 'runtime.powerState') -ne 'poweredOn') { continue }
+            $mo = "$($v.obj.'#text')"; $nm = "$(Get-Prop $v 'name')"; $nc = [int](Get-Prop $v 'config.hardware.numCPU')
+            $hn = $hostNameByMo["$(Get-Prop $v 'runtime.host')"]
+            [pscustomobject]@{ Mo = $mo; Name = $nm; Sub = (@($(if ($nc) { "$nc vCPU" }), $hn) | Where-Object { $_ }) -join '  ' }
+        }
+        $vmItems = @($vmItems | Sort-Object Name)
+
+        if ($script:_splash) { try { $script:_splash.Hide() } catch {} }
+        $pick = Show-VspherePerfTargetDialog @($hostItems) $vmItems
+        if ($script:_splash) { try { $script:_splash.Show(); [void]$script:_splash.Activate() } catch {} }
+        if ($pick.Action -eq 'OK') {
+            foreach ($m in @($pick.Hosts)) { [void]$selHostMo.Add("$m") }
+            foreach ($m in @($pick.Vms))   { [void]$selVmMo.Add("$m") }
+            Write-Log "Monitoring selection: $($selHostMo.Count) host(s), $($selVmMo.Count) VM(s)"
+        } else {
+            Write-Log 'Monitoring selection: skipped (static inventory only)'
+        }
+    } else {
+        # Headless / param-driven: monitor all hosts, and all powered-on VMs unless -HostsOnly (prior default).
+        foreach ($h in @($hostObjs)) { [void]$selHostMo.Add("$($h.obj.'#text')") }
+        if (-not $HostsOnly) {
+            foreach ($v in @($vmObjs)) { if ((Get-Prop $v 'runtime.powerState') -eq 'poweredOn') { [void]$selVmMo.Add("$($v.obj.'#text')") } }
+        }
+    }
+
     # Performance counters (fetched once): CPU Ready for powered-on VMs + host/VM live-monitoring counters.
     Set-SplashStatus 'Querying performance counters...'
     $allCtrs = Get-AllPerfCounters
@@ -710,7 +749,7 @@ function Collect-VsphereData ([scriptblock]$OnTick) {
             Perf         = $null
         }
         $vmMeta.Add([pscustomobject]@{ Mo = $mo; HostMo = "$(Get-Prop $v 'runtime.host')"; On = $on; NumCpu = $numCpu; Record = $rec })
-        if ($on -and -not $NoPerf -and -not $HostsOnly) {
+        if ($on -and -not $NoPerf -and $selVmMo.Contains($mo)) {
             $rec['Perf'] = New-PerfSeries
             $targets.Add(@{ Key = $mo; Type = 'VirtualMachine'; Name = $vmName; Kind = 'VM'; Rec = $rec; Series = $rec['Perf'] })
         }
@@ -758,7 +797,7 @@ function Collect-VsphereData ([scriptblock]$OnTick) {
             Perf            = $null
         }
         $hostList.Add($hrec)
-        if (-not $NoPerf) {
+        if (-not $NoPerf -and $selHostMo.Contains($hMo)) {
             $hrec['Perf'] = New-PerfSeries
             $targets.Add(@{ Key = $hMo; Type = 'HostSystem'; Name = $hName; Kind = 'Host'; Rec = $hrec; Series = $hrec['Perf'] })
         }
@@ -819,7 +858,12 @@ function Show-VsphereDialog {
     <TextBlock Text="vSphere Data Collector" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
     <TextBlock Text="Host + VM utilisation, CPU Ready and overcommit from a vCenter (VCSA)" FontSize="12" Foreground="#555" Margin="0,2,0,16"/>
     <TextBlock Text="vCenter (VCSA) address" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
-    <TextBox x:Name="VcBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,12"/>
+    <Border BorderBrush="#CDD0D6" BorderThickness="1" Background="White" Margin="0,0,0,12">
+      <DockPanel LastChildFill="True">
+        <TextBlock Text="https://" DockPanel.Dock="Left" Foreground="#8a8f98" FontSize="12" VerticalAlignment="Center" Margin="8,0,0,0"/>
+        <TextBox x:Name="VcBox" BorderThickness="0" Background="Transparent" Padding="2,6,8,6" FontSize="12" VerticalContentAlignment="Center"/>
+      </DockPanel>
+    </Border>
     <TextBlock Text="Username (e.g. administrator@vsphere.local)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
     <TextBox x:Name="UserBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,12"/>
     <TextBlock Text="Password" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
@@ -841,7 +885,7 @@ function Show-VsphereDialog {
           <TextBlock Text="minutes  (20s samples)" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="6,0,0,0"/>
         </StackPanel>
         <CheckBox x:Name="LiveChk" Content="Show live view during monitoring" IsChecked="True" Foreground="#1F2937" FontSize="12" Margin="22,8,0,0"/>
-        <CheckBox x:Name="HostsOnlyChk" Content="Hosts only (skip per-VM performance)" Foreground="#1F2937" FontSize="12" Margin="22,8,0,0"/>
+        <TextBlock Text="After connecting you'll pick which hosts and VMs to monitor (hosts default on, VMs off)." FontSize="11" Foreground="#8a8f98" TextWrapping="Wrap" Margin="22,8,0,0"/>
       </StackPanel>
     </Border>
     <Grid><TextBlock x:Name="VersionText" Text="" FontSize="10" Foreground="#8a8f98" VerticalAlignment="Center" HorizontalAlignment="Left"/>
@@ -853,12 +897,13 @@ function Show-VsphereDialog {
     $win.FindName('VersionText').Text = "v$($script:_version)"
     $vcBox = $win.FindName('VcBox'); $userBox = $win.FindName('UserBox'); $pwBox = $win.FindName('PwBox')
     $rbCluster = $win.FindName('RbCluster'); $scopeBox = $win.FindName('ScopeBox'); $custBox = $win.FindName('CustBox'); $encBox = $win.FindName('EncBox')
-    $perfChk = $win.FindName('PerfChk'); $durBox = $win.FindName('DurBox'); $liveChk = $win.FindName('LiveChk'); $hostsOnlyChk = $win.FindName('HostsOnlyChk')
+    $perfChk = $win.FindName('PerfChk'); $durBox = $win.FindName('DurBox'); $liveChk = $win.FindName('LiveChk')
     if ($VCenter) { $vcBox.Text = $VCenter }; if ($Username) { $userBox.Text = $Username }; if ($Cluster) { $scopeBox.Text = $Cluster }; if ($VMHost) { $win.FindName('RbHost').IsChecked = $true; $scopeBox.Text = $VMHost }
     $result = @{ Action = 'Cancel' }
     $win.FindName('OkBtn').Add_Click({
         if (-not $vcBox.Text.Trim() -or -not $userBox.Text.Trim() -or -not $scopeBox.Text.Trim() -or -not $pwBox.Password) { [System.Windows.MessageBox]::Show('Enter the vCenter, username, password and scope.', 'vSphere', 'OK', 'Warning') | Out-Null; return }
-        $result.Action = 'OK'; $result.VCenter = $vcBox.Text.Trim(); $result.Username = $userBox.Text.Trim()
+        # Strip any scheme/trailing slash a user pastes in - Connect-Vsphere adds https://...$VC/sdk itself.
+        $result.Action = 'OK'; $result.VCenter = ($vcBox.Text.Trim() -replace '^\s*https?://\s*', '' -replace '\s*/+\s*$', ''); $result.Username = $userBox.Text.Trim()
         $result.Password = ConvertTo-SecureString $pwBox.Password -AsPlainText -Force
         $result.ScopeType = if ($rbCluster.IsChecked) { 'Cluster' } else { 'Host' }; $result.Scope = $scopeBox.Text.Trim(); $result.Customer = $custBox.Text.Trim()
         $result.Encrypt = if ($encBox.Password) { ConvertTo-SecureString $encBox.Password -AsPlainText -Force } else { $null }
@@ -866,10 +911,100 @@ function Show-VsphereDialog {
         $dm = 30; [void][int]::TryParse($durBox.Text.Trim(), [ref]$dm); if ($dm -lt 1) { $dm = 1 }
         $result.DurationMinutes = $dm
         $result.NoLiveView = -not $liveChk.IsChecked
-        $result.HostsOnly = [bool]$hostsOnlyChk.IsChecked
         $win.Close()
     })
     $win.FindName('CancelBtn').Add_Click({ $win.Close() })
+    $null = $win.ShowDialog()
+    $result
+}
+
+# Post-connect target picker: choose which enumerated hosts / powered-on VMs get LIVE performance capture.
+# Shown only interactively, after the cluster inventory is known (the launch dialog runs before we connect,
+# so it can't list real hosts/VMs). Hosts default ticked (all), VMs default un-ticked. Selection filters the
+# live-monitoring $targets only - the full host/VM inventory + CPU Ready are still collected regardless.
+# $HostItems / $VmItems: arrays of @{ Mo; Name; Sub }. Returns @{ Action='OK'|'Skip'; Hosts=@(mo); Vms=@(mo) }.
+function Show-VspherePerfTargetDialog ($HostItems, $VmItems) {
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Select monitoring targets" Height="600" Width="500" WindowStartupLocation="CenterScreen" ResizeMode="NoResize" FontFamily="Segoe UI" FontSize="13" Background="#F4F6F9">
+  <Window.Resources>
+    <Style x:Key="BlueBtn" TargetType="Button"><Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/><Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
+    <Style x:Key="GreyBtn" TargetType="Button"><Setter Property="Background" Value="#E1E4EA"/><Setter Property="Foreground" Value="#1F2937"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#CDD0D8"/></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
+  </Window.Resources>
+  <DockPanel Margin="22,20,22,16">
+    <TextBlock DockPanel.Dock="Top" Text="Select what to monitor" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+    <TextBlock DockPanel.Dock="Top" Text="Live performance is captured only for the ticked items. The full cluster inventory (specs, CPU Ready, overcommit) is collected either way." FontSize="11" Foreground="#555" TextWrapping="Wrap" Margin="0,3,0,14"/>
+    <Grid DockPanel.Dock="Bottom" Margin="0,14,0,0">
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="SkipBtn" Content="Skip monitoring" Width="130" Padding="0,7" Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/>
+        <Button x:Name="StartBtn" Content="Start" Width="110" Padding="0,7" Style="{StaticResource BlueBtn}" IsDefault="True"/>
+      </StackPanel>
+    </Grid>
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+      <StackPanel>
+        <Grid Margin="0,0,0,4">
+          <TextBlock Text="Hosts" FontSize="12" FontWeight="SemiBold" Foreground="#1F2937" VerticalAlignment="Center"/>
+          <CheckBox x:Name="HostAll" Content="Select all" IsChecked="True" HorizontalAlignment="Right" Foreground="#0078D4" FontSize="11"/>
+        </Grid>
+        <Border Background="White" BorderBrush="#E1E4EA" BorderThickness="1" CornerRadius="4" Padding="10,6">
+          <StackPanel x:Name="HostsPanel"/>
+        </Border>
+        <Grid Margin="0,16,0,4">
+          <TextBlock x:Name="VmHeader" Text="Virtual machines" FontSize="12" FontWeight="SemiBold" Foreground="#1F2937" VerticalAlignment="Center"/>
+          <CheckBox x:Name="VmAll" Content="Select all" HorizontalAlignment="Right" Foreground="#0078D4" FontSize="11"/>
+        </Grid>
+        <Border Background="White" BorderBrush="#E1E4EA" BorderThickness="1" CornerRadius="4" Padding="10,6">
+          <StackPanel x:Name="VmsPanel"/>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>
+'@
+    $win = New-ThemedWindow $xaml
+    $hostsPanel = $win.FindName('HostsPanel'); $vmsPanel = $win.FindName('VmsPanel')
+    $hostAll = $win.FindName('HostAll'); $vmAll = $win.FindName('VmAll'); $vmHeader = $win.FindName('VmHeader')
+    $brDark = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#1F2937'))
+    $brDim  = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#8a8f98'))
+
+    $newCheck = {
+        param($item, $checked)
+        $cb = [System.Windows.Controls.CheckBox]::new()
+        $cb.IsChecked = $checked; $cb.Tag = "$($item.Mo)"
+        $cb.Margin = [System.Windows.Thickness]::new(2, 3, 0, 3)
+        $cb.VerticalContentAlignment = 'Center'
+        $sp = [System.Windows.Controls.StackPanel]::new()
+        $t1 = [System.Windows.Controls.TextBlock]::new(); $t1.Text = "$($item.Name)"; $t1.FontSize = 12; $t1.Foreground = $brDark
+        [void]$sp.Children.Add($t1)
+        if ($item.Sub) { $t2 = [System.Windows.Controls.TextBlock]::new(); $t2.Text = "$($item.Sub)"; $t2.FontSize = 10; $t2.Foreground = $brDim; [void]$sp.Children.Add($t2) }
+        $cb.Content = $sp
+        $cb
+    }
+
+    $hostCbs = New-Object System.Collections.Generic.List[object]
+    foreach ($h in @($HostItems)) { $cb = & $newCheck $h $true;  [void]$hostsPanel.Children.Add($cb); $hostCbs.Add($cb) }
+    $vmCbs = New-Object System.Collections.Generic.List[object]
+    foreach ($v in @($VmItems))   { $cb = & $newCheck $v $false; [void]$vmsPanel.Children.Add($cb);   $vmCbs.Add($cb) }
+
+    $vmHeader.Text = "Virtual machines ($($vmCbs.Count) powered-on)"
+    if ($vmCbs.Count -eq 0) {
+        $vmAll.Visibility = 'Collapsed'
+        $none = [System.Windows.Controls.TextBlock]::new(); $none.Text = 'No powered-on VMs.'; $none.FontSize = 11; $none.Foreground = $brDim
+        [void]$vmsPanel.Children.Add($none)
+    }
+
+    $hostAll.Add_Click({ $ck = [bool]$hostAll.IsChecked; foreach ($c in $hostCbs) { $c.IsChecked = $ck } })
+    $vmAll.Add_Click({   $ck = [bool]$vmAll.IsChecked;   foreach ($c in $vmCbs)   { $c.IsChecked = $ck } })
+
+    $result = @{ Action = 'Skip'; Hosts = @(); Vms = @() }
+    $win.FindName('StartBtn').Add_Click({
+        $result.Action = 'OK'
+        $result.Hosts = @($hostCbs | Where-Object { $_.IsChecked } | ForEach-Object { "$($_.Tag)" })
+        $result.Vms   = @($vmCbs   | Where-Object { $_.IsChecked } | ForEach-Object { "$($_.Tag)" })
+        $win.Close()
+    })
+    $win.FindName('SkipBtn').Add_Click({ $result.Action = 'Skip'; $result.Hosts = @(); $result.Vms = @(); $win.Close() })
+    [void]$win.Activate()
     $null = $win.ShowDialog()
     $result
 }
@@ -891,7 +1026,6 @@ if ($needDialog) {
     if ($sel.Encrypt) { $EncryptPassword = $sel.Encrypt }
     $NoPerf = [bool]$sel.NoPerf
     $NoLiveView = [bool]$sel.NoLiveView
-    $HostsOnly = [bool]$sel.HostsOnly
     if ($sel.DurationMinutes) { $DurationMinutes = [int]$sel.DurationMinutes }
 }
 if (-not $VCenter -or -not $Username -or -not $Password -or (-not $Cluster -and -not $VMHost)) { throw 'Missing -VCenter / -Username / -Password / scope (-Cluster or -VMHost).' }
