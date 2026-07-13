@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-13   (must match $script:_version below and the published .version file)
+# Version: 2026-07-13.1   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-13'
+$script:_version      = '2026-07-13.1'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 $script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
@@ -2085,6 +2085,15 @@ function Get-FasExpiry ($o) {
     # Heuristic: an expiry-looking DateTime property under any name.
     $cand = @($o.PSObject.Properties | Where-Object { $_.Value -is [datetime] -and $_.Name -match 'exp|valid|after|renew' } | Sort-Object { $_.Value })
     if ($cand.Count -gt 0) { try { return (& $iso $cand[0].Value) } catch { } }
+    # Last resort: any string/byte property that decodes to an X509 certificate, so a -FullCertInfo cert
+    # returned under an unexpected property name still yields its NotAfter regardless of FAS SDK shape.
+    foreach ($p in $o.PSObject.Properties) {
+        $v = $p.Value
+        try {
+            if ($v -is [byte[]] -and $v.Length -gt 300) { return (& $iso ([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($v)).NotAfter) }
+            if ($v -is [string] -and "$v".Length -ge 500) { return (& $iso ([System.Security.Cryptography.X509Certificates.X509Certificate2]::new([Convert]::FromBase64String("$v")).NotAfter)) }
+        } catch { }
+    }
     ''
 }
 
@@ -2129,8 +2138,19 @@ function Get-FasData ([string]$Address, [bool]$IsLocal, [string[]]$ExtraAddresse
     foreach ($addr in $candidates) {
         $ok = $false
         try {
-            $ac = @(Get-FasAuthorizationCertificate -Address $addr -ErrorAction Stop)
+            # -FullCertInfo returns the certificate detail (incl. its NotAfter); WITHOUT it, current FAS
+            # versions expose no expiry date on the authorization cert - only Id/Address/TrustArea/Status -
+            # so Get-FasExpiry has nothing to read and FAS-003 falls back to "check the FAS console".
+            # Capability-checked so it stays safe on older SDKs that lack the switch.
+            $acp = @{ Address = $addr; ErrorAction = 'Stop' }
+            if ((Get-Command Get-FasAuthorizationCertificate).Parameters.ContainsKey('FullCertInfo')) { $acp['FullCertInfo'] = $true }
+            $ac = @(Get-FasAuthorizationCertificate @acp)
             $r.AuthCerts = @($ac | ForEach-Object { $f = Get-FasFlat $_; $f['Expiry'] = Get-FasExpiry $_; [pscustomobject]$f })
+            # Diagnostic: if -FullCertInfo still yielded no readable expiry, record the property names so a
+            # debug log reveals where this FAS build hides the date (lets us extend Get-FasExpiry precisely).
+            if (@($ac).Count -and @($r.AuthCerts | Where-Object { -not "$($_.Expiry)" }).Count) {
+                $r.Messages += ('AuthCert fields (no expiry extracted): ' + ((@($ac)[0].PSObject.Properties | ForEach-Object { $_.Name }) -join ', '))
+            }
             $ok = $true
         } catch {
             $m = "$_"; $r.Messages += ("AuthCert@${addr}: " + ($m -replace '\s+', ' ')).Substring(0, [Math]::Min(160, ("AuthCert@${addr}: " + $m).Length))
