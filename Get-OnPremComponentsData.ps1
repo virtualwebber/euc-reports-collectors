@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-13.1   (must match $script:_version below and the published .version file)
+# Version: 2026-07-14   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-13.1'
+$script:_version      = '2026-07-14'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 $script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
@@ -1771,6 +1771,12 @@ $script:_brokerBlock = {
                 ZoneName = (& $str $zn)
                 HypervisorConnection = $(if ($ps) { "$($ps.HostingUnitName)" } else { '' })
                 MasterImagePath = $(if ($ps) { "$($ps.MasterImageVM)" } else { '' })
+                # VM size for feature parity with the cloud collector. ServiceOffering is populated for
+                # Azure/GCP/AWS MCS; empty for vSphere/Hyper-V (size comes from the template) - the report
+                # then falls back to CpuCount/MemoryMB where Get-ProvScheme exposes them, else omits the row.
+                VmSize = $(if ($ps -and $ps.ServiceOffering) { "$($ps.ServiceOffering)" } else { '' })
+                VmCpuCount = $(if ($ps) { $ps.CpuCount } else { $null })
+                VmMemoryMB = $(if ($ps) { $ps.MemoryMB } else { $null })
                 Scopes = @($_.Scopes | ForEach-Object { "$_" }); Tags = @($_.Tags | ForEach-Object { "$_" })
             }
         })
