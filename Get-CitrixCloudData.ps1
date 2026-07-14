@@ -101,7 +101,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-14'
+$script:_version      = '2026-07-14.1'
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
 # downloads the full script if a newer version exists. On every release keep this $script:_version and
 # the published euc-reports-collectors/Get-CitrixCloudData.version in sync.
@@ -676,19 +676,7 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
 
         <TextBlock Text="Client Secret" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,4"/>
         <PasswordBox x:Name="SecretBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1"
-                     Background="White" FontSize="12" Margin="0,0,0,14"/>
-
-        <TextBlock Text="Output Folder" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,4,0,4"/>
-        <Grid Margin="0,0,0,20">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-            </Grid.ColumnDefinitions>
-            <TextBox x:Name="OutputBox" Grid.Column="0" Padding="8,6" BorderBrush="#CDD0D6"
-                     BorderThickness="1" Background="White" FontSize="12" Margin="0,0,8,0"/>
-            <Button x:Name="BrowseBtn" Grid.Column="1" Content="Browse..." Width="80"
-                    Padding="0,7" Style="{StaticResource GreyBtn}"/>
-        </Grid>
+                     Background="White" FontSize="12" Margin="0,0,0,20"/>
 
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,8"
@@ -704,19 +692,8 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
     $custId  = $win.FindName('CustomerIdBox')
     $clntId  = $win.FindName('ClientIdBox')
     $secret  = $win.FindName('SecretBox')
-    $outBox  = $win.FindName('OutputBox')
-    $browse  = $win.FindName('BrowseBtn')
     $save    = $win.FindName('SaveBtn')
     $cancel  = $win.FindName('CancelBtn')
-
-    $outBox.Text = $script:_outputDir
-
-    $browse.Add_Click({
-        $dlg = [System.Windows.Forms.FolderBrowserDialog]::new()
-        $dlg.Description  = 'Select output folder for JSON data files'
-        $dlg.SelectedPath = $outBox.Text
-        if ($dlg.ShowDialog() -eq 'OK') { $outBox.Text = $dlg.SelectedPath }
-    })
 
     $script:_setupResult = $null
     $save.Add_Click({
@@ -733,7 +710,6 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
             CustomerId            = $custId.Text.Trim()
             ClientId              = $clntId.Text.Trim()
             ClientSecretEncrypted = Protect-Secret $secret.Password
-            OutputPath            = $outBox.Text.Trim()
         }
         $win.DialogResult = $true
     })
@@ -2228,8 +2204,9 @@ function Get-CitrixAdministrators {
 #region ── Collection Orchestrator ───────────────────────────────────────────
 
 function Invoke-Collection ([hashtable]$Config) {
-    $outPath  = if ($OutputPath) { $OutputPath } else { $Config['OutputPath'] }
-    if (-not $outPath) { $outPath = $script:_outputDir }
+    # Output goes to the script-relative Outputs folder by default (so it follows the script wherever it
+    # runs from); an explicit -OutputPath overrides. Not persisted per-customer, matching the on-prem collector.
+    $outPath = if ($OutputPath) { $OutputPath } else { $script:_outputDir }
     if (-not (Test-Path $outPath)) { New-Item -ItemType Directory -Path $outPath | Out-Null }
 
     Show-Splash
