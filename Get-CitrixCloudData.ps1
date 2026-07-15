@@ -101,7 +101,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-15.1'
+$script:_version      = '2026-07-15.2'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -1955,6 +1955,24 @@ function Get-DeliveryGroups {
     Write-Log "Delivery groups: $($items.Count)"
     return @($items | ForEach-Object {
         $dg = $_
+        # The list response omits SimpleAccessPolicy, which lists the assigned users/groups. Fetch the
+        # delivery-group detail and capture the included principals so the report can flag individual-user
+        # assignments (Citrix leading practice is to grant access only through security groups). A non-empty
+        # UPN (PrincipalName) marks an individual user; security groups and system accounts have none.
+        $incUsers = [System.Collections.Generic.List[object]]::new()
+        $dgDetail = Invoke-CitrixApi -Path "/DeliveryGroups/$($dg.Id)" -Quiet
+        $sap = if ($dgDetail) { $dgDetail.SimpleAccessPolicy } else { $null }
+        if ($sap -and $sap.IncludedUserFilterEnabled) {
+            foreach ($u in @($sap.IncludedUsers)) {
+                if ($null -eq $u) { continue }
+                [void]$incUsers.Add([ordered]@{
+                    Name    = "$($u.DisplayName)"
+                    Upn     = "$($u.PrincipalName)"
+                    Account = "$($u.SamName)"
+                    IsGroup = $u.IsGroup
+                })
+            }
+        }
         [ordered]@{
             Id                           = $dg.Id
             Name                         = $dg.Name
@@ -1978,6 +1996,7 @@ function Get-DeliveryGroups {
             ReuseMachines                = $dg.ReuseMachines
             Tags                         = @($dg.Tags)
             Scopes                       = @($dg.Scopes | ForEach-Object { $_.ScopeName })
+            IncludedUsers                = $incUsers.ToArray()
         }
     })
 }
@@ -1989,6 +2008,12 @@ function Get-MachineCatalogs {
     return @($items | ForEach-Object {
         $mc = $_
         $ps = $mc.ProvisioningScheme
+        # Surface any AD computer accounts the identity service has flagged 'tainted' (left unusable for
+        # provisioning until reset). The list response omits account state, so fetch the catalog's accounts.
+        $tainted = [System.Collections.Generic.List[object]]::new()
+        $acctResp = Invoke-CitrixApi -Path "/MachineCatalogs/$($mc.Id)/MachineAccounts" -Quiet
+        $accts = if ($acctResp -and $acctResp.Items) { $acctResp.Items } elseif ($acctResp) { @($acctResp) } else { @() }
+        foreach ($a in @($accts)) { if ($a -and "$($a.State)" -eq 'Tainted') { [void]$tainted.Add("$($a.SamName)") } }
         [ordered]@{
             Id                     = $mc.Id
             Name                   = $mc.Name
@@ -2015,6 +2040,7 @@ function Get-MachineCatalogs {
             VmMemoryMB             = if ($ps) { $ps.MemoryMB } else { $null }
             Tags                   = @($mc.Tags)
             Scopes                 = @($mc.Scopes | ForEach-Object { $_.ScopeName })
+            TaintedAccounts        = $tainted.ToArray()
         }
     })
 }
