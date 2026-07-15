@@ -101,7 +101,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-15'
+$script:_version      = '2026-07-15.1'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -1526,38 +1526,104 @@ function Get-NetworkLocations {
 
 function Get-CitrixLicensing {
     Set-SplashStatus 'Collecting licensing...'
-    # Documented licensing API base: https://api.cloud.com/licensing
-    # OpenAPI spec paths (from developer-docs.citrix.com/en-us/citrix-cloud/citrix-cloud-licensing):
-    #   GET /license/enterprise/cloud/cvad/ud/current        DaaS User/Device current usage
-    #   GET /license/enterprise/cloud/ngs/bandwidth/current  Gateway bandwidth (deprecated but may still work)
-    $resp = Invoke-ApiProbe 'Licensing' @(
-        "https://api.cloud.com/licensing/license/enterprise/cloud/cvad/ud/current"
-        "https://api.cloud.com/licensing/license/enterprise/cloud/ngs/bandwidth/current"
-        "https://api.cloud.com/licensing/license/enterprise/cloud/cvad/ccd/summary"
-        "https://api.cloud.com/licensing/license/enterprise/cloud/cvad/ud/historicalusage"
-        "https://api.cloud.com/licensing/license/csp/cloud/cvad/summary"
-    )
-    if (-not $resp) { Write-Log 'Licensing: no endpoint responded'; return ,[ordered]@{} }
-    Write-RawSample 'Licensing' $resp
-    # Also try Gateway bandwidth endpoint for completeness
-    $gwResp = Invoke-CitrixApi -FullUrl 'https://api.cloud.com/licensing/license/enterprise/cloud/ngs/bandwidth/current' -Quiet
-    if ($gwResp) { Write-RawSample 'Licensing-Gateway' $gwResp }
-    return ,[ordered]@{
-        ProductName            = $resp.productName
-        ProductEdition         = $resp.productEdition
-        TotalAvailableLicenses = $resp.totalAvailableLicenseCount
-        TotalUsed              = $resp.totalUsageCount
-        RemainingLicenses      = $resp.remainingLicenseCount
-        UserLicenseUsed        = if ($resp.userLicenseUsage)   { $resp.userLicenseUsage.totalUsageCount }   else { $null }
-        UserLicenseReleased    = if ($resp.userLicenseUsage)   { $resp.userLicenseUsage.releasedCount }     else { $null }
-        DeviceLicenseUsed      = if ($resp.deviceLicenseUsage) { $resp.deviceLicenseUsage.totalUsageCount } else { $null }
-        DeviceLicenseReleased  = if ($resp.deviceLicenseUsage) { $resp.deviceLicenseUsage.releasedCount }   else { $null }
-        GatewayBandwidthUsedGB   = if ($gwResp) { $gwResp.usedBandwidthGB } else { $null }
-        GatewayBandwidthTotalGB  = if ($gwResp) { $gwResp.totalBandwidthGB } else { $null }
-        GatewaySubscriptionStart = if ($gwResp) { $gwResp.subscriptionStartDate } else { $null }
-        GatewaySubscriptionEnd   = if ($gwResp) { $gwResp.subscriptionEndDate } else { $null }
-        Timestamp              = $resp.timeStamp
+    # Citrix Cloud licensing is per-entitlement, per-model - there is no single "list entitlements" API.
+    # Each product is queried by its known code (discovered via the console's F12 network capture); a 200
+    # becomes an entitlement, a 404 means "not entitled" (skipped), and a 403 means the API client lacks the
+    # Licensing permission. Hosts: cloudlicense.citrixworkspacesapi.net for Concurrent/Gateway/SPA/Endpoint
+    # Management; api.cloud.com/licensing for the DaaS User/Device model.
+    $cid  = $script:_customerId
+    $cl   = "https://cloudlicense.citrixworkspacesapi.net/$cid"
+    $ents = [System.Collections.Generic.List[object]]::new()
+    $anyDenied = $false
+
+    # --- DaaS: Concurrent model first (cloudlicense), else User/Device (api.cloud.com) ---
+    $ccu = Invoke-CitrixApi -FullUrl "$cl/license/enterprise/cloud/cvad/ccu/summary?UsageType=device&LicenseModel=Concurrent" -Quiet
+    if ($ccu -and $ccu.currentCcu) {
+        Write-RawSample 'Licensing-DaaS-CCU' $ccu
+        $cur = $ccu.currentCcu
+        $peak = { param($p) if ($p) { [ordered]@{ Assigned = [int]$p.assignedLicenseCount; When = ConvertTo-Iso $p.reportTime } } else { $null } }
+        $daasEnt = [ordered]@{
+            Product='DaaS'; ProductCode='cvad'; Model='Concurrent'; Status='OK'
+            Total=[int]$cur.totalLicenseCount; Assigned=[int]$cur.assignedLicenseCount
+            Available=([int]$cur.totalLicenseCount - [int]$cur.assignedLicenseCount)
+            ReportTime=(ConvertTo-Iso $cur.reportTime)
+            Peaks=[ordered]@{ Last24h=(& $peak $ccu.last24HoursPeak); Month=(& $peak $ccu.monthPeak); AllTime=(& $peak $ccu.allTimePeak) }
+        }
+        # Active Use (monthly / daily concurrent usage) - the console's "Active Use" tile, a separate service.
+        $au = Invoke-CitrixApi -FullUrl "https://activeuse.citrixworkspacesapi.net/$cid/cloudlicenseactiveuse/products/xenappxendesktop/current?licenseModel=Concurrent" -Quiet
+        if ($au) {
+            Write-RawSample 'Licensing-DaaS-ActiveUse' $au
+            $daasEnt['ActiveUse'] = [ordered]@{
+                MonthlyValue=[int]$au.monthlyActiveUseValue; MonthlyPct=[double]$au.monthlyActiveUsePercentage
+                DailyValue=[int]$au.dailyActiveUseValue;     DailyPct=[double]$au.dailyActiveUsePercentage
+            }
+        }
+        [void]$ents.Add($daasEnt)
+    } else {
+        if ($script:_lastStatus -eq 403) { $anyDenied = $true }
+        $ud = Invoke-CitrixApi -FullUrl 'https://api.cloud.com/licensing/license/enterprise/cloud/cvad/ud/current' -Quiet
+        if ($ud -and ($ud.productName -or $ud.totalAvailableLicenseCount)) {
+            Write-RawSample 'Licensing-DaaS-UD' $ud
+            [void]$ents.Add([ordered]@{
+                Product='DaaS'; ProductCode='cvad'; Model='User/Device'; Status='OK'
+                ProductName="$($ud.productName)"; Edition="$($ud.productEdition)"
+                Total=[int]$ud.totalAvailableLicenseCount; Used=[int]$ud.totalUsageCount; Available=[int]$ud.remainingLicenseCount
+                UserUsed=$(if ($ud.userLicenseUsage) { [int]$ud.userLicenseUsage.totalUsageCount } else { $null })
+                DeviceUsed=$(if ($ud.deviceLicenseUsage) { [int]$ud.deviceLicenseUsage.totalUsageCount } else { $null })
+            })
+        } elseif ($script:_lastStatus -eq 403) { $anyDenied = $true }
     }
+
+    # --- Gateway (NetScaler Gateway Service) - termed bandwidth. ngs/bandwidth/summary (bandwidth in GB) is
+    #     the most widely accessible endpoint; fall back to the newer per-product entitlement (bandwidth in
+    #     MB) if it's unavailable. ---
+    $gwTerms = $null
+    $gw = Invoke-CitrixApi -FullUrl "$cl/license/enterprise/cloud/ngs/bandwidth/summary" -Quiet
+    if ($gw -and @($gw.termedUsages).Count) {
+        Write-RawSample 'Licensing-Gateway' $gw
+        $gwTerms = @(foreach ($t in @($gw.termedUsages)) {
+            [ordered]@{ AvailableGB=[math]::Round([double]$t.availableBandwidth, 1); UsedGB=[math]::Round([double]$t.bandwidthUsage, 3)
+                        Start=(ConvertTo-Iso $t.entitlementStartDate); End=(ConvertTo-Iso $t.entitlementEndDate); Type="$($t.subscriptionType)" }
+        })
+    } else {
+        $gwDenied = ($script:_lastStatus -eq 403)
+        $gw2 = Invoke-CitrixApi -FullUrl "$cl/cloudlicenseusages/products/netscalergateway/current/bandwidth/entitlement" -Quiet
+        if ($gw2 -and @($gw2.termedUsages).Count) {
+            Write-RawSample 'Licensing-Gateway' $gw2
+            $gwTerms = @(foreach ($t in @($gw2.termedUsages)) {
+                [ordered]@{ AvailableGB=[math]::Round([double]$t.totalAvailableBandwidth / 1024, 1); UsedGB=[math]::Round([double]$t.totalBandwidthUsage / 1024, 3)
+                            Start=(ConvertTo-Iso $t.entitlementStartDate); End=(ConvertTo-Iso $t.entitlementEndDate); Type="$($t.entitlementType)" }
+            })
+        } elseif ($gwDenied -or $script:_lastStatus -eq 403) { $anyDenied = $true }
+    }
+    if ($gwTerms) { [void]$ents.Add([ordered]@{ Product='Gateway'; ProductCode='netscalergateway'; Model='Bandwidth'; Status='OK'; Terms=$gwTerms }) }
+
+    # --- User-based products (Secure Private Access, Endpoint Management) - common current-usage shape ---
+    foreach ($prod in @(
+        [ordered]@{ Code='secureworkspaceaccess'; Display='Secure Private Access' },
+        [ordered]@{ Code='xenmobile';             Display='Endpoint Management' }
+    )) {
+        $r = Invoke-CitrixApi -FullUrl "$cl/cloudlicenseusages/products/$($prod.Code)/current" -Quiet
+        if ($r -and ($r.productName -or $r.totalAvailableLicenseCount)) {
+            Write-RawSample "Licensing-$($prod.Code)" $r
+            $exp = $r.nextExpiredLicenses
+            [void]$ents.Add([ordered]@{
+                Product=$prod.Display; ProductCode=$prod.Code; Status='OK'
+                ProductName="$($r.productName)"; Edition="$($r.productEdition)"; Model=$(if ($r.licenseModel) { "$($r.licenseModel)" } else { 'User' })
+                Total=[int]$r.totalAvailableLicenseCount; Used=[int]$r.totalUsageCount; Available=[int]$r.remainingLicenseCount
+                NextExpiry=$(if ($exp) { ConvertTo-Iso $exp.nextExpiredTime } else { '' })
+                DaysToExpire=$(if ($exp -and $null -ne $exp.daysToExpire) { [int]$exp.daysToExpire } else { $null })
+                ExpiringCount=$(if ($exp) { [int]$exp.totalCount } else { $null })
+            })
+        } elseif ($script:_lastStatus -eq 403) { $anyDenied = $true }
+    }
+
+    # A 403 with no readable product = the Service Principal lacks the Licensing permission. Record one note
+    # rather than an empty section (no vacuous "no data" when the truth is "not permitted").
+    if ($ents.Count -eq 0 -and $anyDenied) { [void]$ents.Add([ordered]@{ Product='Licensing'; Status='AccessDenied' }) }
+
+    Write-Log "Licensing: $($ents.Count) entitlement(s) - $((@($ents) | ForEach-Object { "$($_.Product):$($_.Status)" }) -join ', ')"
+    return ,[ordered]@{ Entitlements = $ents.ToArray() }
 }
 
 function Get-CloudAdministrators {
