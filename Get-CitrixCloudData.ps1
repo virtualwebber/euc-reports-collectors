@@ -101,7 +101,9 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-14.1'
+$script:_version      = '2026-07-15'
+# Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
+# (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
 # downloads the full script if a newer version exists. On every release keep this $script:_version and
 # the published euc-reports-collectors/Get-CitrixCloudData.version in sync.
@@ -1138,7 +1140,7 @@ function Get-CloudResourceLocations {
     return $results
 }
 
-# NOTE: Identity providers, Workspace configuration, and Cloud administrators are
+# NOTE: Identity providers, Cloud StoreFront configuration, and Cloud administrators are
 # separate Citrix Cloud *platform* services (not DaaS), and their REST endpoints
 # are not cleanly documented. When $script:_collectPlatform is on, each function
 # probes a list of candidate URLs (modern api.cloud.com + legacy
@@ -1352,18 +1354,63 @@ function Get-ConditionalAuthPolicies {
     return ,$out.ToArray()
 }
 
+function Get-StoreCustomDomains ([string]$StoreGuid) {
+    # Query the Citrix custom-domain-service for a store's custom (vanity) Cloud StoreFront URL(s).
+    # It returns each configured custom domain with Citrix's own certificate record - expiry and type,
+    # where type 'Managed' means Citrix provisioned and auto-renews the certificate (Citrix-provided)
+    # and anything else means the customer uploaded their own (customer-provided). The service host is
+    # geo-routed (us / eu / ap-s); the first geo that answers is cached for the remaining stores.
+    # Discovered via browser F12 capture. Empty array on any failure so collection continues.
+    if (-not $StoreGuid) { return @() }
+    $cid  = $script:_customerId
+    $geos = if ($script:_cdGeo) { @($script:_cdGeo) } else { @('us', 'eu', 'ap-s') }
+    foreach ($geo in $geos) {
+        $url  = "https://custom-domain-service.$geo.wsp.cloud.com/services/custom-domain-service/customers/$cid/stores/$StoreGuid/customdomains"
+        $resp = Invoke-CitrixApi -FullUrl $url -Quiet
+        if ($resp) {
+            $script:_cdGeo = $geo
+            $out = [System.Collections.Generic.List[object]]::new()
+            foreach ($it in @($resp.items)) {
+                if (-not $it -or -not $it.domain) { continue }
+                $ci   = $it.certificateInformation
+                $type = if ($ci) { "$($ci.type)" } else { '' }
+                $exp  = ''
+                if ($ci -and $ci.expiry) {
+                    try { $exp = ([datetimeoffset]"$($ci.expiry)").UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } catch { $exp = "$($ci.expiry)" }
+                }
+                [void]$out.Add([ordered]@{
+                    Host     = "$($it.domain)"
+                    State    = "$($it.state)"
+                    CertType = $type
+                    NotAfter = $exp
+                    # 'Managed' = Citrix-provisioned & auto-renewed; anything else = customer-supplied.
+                    Provider = if ($type -eq 'Managed') { 'Citrix' } else { 'Customer' }
+                    Error    = ''
+                })
+            }
+            return $out.ToArray()
+        }
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) {
+            Write-Log "Cloud StoreFront config: custom-domain-service denied ($($script:_lastStatus)) for store $StoreGuid"
+            return @()
+        }
+    }
+    Write-Log "Cloud StoreFront config: custom-domain-service returned no data for store $StoreGuid"
+    return @()
+}
+
 function Get-WorkspaceConfig {
-    if (-not $script:_collectPlatform) { Write-Log 'Workspace config: skipped'; return [ordered]@{} }
-    Set-SplashStatus 'Collecting Workspace configuration...'
+    if (-not $script:_collectPlatform) { Write-Log 'Cloud StoreFront config: skipped'; return [ordered]@{} }
+    Set-SplashStatus 'Collecting Cloud StoreFront configuration...'
     $cid = $script:_customerId
 
-    # The console's Workspace Configuration > Access page reads from the StoreFront
+    # The console's Cloud StoreFront > Access page reads from the StoreFront
     # configuration service. Returns { entitled, items:[ <store config> ] } where each
     # store carries its workspace URLs, authentication IdP, adaptive access, branding,
     # 2FA, self-service, and feature preferences. Discovered via browser F12 capture.
     $resp = Invoke-CitrixApi -FullUrl "https://storefrontconfiguration.citrixworkspacesapi.net/$cid/storeconfigs" -Quiet
     if (-not $resp) {
-        Write-Log 'Workspace config: storeconfigs endpoint unavailable'
+        Write-Log 'Cloud StoreFront config: storeconfigs endpoint unavailable'
         return [ordered]@{ ApiAvailable = $false; Stores = @() }
     }
     Write-RawSample 'WorkspaceStoreConfigs' $resp
@@ -1383,10 +1430,19 @@ function Get-WorkspaceConfig {
             HeaderLogo      = if ($style -and $style.headerLogo) { 'Custom' } else { 'Default' }
             LogonLogo       = if ($style -and $style.logonLogo) { 'Custom' } else { 'Default' }
         }
+        $domainList = @($s.storeFrontDomains | ForEach-Object { "$_" })
+        # Custom (vanity) Cloud StoreFront URL(s) for this store, from the Citrix custom-domain-service:
+        # each custom domain plus Citrix's certificate expiry and type (Managed = Citrix auto-renewed;
+        # otherwise customer-supplied).
+        $customDomains = Get-StoreCustomDomains "$($s.storeGuid)"
+        if (@($customDomains).Count) {
+            Write-Log "Cloud StoreFront config: store $($s.storeId) custom domain(s): $((@($customDomains) | ForEach-Object { $_.Host }) -join ', ')"
+        }
         [void]$stores.Add([ordered]@{
             StoreId               = "$($s.storeId)"
             StoreGuid             = "$($s.storeGuid)"
-            Domains               = @($s.storeFrontDomains | ForEach-Object { "$_" })
+            Domains               = $domainList
+            CustomDomains         = @($customDomains)
             WorkspaceUrlEnabled   = [bool]$s.workSpaceUrlEnabled
             AuthIdpType           = "$($s.idpType)"
             AuthConfigId          = "$($s.idpConfigId)"
@@ -1422,7 +1478,7 @@ function Get-WorkspaceConfig {
         $serviceContinuity['BypassAuthForCached']      = [bool]$scResp.bypassAuthForCachedResources
     }
 
-    Write-Log "Workspace config: $($stores.Count) store(s); service continuity: $($serviceContinuity['ApiAvailable'])"
+    Write-Log "Cloud StoreFront config: $($stores.Count) store(s); service continuity: $($serviceContinuity['ApiAvailable'])"
     return [ordered]@{
         ApiAvailable      = $true
         Entitled          = [bool]$resp.entitled
