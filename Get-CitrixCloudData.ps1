@@ -101,7 +101,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-15.2'
+$script:_version      = '2026-07-15.3'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -1949,6 +1949,82 @@ function Get-CitrixZones {
     })
 }
 
+function Get-Backups {
+    # Citrix DaaS "Backup and Restore" - the configuration backups the site can be restored from.
+    # /BackupRestore lists the current backups; the creation time is encoded in the backup name
+    # (B_YYYY_MM_DD_HH_MM_SS_..), with RelatedDate as a fallback.
+    Set-SplashStatus 'Collecting backup and restore...'
+    $resp  = Invoke-CitrixApi -Path '/BackupRestore' -Quiet
+    $items = if ($resp -and $resp.Items) { @($resp.Items) } else { @() }
+    $schedResp = Invoke-CitrixApi -Path '/BackupRestore/Schedules' -Quiet
+    $scheds    = if ($schedResp -and $schedResp.Items) { @($schedResp.Items) } else { @() }
+    Write-Log "Backup and restore: $(@($items).Count) backup(s), $(@($scheds).Count) schedule(s)"
+    $mapped = @(@($items) | Where-Object { $_ } | ForEach-Object {
+        $b = $_
+        $created = ''
+        if ("$($b.BackupName)" -match '(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})') {
+            $created = "$($Matches[1])-$($Matches[2])-$($Matches[3])T$($Matches[4]):$($Matches[5]):$($Matches[6])Z"
+        } elseif ($b.RelatedDate) { $created = ConvertTo-Iso $b.RelatedDate }
+        # Component counts (non-zero) from the backup's Details, for a "what's in it" summary.
+        $contents = [ordered]@{}
+        if ($b.Details) { foreach ($p in $b.Details.PSObject.Properties) { $n = 0; [void][int]::TryParse("$($p.Value)", [ref]$n); if ($n -gt 0) { $contents[$p.Name] = $n } } }
+        [ordered]@{
+            Name          = "$($b.BackupName)"
+            Notes         = "$($b.Notes)"
+            Created       = $created
+            Successful    = [bool]$b.Result
+            Pinned        = [bool]$b.Pinned
+            Administrator = "$($b.AdministratorName)"
+            DurationSec   = [int]$b.Duration
+            SizeBytes     = [long]$b.BackupSize
+            ScheduleName  = "$($b.ScheduleName)"
+            Contents      = $contents
+        }
+    })
+    return [ordered]@{
+        Items = $mapped
+        Schedules = @(@($scheds) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name      = "$($_.Name)"
+                Enabled   = [bool]$_.Enabled
+                Frequency = "$($_.Frequency)"
+                Days      = @($_.DaysInWeek | ForEach-Object { "$_" })
+                StartTime = "$($_.StartTime)"
+                TimeZone  = "$($_.TimeZoneId)"
+                LastRun   = ConvertTo-Iso $_.LastRunTime
+            }
+        })
+    }
+}
+
+function Get-AppPackages {
+    # DaaS "App Packages" - App-V/MSIX/AppAttach packages, their isolation groups, and App-V servers.
+    # Endpoints confirmed present (a backup's Details also reports AppVPackages/AppVIsolationGroups counts).
+    # Field mapping for populated packages is best-effort (lab tenants have none) - raw is logged when present.
+    Set-SplashStatus 'Collecting app packages...'
+    $pkgResp = Invoke-CitrixApi -Path '/AppVPackages' -Quiet
+    $isoResp = Invoke-CitrixApi -Path '/AppVIsolationGroups' -Quiet
+    $srvResp = Invoke-CitrixApi -Path '/AppVServers' -Quiet
+    $pkgs = if ($pkgResp -and $pkgResp.Items) { @($pkgResp.Items) } else { @() }
+    $isos = if ($isoResp -and $isoResp.Items) { @($isoResp.Items) } else { @() }
+    $srvs = if ($srvResp -and $srvResp.Items) { @($srvResp.Items) } else { @() }
+    if (@($pkgs).Count) { Write-RawSample 'AppVPackages' $pkgResp }
+    if (@($isos).Count) { Write-RawSample 'AppVIsolationGroups' $isoResp }
+    Write-Log "App packages: $(@($pkgs).Count) package(s), $(@($isos).Count) isolation group(s), $(@($srvs).Count) server(s)"
+    return [ordered]@{
+        Packages = @(@($pkgs) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name        = if ($_.Name) { "$($_.Name)" } elseif ($_.PackageName) { "$($_.PackageName)" } else { "$($_.DisplayName)" }
+                PackageType = if ($_.PackageType) { "$($_.PackageType)" } elseif ($_.Type) { "$($_.Type)" } else { 'App-V' }
+                Version     = "$($_.Version)"
+                UsedBy      = if ($null -ne $_.UsedByApplicationCount) { [int]$_.UsedByApplicationCount } elseif ($null -ne $_.UsedBy) { $_.UsedBy } else { $null }
+            }
+        })
+        IsolationGroups = @(@($isos) | Where-Object { $_ } | ForEach-Object { [ordered]@{ Name = "$($_.Name)"; Members = @($_.Packages | ForEach-Object { "$($_.Name)" }) } })
+        Servers = @(@($srvs) | Where-Object { $_ } | ForEach-Object { [ordered]@{ Management = "$($_.ManagementServer)"; Publishing = "$($_.PublishingServer)"; Name = "$($_.Name)" } })
+    }
+}
+
 function Get-DeliveryGroups {
     Set-SplashStatus 'Collecting delivery groups...'
     $items = Get-PagedResults -Path '/DeliveryGroups'
@@ -2393,6 +2469,8 @@ function Invoke-Collection ([hashtable]$Config) {
     $policies          = Collect 'Policies'          { Get-CitrixPolicies }
     $hosting           = Collect 'Hosting'           { Get-CitrixHostingConnections }
     $admins            = Collect 'Administrators'    { Get-CitrixAdministrators }
+    $backups           = Collect 'Backups'           { Get-Backups }
+    $appPackages       = Collect 'AppPackages'       { Get-AppPackages }
 
     # Performance (Monitor OData) - raw logon-performance rows for the last 30 days.
     $logonPerf         = Collect 'LogonPerformance'  { Get-LogonPerformance }
@@ -2431,6 +2509,8 @@ function Invoke-Collection ([hashtable]$Config) {
         Policies           = $policies
         HostingConnections = $hosting
         Administrators     = $admins
+        Backups            = $backups
+        AppPackages        = $appPackages
         # Performance
         LogonPerformance   = $logonPerf
     }
