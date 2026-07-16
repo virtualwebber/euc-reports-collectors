@@ -19,9 +19,19 @@
 .PARAMETER OutputPath
     Override the output folder from config.
 
+.PARAMETER SkipAdvisor
+    Skip Citrix's Advisor site check. The Advisor scan runs by default - it is the one on-demand action in the
+    collection (it triggers a scan and updates the console's Advisor blade) and adds ~15-60s. Use this switch
+    to skip it for scripted runs; interactive runs can untick the dialog checkbox (the choice is saved per
+    customer).
+
 .EXAMPLE
     .\Get-CitrixCloudData.ps1
     # Interactive - shows customer selection dialog
+
+.EXAMPLE
+    .\Get-CitrixCloudData.ps1 -CustomerName "Acme Corp" -SkipAdvisor
+    # Non-interactive, skipping the Citrix Advisor site check
 
 .EXAMPLE
     .\Get-CitrixCloudData.ps1 -CustomerName "Acme Corp"
@@ -36,6 +46,9 @@ param(
     # Optional: encrypt the collected data file with this password (writes <name>.cdenc instead of
     # .json). OFF by default - omit it and the output stays plaintext .json exactly as before.
     [System.Security.SecureString]$EncryptPassword,
+    # Skip the Citrix Advisor site check (it runs by default - the one on-demand scan in the collection).
+    # Interactive runs untick the dialog checkbox instead (saved per customer). See .PARAMETER SkipAdvisor.
+    [switch]$SkipAdvisor,
     # Skip the launch-time self-update check (mirrors the on-prem collector's -SkipUpdateCheck).
     [switch]$SkipUpdateCheck
 )
@@ -101,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-15.3'
+$script:_version      = '2026-07-16'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -545,7 +558,10 @@ function Show-CustomerDialog {
         <Rectangle Height="1" Fill="#DDE1E7" Margin="0,0,0,12"/>
         <CheckBox x:Name="ChkSessionDetail"
                   Content="Collect session detail (individual user sessions: user, client device, IP)"
-                  FontSize="11" Foreground="#555" IsChecked="False" Margin="0,0,0,16"/>
+                  FontSize="11" Foreground="#555" IsChecked="False" Margin="0,0,0,10"/>
+        <CheckBox x:Name="ChkAdvisor"
+                  Content="Run Citrix Advisor site check (on by default; extra ~15-60s, triggers a scan in the console)"
+                  FontSize="11" Foreground="#555" IsChecked="True" Margin="0,0,0,16"/>
 
         <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
         <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
@@ -566,6 +582,7 @@ function Show-CustomerDialog {
     $combo    = $win.FindName('CustomerCombo')
     $newName  = $win.FindName('NewNameBox')
     $chkSession = $win.FindName('ChkSessionDetail')
+    $chkAdvisor = $win.FindName('ChkAdvisor')
     $encryptBox = $win.FindName('EncryptBox')
     $okBtn    = $win.FindName('OkBtn')
     $cancel   = $win.FindName('CancelBtn')
@@ -573,33 +590,40 @@ function Show-CustomerDialog {
     $configs | ForEach-Object { [void]$combo.Items.Add($_) }
     if ($combo.Items.Count -gt 0) { $combo.SelectedIndex = 0 }
 
-    # Pre-tick session-detail from saved config when a customer is selected
+    # Pre-tick the per-run options from saved config when a customer is selected
     $combo.Add_SelectionChanged({
         $name = "$($combo.SelectedItem)"
         if ($name) {
             $cfg = Read-CollectConfig -Name $name
-            if ($cfg) { $chkSession.IsChecked = [bool]$cfg['CollectSessionDetail'] }
+            if ($cfg) {
+                $chkSession.IsChecked = [bool]$cfg['CollectSessionDetail']
+                # Advisor defaults ON - a config without the key predates the option, so treat absent as ticked.
+                $chkAdvisor.IsChecked = ($null -eq $cfg['IncludeAdvisor']) -or [bool]$cfg['IncludeAdvisor']
+            }
         }
     })
     # Initialise for the default selection
     if ($combo.SelectedItem) {
         $initCfg = Read-CollectConfig -Name "$($combo.SelectedItem)"
-        if ($initCfg) { $chkSession.IsChecked = [bool]$initCfg['CollectSessionDetail'] }
+        if ($initCfg) {
+            $chkSession.IsChecked = [bool]$initCfg['CollectSessionDetail']
+            $chkAdvisor.IsChecked = ($null -eq $initCfg['IncludeAdvisor']) -or [bool]$initCfg['IncludeAdvisor']
+        }
     }
 
-    $script:_dlgResult = [ordered]@{ Action = 'Cancel'; CustomerName = ''; IsNew = $false; CollectSessionDetail = $false; EncryptPassword = $null }
+    $script:_dlgResult = [ordered]@{ Action = 'Cancel'; CustomerName = ''; IsNew = $false; CollectSessionDetail = $false; IncludeAdvisor = $false; EncryptPassword = $null }
 
     $okBtn.Add_Click({
         $encPw = if ($encryptBox.Password) { ConvertTo-SecureString $encryptBox.Password -AsPlainText -Force } else { $null }
         $newText = $newName.Text.Trim()
         if ($newText) {
             Write-Log "Customer dialog: 'New' chosen - '$newText'"
-            $script:_dlgResult = [ordered]@{ Action = 'New'; CustomerName = $newText; IsNew = $true; CollectSessionDetail = [bool]$chkSession.IsChecked; EncryptPassword = $encPw }
+            $script:_dlgResult = [ordered]@{ Action = 'New'; CustomerName = $newText; IsNew = $true; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked; EncryptPassword = $encPw }
             $win.DialogResult = $true
             $win.Close()
         } elseif ($combo.SelectedItem) {
             Write-Log "Customer dialog: 'Load' chosen - '$($combo.SelectedItem)'"
-            $script:_dlgResult = [ordered]@{ Action = 'Load'; CustomerName = "$($combo.SelectedItem)"; IsNew = $false; CollectSessionDetail = [bool]$chkSession.IsChecked; EncryptPassword = $encPw }
+            $script:_dlgResult = [ordered]@{ Action = 'Load'; CustomerName = "$($combo.SelectedItem)"; IsNew = $false; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked; EncryptPassword = $encPw }
             $win.DialogResult = $true
             $win.Close()
         } else {
@@ -2025,6 +2049,59 @@ function Get-AppPackages {
     }
 }
 
+# Autoscale (power management) configuration for one delivery group. The scalar settings ride on the per-DG
+# detail response the caller already fetched (for SimpleAccessPolicy), so they cost no extra call; the power
+# time schemes - the per-day peak windows + how many machines to keep powered on - are a separate sub-resource.
+# Field names verified live against the DaaS Orchestration API (2026-07-16): the schemes express peak/pool as
+# time-range arrays (PeakTimeRanges / PoolSizeSchedule), NOT the legacy 24-element PeakHours/PoolSize arrays
+# (which the API returns null). $DgDetail may be $null if its call failed - the casts below then yield safe
+# defaults (Enabled=$false, numbers 0, actions ''), and a non-power-managed group simply has no schemes.
+function Get-DgAutoscale ([string]$DgId, $DgDetail) {
+    $schemes = [System.Collections.Generic.List[object]]::new()
+    $ptsResp = Invoke-CitrixApi -Path "/DeliveryGroups/$DgId/PowerTimeSchemes" -Quiet
+    $ptsItems = if ($ptsResp -and $ptsResp.Items) { $ptsResp.Items } elseif ($ptsResp) { $ptsResp } else { @() }
+    foreach ($s in @($ptsItems)) {
+        if ($null -eq $s) { continue }
+        $pool = [System.Collections.Generic.List[object]]::new()
+        foreach ($ps in @($s.PoolSizeSchedule)) {
+            if ($null -eq $ps) { continue }
+            [void]$pool.Add([ordered]@{ TimeRange = "$($ps.TimeRange)"; PoolSize = [int]$ps.PoolSize })
+        }
+        $days  = @(); foreach ($d in @($s.DaysOfWeek))     { if ($null -ne $d) { $days  += "$d" } }
+        $peaks = @(); foreach ($r in @($s.PeakTimeRanges)) { if ($null -ne $r) { $peaks += "$r" } }
+        [void]$schemes.Add([ordered]@{
+            Name                = "$($s.Name)"
+            DisplayName         = "$($s.DisplayName)"
+            DaysOfWeek          = $days
+            PeakTimeRanges      = $peaks
+            PoolUsingPercentage = [bool]$s.PoolUsingPercentage
+            PoolSizeSchedule    = $pool.ToArray()
+        })
+    }
+    # *Action values (Nothing/Suspend/Shutdown) are strings over REST; stringify defensively to match the
+    # collector's pattern and dodge any PS 5.1 enum {value,Value} serialisation.
+    return [ordered]@{
+        Enabled                         = [bool]$DgDetail.AutoScaleEnabled
+        AutoscalingEnabled              = [bool]$DgDetail.AutoscalingEnabled
+        IsPowerManaged                  = [bool]$DgDetail.IsPowerManaged
+        RestrictToTag                   = "$($DgDetail.RestrictAutoscaleTag)"
+        PeakBufferSizePercent           = [int]$DgDetail.PeakBufferSizePercent
+        OffPeakBufferSizePercent        = [int]$DgDetail.OffPeakBufferSizePercent
+        PowerOffDelayMinutes            = [int]$DgDetail.PowerOffDelayMinutes
+        ScaleDownActionDuringPeak       = "$($DgDetail.AutoscaleScaleDownActionDuringPeak)"
+        ScaleDownActionDuringOffPeak    = "$($DgDetail.AutoscaleScaleDownActionDuringOffPeak)"
+        PeakDisconnectAction            = "$($DgDetail.PeakDisconnectAction)"
+        PeakDisconnectTimeoutMinutes    = [int]$DgDetail.PeakDisconnectTimeoutMinutes
+        OffPeakDisconnectAction         = "$($DgDetail.OffPeakDisconnectAction)"
+        OffPeakDisconnectTimeoutMinutes = [int]$DgDetail.OffPeakDisconnectTimeoutMinutes
+        PeakLogOffAction                = "$($DgDetail.PeakLogOffAction)"
+        PeakLogOffTimeoutMinutes        = [int]$DgDetail.PeakLogOffTimeoutMinutes
+        OffPeakLogOffAction             = "$($DgDetail.OffPeakLogOffAction)"
+        OffPeakLogOffTimeoutMinutes     = [int]$DgDetail.OffPeakLogOffTimeoutMinutes
+        Schemes                         = $schemes.ToArray()
+    }
+}
+
 function Get-DeliveryGroups {
     Set-SplashStatus 'Collecting delivery groups...'
     $items = Get-PagedResults -Path '/DeliveryGroups'
@@ -2073,6 +2150,7 @@ function Get-DeliveryGroups {
             Tags                         = @($dg.Tags)
             Scopes                       = @($dg.Scopes | ForEach-Object { $_.ScopeName })
             IncludedUsers                = $incUsers.ToArray()
+            Autoscale                    = Get-DgAutoscale $dg.Id $dgDetail
         }
     })
 }
@@ -2423,6 +2501,147 @@ function Get-CitrixAdministrators {
     })
 }
 
+# Citrix Advisor site check. Advisor is Citrix's own recommendations engine (the DaaS 'Advisor' blade): an
+# on-demand scan across Security / Reliability / Performance / Operational Excellence / Cost Optimization that
+# returns ~50 candidate recommendations, each flagged IsRecommendationNeeded (whether it actually applies to
+# this site) with the AffectedResources behind it. The scan changes NO site configuration - it only
+# (re)generates the recommendation list the console shows. Flow: POST $generateRecommendations (async job) ->
+# poll /Jobs/{id} -> GET /Advisor/Recommendations. Degrades gracefully: an API client without the rights to
+# start the scan yields Status='AccessDenied'; a slow scan is read as-is once the poll times out.
+function Get-AdvisorRecommendations {
+    Set-SplashStatus 'Running Citrix Advisor site check...'
+    $base   = $script:_daasBase
+    $result = [ordered]@{ Status = 'OK'; Generated = ''; Recommendations = @() }
+
+    # Advisor calls carry the console's consumer id (the trigger expects it; harmless on the reads).
+    $ah = @{}; foreach ($k in $script:_authHeaders.Keys) { $ah[$k] = $script:_authHeaders[$k] }
+    $ah['Citrix-Consumer-Id'] = 'WebStudio'
+    # Invoke-WebRequest rejects a Content-Type entry in -Headers when -ContentType is also set, so drop it for
+    # the POST and let -ContentType supply it.
+    $postHeaders = @{}; foreach ($k in $ah.Keys) { if ($k -ne 'Content-Type') { $postHeaders[$k] = $ah[$k] } }
+
+    # 1. Trigger the scan (async job). The job URL comes back in the Location header. The '$' in the action
+    #    verb is literal (single-quoted), not a PowerShell variable.
+    $body = '{"AspectNameList":["Security","Reliability","Performance","OperationalExcellence","CostOptimization"],"IsRunAllChecks":true,"RecommendationIdList":[]}'
+    $jobUrl = $null
+    try {
+        $resp   = Invoke-WebRequest -Method Post -Uri ($base + '/Advisor/$generateRecommendations?async=true') -Headers $postHeaders -Body $body -ContentType 'application/json' -UseBasicParsing
+        $loc    = $resp.Headers['Location']; if ($loc -is [array]) { $loc = $loc[0] }
+        $jobUrl = "$loc"
+        Write-Log "Advisor: site check started (job $jobUrl)"
+    } catch {
+        $st = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+        Write-Log "Advisor: could not start the site check [$st]: $_" 'WARN'
+        if ($st -eq 401 -or $st -eq 403) { $result['Status'] = 'AccessDenied' }
+    }
+
+    # 2. Poll the job to completion (bounded - a large site can take a minute or two).
+    if ($jobUrl) {
+        $deadline = (Get-Date).AddSeconds(180)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            try {
+                $job = Invoke-RestMethod -Method Get -Uri $jobUrl -Headers $ah
+                Set-SplashStatus "Citrix Advisor check: $($job.Status) $($job.OverallProgressPercent)%"
+                if ("$($job.Status)" -match 'Complete|Success') { break }
+                if ("$($job.Status)" -match 'Fail|Error')       { Write-Log "Advisor: job reported $($job.Status)" 'WARN'; break }
+            } catch { Write-Log "Advisor: job poll error: $_" 'INFO' }
+        }
+    }
+
+    # 3. Read the recommendations (also returns the previous scan's results if the trigger was skipped/denied).
+    Set-SplashStatus 'Collecting Citrix Advisor recommendations...'
+    $rec = Invoke-CitrixApi -Path '/Advisor/Recommendations' -Query @{ includeDismissed = 'false' } -ExtraHeaders @{ 'Citrix-Consumer-Id' = 'WebStudio' } -Quiet
+    if ($null -eq $rec) {
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) { $result['Status'] = 'AccessDenied' }
+        elseif ($result['Status'] -eq 'OK') { $result['Status'] = 'NoData' }
+        Write-Log "Advisor: no recommendations returned (status $($result['Status']))"
+        return $result
+    }
+    $items = if ($null -ne $rec.Items) { $rec.Items } else { $rec }
+
+    $mapped = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($items)) {
+        if ($null -eq $r -or "$r" -eq 'null') { continue }
+        [void]$mapped.Add([ordered]@{
+            Id                        = "$($r.Id)"
+            Recommendation            = "$($r.Recommendation)"
+            Details                   = "$($r.Details)"
+            Impact                    = "$($r.Impact)"
+            Aspect                    = "$($r.Aspect)"
+            Component                 = "$($r.Component)"
+            IsRecommendationNeeded    = [bool]$r.IsRecommendationNeeded
+            IsUsingCustomizedSettings = [bool]$r.IsUsingCustomizedSettings
+            LastReportedTime          = ConvertTo-Iso $r.LastReportedTime
+            # Full detail behind each recommendation (delivery groups / catalogs / machines / connections),
+            # passed through as collected so the report can show what the console's expanded view shows.
+            AffectedResources         = @($r.AffectedResources)
+            Metadata                  = @($r.Metadata)
+        })
+    }
+    $result['Recommendations'] = $mapped.ToArray()
+    $needed = @($mapped | Where-Object { $_['IsRecommendationNeeded'] }).Count
+    $result['Generated'] = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Write-Log "Advisor: $($mapped.Count) recommendations ($needed needed)"
+    return $result
+}
+
+# Endpoint inventory, derived from the Advisor result. Advisor's Citrix Workspace app recommendations (End of
+# Life + security vulnerabilities) carry per-DEVICE detail - one AffectedResource per endpoint (client name,
+# address, platform, Workspace app version, domain, user, last connection) plus, for the security one, the
+# CVEs affecting each device. We surface that as a dedicated top-level Endpoints dataset so the report's
+# Endpoints section renders straight from it, without depending on Advisor's internal recommendation ids. One
+# entry per applicable Workspace app recommendation. Empty when Advisor was not run or flagged nothing.
+function ConvertTo-EndpointInventory ($Advisor) {
+    if (-not $Advisor) { return @() }
+    # The two Citrix Workspace app endpoint recommendations to surface: End of Life (REC_017) and security
+    # vulnerabilities (REC_041). Advisor also emits a Low-impact 'Use consistent versions' rec (REC_018, often
+    # hundreds of devices) with the same Component - deliberately excluded; it is not an endpoint-risk check.
+    $endpointRecIds = @('REC_017', 'REC_041')
+    $recs = @($Advisor['Recommendations']) | Where-Object {
+        $_ -and ($endpointRecIds -contains "$($_['Id'])") -and $_['IsRecommendationNeeded']
+    }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $recs) {
+        $devices = New-Object System.Collections.Generic.List[object]
+        $cveMap  = [ordered]@{}   # distinct CVEs across this recommendation's devices
+        foreach ($e in @($r['AffectedResources'])) {
+            if ($null -eq $e) { continue }
+            $cveNames = New-Object System.Collections.Generic.List[string]
+            foreach ($v in @($e.Vulnerabilities)) {
+                if ($v -and $v.Name) {
+                    [void]$cveNames.Add("$($v.Name)")
+                    if (-not $cveMap.Contains("$($v.Name)")) {
+                        $cveMap["$($v.Name)"] = [ordered]@{ Name = "$($v.Name)"; Article = "$($v.Article)"; Description = "$($v.Description)" }
+                    }
+                }
+            }
+            [void]$devices.Add([ordered]@{
+                ClientName     = "$($e.ClientName)"
+                ClientAddress  = "$($e.ClientAddress)"
+                ClientPlatform = "$($e.ClientPlatform)"
+                ClientVersion  = "$($e.ClientVersion)"
+                Domain         = "$($e.Domain)"
+                Username       = "$($e.Username)"
+                ConnectionTime = ConvertTo-Iso $e.ConnectionTime
+                Cves           = $cveNames.ToArray()
+            })
+        }
+        [void]$out.Add([ordered]@{
+            Id               = "$($r['Id'])"
+            Recommendation   = "$($r['Recommendation'])"
+            Impact           = "$($r['Impact'])"
+            Aspect           = "$($r['Aspect'])"
+            Details          = "$($r['Details'])"
+            LastReportedTime = "$($r['LastReportedTime'])"
+            DeviceCount      = $devices.Count
+            Cves             = @($cveMap.Values)
+            Devices          = $devices.ToArray()
+        })
+    }
+    return $out.ToArray()
+}
+
 #endregion
 
 #region ── Collection Orchestrator ───────────────────────────────────────────
@@ -2471,6 +2690,15 @@ function Invoke-Collection ([hashtable]$Config) {
     $admins            = Collect 'Administrators'    { Get-CitrixAdministrators }
     $backups           = Collect 'Backups'           { Get-Backups }
     $appPackages       = Collect 'AppPackages'       { Get-AppPackages }
+    # Advisor runs Citrix's own site check (an async scan) and gathers the recommendations + affected
+    # resources. It is the one on-demand action in the collection, so it sits last among the DaaS steps. It
+    # runs by DEFAULT; skip it with -SkipAdvisor, or per-customer by unticking the dialog checkbox. A config
+    # without the IncludeAdvisor key predates the option and defaults to ON.
+    $includeAdvisor    = (-not $SkipAdvisor) -and (($null -eq $Config['IncludeAdvisor']) -or [bool]$Config['IncludeAdvisor'])
+    $advisor           = if ($includeAdvisor) { Collect 'Advisor' { Get-AdvisorRecommendations } } else { $null }
+    # Endpoint inventory (Citrix Workspace app versions / vulnerabilities per device) - derived from the
+    # Advisor Workspace app recommendations, so it is present only when Advisor ran and flagged them.
+    $endpoints         = Collect 'Endpoints' { ConvertTo-EndpointInventory $advisor }
 
     # Performance (Monitor OData) - raw logon-performance rows for the last 30 days.
     $logonPerf         = Collect 'LogonPerformance'  { Get-LogonPerformance }
@@ -2485,6 +2713,7 @@ function Invoke-Collection ([hashtable]$Config) {
         CollectionErrors   = $errors
         CollectionStatus   = $script:_collectStatus   # per-resource status (e.g. ServicePrincipals='AccessDenied')
         SessionDetailCollected = $collectSessionDetail
+        AdvisorCollected   = $includeAdvisor   # false => Advisor was not run this collection (opt-in)
         # Citrix Cloud level
         ResourceLocations  = $resourceLocations
         NetworkLocations   = $networkLocations
@@ -2511,6 +2740,8 @@ function Invoke-Collection ([hashtable]$Config) {
         Administrators     = $admins
         Backups            = $backups
         AppPackages        = $appPackages
+        Advisor            = $advisor
+        Endpoints          = $endpoints
         # Performance
         LogonPerformance   = $logonPerf
     }
@@ -2520,7 +2751,7 @@ function Invoke-Collection ([hashtable]$Config) {
     $listKeys = 'ResourceLocations','NetworkLocations','IdentityProviders','ConditionalAuthPolicies','CloudAdministrators',
                 'ServicePrincipals','SecureClients','ProductRegistrations','IdentityDomains','Sites','Zones',
                 'DeliveryGroups','MachineCatalogs','Machines','Applications','ApplicationGroups',
-                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance'
+                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance','Endpoints'
     foreach ($k in $listKeys) {
         $clean = @(@($output[$k]) | Where-Object {
             if ($null -eq $_) { $false }
@@ -2588,6 +2819,7 @@ if ($ConfigFile -and (Test-Path $ConfigFile)) {
         $config = Show-CloudSetupDialog -CustomerName $sel['CustomerName']
         if (-not $config) { Write-Log 'Setup cancelled'; exit 0 }
         $config['CollectSessionDetail'] = [bool]$sel['CollectSessionDetail']
+        $config['IncludeAdvisor']       = [bool]$sel['IncludeAdvisor']
         Save-CollectConfig -Config $config
     } else {
         Write-Log "Loading saved config for '$($sel['CustomerName'])'"
@@ -2597,8 +2829,9 @@ if ($ConfigFile -and (Test-Path $ConfigFile)) {
             Show-MsgBox "Could not load config for '$($sel['CustomerName'])'." -Icon Error
             exit 1
         }
-        # Persist the session-detail preference from the dialog selection
+        # Persist the per-run preferences from the dialog selection
         $config['CollectSessionDetail'] = [bool]$sel['CollectSessionDetail']
+        $config['IncludeAdvisor']       = [bool]$sel['IncludeAdvisor']
         Save-CollectConfig -Config $config
         Write-Log "Config loaded: CustomerId='$($config['CustomerId'])' ClientId='$($config['ClientId'])' OutputPath='$($config['OutputPath'])' HasSecret=$([bool]$config['ClientSecretEncrypted'])"
     }
