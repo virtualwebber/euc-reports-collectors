@@ -114,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-16'
+$script:_version      = '2026-07-20'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -1945,6 +1945,29 @@ function Get-CitrixSites {
             if ($v -is [string] -or $v -is [bool] -or $v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [datetime]) {
                 $settings[$pr.Name] = if ($v -is [datetime]) { ConvertTo-Iso $v } else { $v }
             }
+        }
+    }
+    # AotSetting - the console's "Log server" setting (Always-on Tracing log forwarding). It is NOT in
+    # the default /Settings projection, so it must be requested by name. 'fields' is a PROJECTION: asking
+    # for AotSetting returns every OTHER property as null, so this has to be a SECOND call merged in -
+    # adding fields= to the call above would silently blank DnsResolutionEnabled and
+    # TrustRequestsSentToTheXmlServicePortEnabled, which the report already checks.
+    # Kept as a nested object (the loop above takes scalars only): the report needs Server, Port and the
+    # three Enabled* flags together to tell "no log server" from "log server set but forwarding nothing".
+    $aotResp = if ($script:_siteId) { Invoke-CitrixApi -Path "/Sites/$($script:_siteId)/Settings" -Query @{ fields = 'AotSetting' } } else { $null }
+    if ($aotResp -and $aotResp.AotSetting) {
+        $a = $aotResp.AotSetting
+        Write-RawSample 'SiteSettings.AotSetting' $a
+        $settings['AotSetting'] = [ordered]@{
+            Server                      = "$($a.Server)"
+            Port                        = [int]$a.Port
+            EnabledOnDeliveryController = [bool]$a.EnabledOnDeliveryController
+            EnabledOnAllDeliveryGroups  = [bool]$a.EnabledOnAllDeliveryGroups
+            EnabledOnDeliveryGroups     = @(if ($a.EnabledOnDeliveryGroups) { $a.EnabledOnDeliveryGroups | ForEach-Object { "$_" } })
+            ResourceLocationId          = "$($a.LogServerResourceLocationId)"
+            # LogServerApiKey is a CREDENTIAL for the log service - record only that one is set. The JSON
+            # is a customer deliverable and is not encrypted unless -EncryptPassword was used.
+            HasApiKey                   = [bool]$a.LogServerApiKey
         }
     }
     $results = @([ordered]@{
