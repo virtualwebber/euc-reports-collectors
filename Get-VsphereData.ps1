@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-13   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-17   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -56,7 +56,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-13'
+$script:_version = '2026-07-17'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -635,7 +635,7 @@ function Invoke-PerfMonitor ($Targets, [hashtable]$Ids, $Data, [scriptblock]$OnT
 #endregion
 
 #region -- Collection ---------------------------------------------------------
-$script:_hostPaths = @('name','parent','summary.hardware.numCpuCores','summary.hardware.numCpuThreads','summary.hardware.cpuMhz','summary.hardware.numCpuPkgs','summary.hardware.memorySize','summary.hardware.vendor','summary.hardware.model','summary.quickStats.overallCpuUsage','summary.quickStats.overallMemoryUsage','summary.quickStats.uptime','runtime.connectionState','runtime.powerState','vm')
+$script:_hostPaths = @('name','parent','summary.hardware.numCpuCores','summary.hardware.numCpuThreads','summary.hardware.cpuMhz','summary.hardware.numCpuPkgs','summary.hardware.memorySize','summary.hardware.vendor','summary.hardware.model','summary.config.product.version','summary.config.product.build','summary.quickStats.overallCpuUsage','summary.quickStats.overallMemoryUsage','summary.quickStats.uptime','runtime.connectionState','runtime.powerState','vm')
 $script:_vmPaths   = @('name','runtime.host','runtime.powerState','config.hardware.numCPU','config.hardware.memoryMB','summary.quickStats.overallCpuUsage','summary.quickStats.hostMemoryUsage','summary.quickStats.guestMemoryUsage','config.guestFullName')
 
 function Get-MoRefName ([string]$Type, [string]$MoRef) {
@@ -782,6 +782,8 @@ function Collect-VsphereData ([scriptblock]$OnTick) {
             PowerState      = "$(Get-Prop $h 'runtime.powerState')"
             Vendor          = "$(Get-Prop $h 'summary.hardware.vendor')"
             Model           = "$(Get-Prop $h 'summary.hardware.model')"
+            EsxiVersion     = "$(Get-Prop $h 'summary.config.product.version')"
+            EsxiBuild       = "$(Get-Prop $h 'summary.config.product.build')"
             Cores           = $cores
             Threads         = [int](Get-Prop $h 'summary.hardware.numCpuThreads')
             Sockets         = [int](Get-Prop $h 'summary.hardware.numCpuPkgs')
@@ -902,6 +904,15 @@ function Show-VsphereDialog {
     $vcBox = $win.FindName('VcBox'); $userBox = $win.FindName('UserBox'); $pwBox = $win.FindName('PwBox')
     $rbCluster = $win.FindName('RbCluster'); $scopeBox = $win.FindName('ScopeBox'); $custBox = $win.FindName('CustBox'); $encBox = $win.FindName('EncBox')
     $perfChk = $win.FindName('PerfChk'); $durBox = $win.FindName('DurBox'); $liveChk = $win.FindName('LiveChk')
+    # Monitor duration + live view only apply when performance capture is on; grey them out otherwise
+    # (mirrors the on-prem collector).
+    $syncPerf = {
+        $on = [bool]$perfChk.IsChecked
+        $durBox.IsEnabled  = $on
+        $liveChk.IsEnabled = $on
+        if (-not $on) { $liveChk.IsChecked = $false }
+    }
+    $perfChk.Add_Checked($syncPerf); $perfChk.Add_Unchecked($syncPerf)
     if ($VCenter) { $vcBox.Text = $VCenter }; if ($Username) { $userBox.Text = $Username }; if ($Cluster) { $scopeBox.Text = $Cluster }; if ($VMHost) { $win.FindName('RbHost').IsChecked = $true; $scopeBox.Text = $VMHost }
     $result = @{ Action = 'Cancel' }
     $win.FindName('OkBtn').Add_Click({
