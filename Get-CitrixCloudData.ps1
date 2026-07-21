@@ -114,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-20'
+$script:_version      = '2026-07-21'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -2191,6 +2191,17 @@ function Get-MachineCatalogs {
         $acctResp = Invoke-CitrixApi -Path "/MachineCatalogs/$($mc.Id)/MachineAccounts" -Quiet
         $accts = if ($acctResp -and $acctResp.Items) { $acctResp.Items } elseif ($acctResp) { @($acctResp) } else { @() }
         foreach ($a in @($accts)) { if ($a -and "$($a.State)" -eq 'Tainted') { [void]$tainted.Add("$($a.SamName)") } }
+        # The catalog -> hosting connection link is NOT in the list response, and unlike SiteSettings
+        # a ?fields=HypervisorConnection projection does not surface it either (both verified against
+        # the live API). It only appears on the per-catalog detail. Without it every catalog reported
+        # an empty connection, so HC-002 saw an empty "in use" set and declared every hosting
+        # connection unreferenced. Skip the extra call for catalogs that cannot have a connection -
+        # a manual, non-power-managed catalog (e.g. Remote PC) legitimately has none.
+        $hcName = if ($mc.HypervisorConnection) { "$($mc.HypervisorConnection.Name)" } else { '' }
+        if (-not $hcName -and (("$($mc.ProvisioningType)" -ne 'Manual') -or ("$($mc.IsPowerManaged)" -eq 'True'))) {
+            $det = Invoke-CitrixApi -Path "/MachineCatalogs/$($mc.Id)" -Quiet
+            if ($det -and $det.HypervisorConnection) { $hcName = "$($det.HypervisorConnection.Name)" }
+        }
         [ordered]@{
             Id                     = $mc.Id
             Name                   = $mc.Name
@@ -2206,7 +2217,7 @@ function Get-MachineCatalogs {
             MinimumFunctionalLevel = $mc.MinimumFunctionalLevel
             IdentityType           = $mc.IdentityType
             ZoneName               = if ($mc.Zone) { $mc.Zone.Name } else { $null }
-            HypervisorConnection   = if ($mc.HypervisorConnection) { $mc.HypervisorConnection.Name } else { $null }
+            HypervisorConnection   = $hcName
             # The list response inlines the full ProvisioningScheme. VM size is the ServiceOffering string
             # (e.g. Standard_D4s_v5); CpuCount/MemoryMB cover machine-profile catalogs that have no
             # ServiceOffering. MasterImage is an object {Name,XDPath} - the old '.MasterImagePath' property
@@ -2871,3 +2882,4 @@ Invoke-Collection -Config $config
 Write-Log 'Collection routine returned'
 
 #endregion
+
