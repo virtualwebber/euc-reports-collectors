@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-22.3   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-22.4   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22.3'
+$script:_version      = '2026-07-22.4'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
