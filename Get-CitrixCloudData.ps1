@@ -114,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22.1'
+$script:_version      = '2026-07-22.2'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -851,12 +851,17 @@ function Invoke-CitrixApi {
                 if ($body.Length -gt 400) { $body = $body.Substring(0, 400) + '...' }
             } catch { }
         }
-        if ($Quiet) { Write-Log "Probe [$status] GET $uri$(if ($body) { " | $body" })" 'INFO' }
-        else        { Write-Log "API [$status] GET $uri - $_$(if ($body) { " | $body" })" 'ERROR' }
-        # An access-denial is a permission problem, not a transient error - surface it as its own WARN
-        # regardless of -Quiet (probe calls otherwise only log at INFO and the denial is easy to miss),
-        # and record the path so the end-of-run summary can name every denied section.
-        if ($status -eq 401 -or $status -eq 403) {
+        # A 401/403 is a permission problem, not a code failure. Its full response body (the Citrix SDK
+        # error dump - transaction id, stack, "insufficient administrative privilege") is useful for
+        # troubleshooting but must NOT flood the console: it goes to the debug-log FILE only (WARN), not
+        # to ERROR which Write-Log mirrors to the console. Genuine errors (5xx, timeouts) keep ERROR so
+        # they still surface live. The concise per-call denial line and the end-of-run summary are enough
+        # on screen.
+        $denied = ($status -eq 401 -or $status -eq 403)
+        if ($Quiet)      { Write-Log "Probe [$status] GET $uri$(if ($body) { " | $body" })" 'INFO' }
+        elseif ($denied) { Write-Log "API [$status] GET $uri$(if ($body) { " | $body" })" 'WARN' }
+        else             { Write-Log "API [$status] GET $uri - $_$(if ($body) { " | $body" })" 'ERROR' }
+        if ($denied) {
             $what = if ($FullUrl) { $FullUrl } else { $Path }
             Write-Log "ACCESS DENIED [$status] $what - the API client's admin lacks permission for this" 'WARN'
             # For the end-of-run summary, record direct calls by their (clean) path. Probe candidates
@@ -2848,6 +2853,9 @@ function Invoke-Collection ([hashtable]$Config) {
     $denied = @($script:_deniedPaths | Select-Object -Unique)
     if ($denied.Count -gt 0) {
         Write-Log "Access denied on $($denied.Count) call(s) - the API client's admin lacks permission for: $($denied -join ', '). Dependent sections will be empty (e.g. Endpoints <- Advisor)." 'WARN'
+        # One concise heads-up on the console (the per-call SDK detail stayed in the debug log). The
+        # report marks each affected section "permissions not set to support data collection".
+        Write-Warning "Access denied on $($denied.Count) API call(s) - the API client's admin lacks permission. Affected report sections will show 'permissions not set to support data collection'. Detail: $($script:_debugLogPath)"
     }
 
     Close-Splash
