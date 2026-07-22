@@ -1,0 +1,4 @@
+# Disable all line-ending conversion. Self-update compares SHA-256 hashes of local files against
+# blobs served by raw.githubusercontent.com, and the DaaS collector is Authenticode-signed - so
+# working tree, blobs, zips and raw downloads must be byte-identical regardless of core.autocrlf.
+* -text

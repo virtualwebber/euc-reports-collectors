@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-14   (must match $script:_version below and the published .version file)
+# Version: 2026-07-22   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,11 +129,15 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-14'
+$script:_version      = '2026-07-22'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
-$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.version'
-$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-OnPremComponentsData.ps1'
+# Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
+# manifest entry, and if they differ download the published .ps1 BYTE-EXACT (Invoke-WebRequest -OutFile),
+# verify its hash (and Authenticode signature when the manifest marks it signed) before replacing itself.
+$script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
+$script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
+$script:_selfName       = 'Get-OnPremComponentsData.ps1'
 $script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
@@ -331,46 +335,62 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
 }
 
 function Invoke-OnPremUpdateCheck {
-    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_updateVersionUrl) { return }
+    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_manifestUrl) { return }
     $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
     if (-not $self) { return }
     try {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-        # Step 1 (lightweight): read just the tiny version file - a few bytes.
-        $vresp = Invoke-WebRequest -Uri $script:_updateVersionUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
-        $remoteVer = (("$($vresp.Content)" -split "`r?`n") | Where-Object { "$_".Trim() } | Select-Object -First 1)
-        $remoteVer = "$remoteVer".Trim()
-        $rv = ConvertTo-CollectorVersion $remoteVer; $lv = ConvertTo-CollectorVersion $script:_version
-        if (-not $rv) { Write-Log "Update check: unrecognised remote version '$remoteVer' - skipping" 'WARN'; return }
-        if (-not $lv -or $rv -le $lv) { Write-Log "Update check: up to date (local $($script:_version), remote $remoteVer)"; return }
-        Write-Log "Update check: newer version available - local $($script:_version), remote $remoteVer"
-        if (-not (Show-UpdatePrompt $script:_version $remoteVer)) { Write-Log 'Update check: user chose Not now'; return }
-        # Step 2 (only when updating): download the full script.
-        $resp = Invoke-WebRequest -Uri $script:_updateScriptUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        $content = "$($resp.Content)"
-        # Sanity: recognisably our collector, and carries a version line.
-        if ($content.Length -lt 20000 -or $content -notmatch 'Get-OnPremComponentsData' -or $content -notmatch "\`$script:_version\s*=\s*'([^']+)'") {
-            Show-MsgBox 'Could not download a valid update; keeping the current version.' -Icon Warning
-            Write-Log 'Update check: downloaded script not recognised - aborting' 'WARN'; return
-        }
-        # Validate the download parses before replacing anything.
+        # 1. Fetch the tiny manifest and find this collector's entry.
+        $mresp = Invoke-WebRequest -Uri $script:_manifestUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
+        $manifest = "$($mresp.Content)" | ConvertFrom-Json
+        $entry = @($manifest.files) | Where-Object { $_.name -eq $script:_selfName } | Select-Object -First 1
+        if (-not $entry -or -not $entry.sha256) { Write-Log "Update check: no manifest entry for $($script:_selfName) - skipping" 'WARN'; return }
+        $wantHash = "$($entry.sha256)".ToUpperInvariant()
+        # 2. Compare my own bytes to the manifest. Same hash -> nothing to do.
+        $myHash = (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($myHash -eq $wantHash) { Write-Log "Update check: up to date (v$($script:_version), hash matches manifest)"; return }
+        # Never downgrade: only proceed when the manifest version is >= mine (a same-version, different-hash
+        # entry is the unsigned->signed migration, which we DO want).
+        $rv = ConvertTo-CollectorVersion "$($entry.version)"; $lv = ConvertTo-CollectorVersion $script:_version
+        if ($rv -and $lv -and $rv -lt $lv) { Write-Log "Update check: manifest v$($entry.version) older than local v$($script:_version) - skipping" 'WARN'; return }
+        Write-Log "Update check: update available - local v$($script:_version), manifest v$($entry.version)$(if ($entry.signed) { ' (signed)' })"
+        if (-not (Show-UpdatePrompt $script:_version "$($entry.version)")) { Write-Log 'Update check: user chose Not now'; return }
+        # 3. Download the published script BYTE-EXACT (preserves any signature).
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ("OnPremCollector-$([guid]::NewGuid().ToString('N')).ps1")
-        Set-Content -Path $tmp -Value $content -Encoding UTF8
-        $tk = $null; $perr = $null
-        [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        if ($perr -and $perr.Count) { Show-MsgBox 'The downloaded update did not validate (parse errors). Keeping the current version.' -Icon Warning; Write-Log 'Update check: downloaded content failed to parse - aborting' 'WARN'; return }
+        Invoke-WebRequest -Uri "$($script:_updateRawBase)/$($script:_selfName)" -UseBasicParsing -TimeoutSec 30 -OutFile $tmp -ErrorAction Stop | Out-Null
+        # 4. Verify BEFORE replacing anything: hash matches the manifest, it parses, and - when the manifest
+        #    marks it signed - its Authenticode signature is valid.
+        $why = ''
+        $dlHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($dlHash -ne $wantHash) { $why = "hash mismatch after download (expected $wantHash, got $dlHash)" }
+        if (-not $why) {
+            $tk = $null; $perr = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null
+            if ($perr -and $perr.Count) { $why = "parse errors ($($perr[0].Message))" }
+        }
+        if (-not $why -and $entry.signed) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $tmp
+            if ($sig.Status -ne 'Valid') { $why = "Authenticode signature is $($sig.Status), expected Valid" }
+        }
+        if ($why) {
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            Show-MsgBox "The downloaded update did not validate; keeping the current version.`n`n$why" -Icon Warning
+            Write-Log "Update check: download failed validation - $why - aborting" 'WARN'; return
+        }
+        # 5. Back up, replace BYTE-EXACT (Copy-Item, not Set-Content, so a signature survives), relaunch.
         try {
             Copy-Item -LiteralPath $self -Destination "$self.bak" -Force -ErrorAction SilentlyContinue
-            Set-Content -Path $self -Value $content -Encoding UTF8
+            Copy-Item -LiteralPath $tmp -Destination $self -Force
         } catch {
             $alt = Join-Path (Split-Path $self -Parent) 'Get-OnPremComponentsData.NEW.ps1'
-            try { Set-Content -Path $alt -Value $content -Encoding UTF8 } catch {}
+            try { Copy-Item -LiteralPath $tmp -Destination $alt -Force } catch {}
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             Show-MsgBox "Couldn't replace the running script (permissions?). The new version was saved as:`n$alt`n`nReplace the old script with it and re-run." -Icon Warning
             Write-Log "Update check: could not overwrite $self - saved new version to $alt" 'WARN'; return
         }
-        Write-Log "Update check: updated $self to $remoteVer - relaunching"
-        Show-MsgBox "Updated to version $remoteVer.`n`nThe collector will now relaunch." -Icon Info
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log "Update check: updated $self to v$($entry.version) - relaunching"
+        Show-MsgBox "Updated to version $($entry.version).`n`nThe collector will now relaunch." -Icon Info
         try { Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"') } catch { Write-Log "Relaunch failed: $($_.Exception.Message)" 'WARN' }
         exit 0
     } catch {

@@ -1,0 +1,40 @@
+{
+    "generated":  "2026-07-22",
+    "files":  [
+                  {
+                      "name":  "Get-AVDData.ps1",
+                      "version":  "2026-07-22",
+                      "sha256":  "5A9C25D8D41595F98A7C9539BDE671A92D7C0149303B7530A7BC4FDB8D8BB497",
+                      "size":  170702,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-CitrixCloudData.ps1",
+                      "version":  "2026-07-22.2",
+                      "sha256":  "E29B4F8E8D93C91CE23619554F290E86D7A4BD5DB60C880A16B82D59D1FCB0A1",
+                      "size":  186454,
+                      "signed":  true
+                  },
+                  {
+                      "name":  "Get-OnPremComponentsData.ps1",
+                      "version":  "2026-07-22",
+                      "sha256":  "D97D92EC24B73DF62C404BBC8D9693C1CC8B8F52F6D0823E6E5025D3C2C03BE5",
+                      "size":  186677,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-ProfilesData.ps1",
+                      "version":  "2026-07-22",
+                      "sha256":  "2445ECDBBAD274118248E2C81C88AE1B955441CFBACC9CFECBA591EFC7029371",
+                      "size":  76506,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-VsphereData.ps1",
+                      "version":  "2026-07-22",
+                      "sha256":  "0C1123F6BA75658102E938FF12D6666AE48D138D54D69C891AD368A10EF677F6",
+                      "size":  80907,
+                      "signed":  false
+                  }
+              ]
+}

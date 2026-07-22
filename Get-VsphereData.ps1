@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-17   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-22   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -56,12 +56,16 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-17'
+$script:_version = '2026-07-22'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
-$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-VsphereData.version'
-$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-VsphereData.ps1'
+# Self-update: fetch update-manifest.json, compare this file's SHA-256 to its manifest entry, and if they
+# differ download the published .ps1 BYTE-EXACT (Invoke-WebRequest -OutFile), verify its hash (and signature
+# when the manifest marks it signed) before replacing itself.
+$script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
+$script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
+$script:_selfName       = 'Get-VsphereData.ps1'
 
 $script:_scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $script:_scriptDir) { $script:_scriptDir = (Get-Location).Path }
@@ -252,28 +256,38 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
     return [bool]$script:_updChoice
 }
 function Invoke-VsphereUpdateCheck {
-    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_updateVersionUrl) { return }
+    if ($SkipUpdateCheck -or $script:_noSplash -or -not $script:_manifestUrl) { return }
     $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
     if (-not $self) { return }
     try {
-        $vresp = Invoke-WebRequest -Uri $script:_updateVersionUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
-        $remoteVer = (("$($vresp.Content)" -split "`r?`n") | Where-Object { "$_".Trim() } | Select-Object -First 1); $remoteVer = "$remoteVer".Trim()
-        $rv = ConvertTo-CollectorVersion $remoteVer; $lv = ConvertTo-CollectorVersion $script:_version
-        if (-not $rv) { Write-Log "Update check: unrecognised remote version '$remoteVer'" 'WARN'; return }
-        if (-not $lv -or $rv -le $lv) { Write-Log "Update check: up to date (local $($script:_version), remote $remoteVer)"; return }
-        if (-not (Show-UpdatePrompt $script:_version $remoteVer)) { return }
-        $resp = Invoke-WebRequest -Uri $script:_updateScriptUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        $content = "$($resp.Content)"
-        if ($content.Length -lt 20000 -or $content -notmatch 'Get-VsphereData' -or $content -notmatch "\`$script:_version\s*=\s*'([^']+)'") {
-            Show-MsgBox 'Could not download a valid update; keeping the current version.' -Icon Warning; Write-Log 'Update: download not recognised' 'WARN'; return
-        }
+        # 1. Fetch the tiny manifest and find this collector's entry.
+        $mresp = Invoke-WebRequest -Uri $script:_manifestUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
+        $manifest = "$($mresp.Content)" | ConvertFrom-Json
+        $entry = @($manifest.files) | Where-Object { $_.name -eq $script:_selfName } | Select-Object -First 1
+        if (-not $entry -or -not $entry.sha256) { Write-Log "Update check: no manifest entry for $($script:_selfName)" 'WARN'; return }
+        $wantHash = "$($entry.sha256)".ToUpperInvariant()
+        # 2. Compare my own bytes to the manifest. Same hash -> nothing to do.
+        $myHash = (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($myHash -eq $wantHash) { Write-Log "Update check: up to date (v$($script:_version), hash matches manifest)"; return }
+        # Never downgrade (a same-version, different-hash entry is the unsigned->signed migration, kept).
+        $rv = ConvertTo-CollectorVersion "$($entry.version)"; $lv = ConvertTo-CollectorVersion $script:_version
+        if ($rv -and $lv -and $rv -lt $lv) { Write-Log "Update check: manifest v$($entry.version) older than local v$($script:_version) - skipping" 'WARN'; return }
+        if (-not (Show-UpdatePrompt $script:_version "$($entry.version)")) { return }
+        # 3. Download the published script BYTE-EXACT (preserves any signature).
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ("VsphereCollector-$([guid]::NewGuid().ToString('N')).ps1")
-        Set-Content -Path $tmp -Value $content -Encoding UTF8
-        $tk = $null; $perr = $null; [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null; Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        if ($perr -and $perr.Count) { Show-MsgBox 'The downloaded update did not validate (parse errors). Keeping the current version.' -Icon Warning; return }
-        try { Copy-Item -LiteralPath $self -Destination "$self.bak" -Force -ErrorAction SilentlyContinue; Set-Content -Path $self -Value $content -Encoding UTF8 }
-        catch { $alt = Join-Path (Split-Path $self -Parent) 'Get-VsphereData.NEW.ps1'; try { Set-Content -Path $alt -Value $content -Encoding UTF8 } catch {}; Show-MsgBox "Couldn't replace the running script (permissions?). Saved as:`n$alt" -Icon Warning; return }
-        Show-MsgBox "Updated to version $remoteVer.`n`nThe collector will now relaunch." -Icon Info
+        Invoke-WebRequest -Uri "$($script:_updateRawBase)/$($script:_selfName)" -UseBasicParsing -TimeoutSec 30 -OutFile $tmp -ErrorAction Stop | Out-Null
+        # 4. Verify BEFORE replacing: hash matches the manifest, it parses, and - when signed - its signature is valid.
+        $why = ''
+        $dlHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($dlHash -ne $wantHash) { $why = 'hash mismatch after download' }
+        if (-not $why) { $tk = $null; $perr = $null; [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null; if ($perr -and $perr.Count) { $why = 'parse errors' } }
+        if (-not $why -and $entry.signed) { $sig = Get-AuthenticodeSignature -LiteralPath $tmp; if ($sig.Status -ne 'Valid') { $why = "signature is $($sig.Status)" } }
+        if ($why) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue; Show-MsgBox "The downloaded update did not validate ($why); keeping the current version." -Icon Warning; Write-Log "Update: $why" 'WARN'; return }
+        # 5. Back up, replace BYTE-EXACT (Copy-Item, not Set-Content, so a signature survives), relaunch.
+        try { Copy-Item -LiteralPath $self -Destination "$self.bak" -Force -ErrorAction SilentlyContinue; Copy-Item -LiteralPath $tmp -Destination $self -Force }
+        catch { $alt = Join-Path (Split-Path $self -Parent) 'Get-VsphereData.NEW.ps1'; try { Copy-Item -LiteralPath $tmp -Destination $alt -Force } catch {}; Remove-Item $tmp -Force -ErrorAction SilentlyContinue; Show-MsgBox "Couldn't replace the running script (permissions?). Saved as:`n$alt" -Icon Warning; return }
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Show-MsgBox "Updated to version $($entry.version).`n`nThe collector will now relaunch." -Icon Info
         try { Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"') } catch {}
         exit 0
     } catch { Write-Log "Update check skipped: $(("$($_.Exception.Message)" -replace '\s+', ' '))" }
