@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+# Version: 2026-07-22.4   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -114,14 +115,17 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22.2'
+$script:_version      = '2026-07-22.4'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
-# Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
-# downloads the full script if a newer version exists. On every release keep this $script:_version and
-# the published euc-reports-collectors/Get-CitrixCloudData.version in sync.
-$script:_updateVersionUrl = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-CitrixCloudData.version'
-$script:_updateScriptUrl  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/Get-CitrixCloudData.ps1'
+# Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
+# file's SHA-256 to the manifest entry for its own name, and if they differ downloads the published .ps1
+# BYTE-EXACT (Invoke-WebRequest -OutFile), verifies its hash (and Authenticode signature when the manifest
+# marks it signed) before replacing itself. Byte-exact + hash/signature verified so a signed collector
+# stays signed. The published Get-CitrixCloudData.ps1 is the SIGNED copy of this script.
+$script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
+$script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
+$script:_selfName       = 'Get-CitrixCloudData-Signed.ps1'
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Configs (including the DPAPI-encrypted client secret) live in the user's
 # local profile, not in the repo. LocalAppData is per-user + per-machine,
@@ -142,6 +146,80 @@ $script:_lastStatus   = 0       # HTTP status of the most recent Invoke-CitrixAp
 $script:_collectStatus = [ordered]@{}  # per-resource collection status (e.g. 'AccessDenied') surfaced to the report
 $script:_deniedPaths  = @()     # every path that returned 401/403 - drives the end-of-run access-denied summary
 
+#region ── Read-only guards ──────────────────────────────────────────────────
+# This collector is READ-ONLY: it never mutates Citrix and never deletes files it does not own. These
+# guards enforce that at runtime, and Assert-CollectorReadOnly.ps1 checks it statically at build/publish.
+#
+# HTTP: every request is GET except two POSTs - the OAuth token request and the optional Advisor scan
+# trigger. There are NO PUT/PATCH/DELETE calls. The allowlist is SINGLE-QUOTED so the literal
+# $generateRecommendations in the Advisor URI is not treated as a PowerShell variable; -like treats $ as
+# a literal, so these patterns match the real URIs.
+$script:_allowedPostUri = @(
+    '*/cctrustoauth2/*/tokens/clients'          # OAuth2 client-credentials token
+    '*/Advisor/$generateRecommendations*'       # Advisor site-check trigger (skippable with -SkipAdvisor)
+)
+function Assert-HttpAllowed ([string]$Method, [string]$Uri) {
+    if ($Method -eq 'Get') { return }
+    if ($Method -eq 'Post') {
+        foreach ($p in $script:_allowedPostUri) { if ($Uri -like $p) { return } }
+    }
+    throw "Read-only collector: refusing a $Method request to '$Uri'. Only GET (plus the OAuth token and Advisor-scan POSTs) is permitted."
+}
+# All outbound HTTP goes through these wrappers so the method guard cannot be bypassed. The real
+# Invoke-RestMethod / Invoke-WebRequest appear ONLY inside them (the static audit enforces that).
+function Invoke-SafeRest {
+    param([string]$Uri, [string]$Method = 'Get', [hashtable]$Headers, $Body, [string]$ContentType, [int]$TimeoutSec, [switch]$UseBasicParsing)
+    Assert-HttpAllowed $Method $Uri
+    $p = @{ Method = $Method; Uri = $Uri }
+    if ($Headers)     { $p.Headers     = $Headers }
+    if ($PSBoundParameters.ContainsKey('Body')) { $p.Body = $Body }
+    if ($ContentType) { $p.ContentType = $ContentType }
+    if ($TimeoutSec)  { $p.TimeoutSec  = $TimeoutSec }
+    if ($UseBasicParsing) { $p.UseBasicParsing = $true }
+    $p.ErrorAction = 'Stop'   # every caller try/catches; keep errors terminating so they surface
+    Invoke-RestMethod @p
+}
+function Invoke-SafeWeb {
+    param([string]$Uri, [string]$Method = 'Get', [hashtable]$Headers, $Body, [string]$ContentType, [int]$TimeoutSec, [switch]$UseBasicParsing, [string]$OutFile)
+    Assert-HttpAllowed $Method $Uri
+    $p = @{ Method = $Method; Uri = $Uri }
+    if ($Headers)     { $p.Headers     = $Headers }
+    if ($PSBoundParameters.ContainsKey('Body')) { $p.Body = $Body }
+    if ($ContentType) { $p.ContentType = $ContentType }
+    if ($TimeoutSec)  { $p.TimeoutSec  = $TimeoutSec }
+    if ($UseBasicParsing) { $p.UseBasicParsing = $true }
+    if ($OutFile)     { $p.OutFile     = $OutFile }   # byte-exact download (preserves a signature); used by self-update
+    $p.ErrorAction = 'Stop'   # every caller try/catches; keep errors terminating so they surface
+    Invoke-WebRequest @p
+}
+# Files: a delete/move may only ever touch a path the collector OWNS - its temp files, its config dir,
+# its output folder, or its own script folder (self / .bak / .NEW). Remove-OwnedItem / Move-OwnedItem are
+# the only wrappers that call the real Remove-Item / Move-Item (the static audit enforces that).
+$script:_ownedRoots = @(
+    [System.IO.Path]::GetTempPath()
+    $script:_appDataDir
+    $script:_outputDir
+    $script:_scriptDir
+) | Where-Object { $_ } | ForEach-Object { try { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') } catch { $_ } }
+function Assert-OwnedPath ([string]$Path, [string]$Op = 'modify') {
+    $full = try { [System.IO.Path]::GetFullPath($Path) } catch { throw "Read-only collector: refusing to $Op an unresolvable path '$Path'." }
+    foreach ($r in $script:_ownedRoots) {
+        if ($full.Equals($r, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $full.StartsWith($r + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    throw "Read-only collector: refusing to $Op '$full' - it is outside the collector's own folders (temp / config / output / script)."
+}
+function Remove-OwnedItem ([string]$Path) {
+    Assert-OwnedPath $Path 'delete'
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+function Move-OwnedItem ([string]$Path, [string]$Destination) {
+    Assert-OwnedPath $Path        'move'
+    Assert-OwnedPath $Destination 'move'
+    Move-Item -LiteralPath $Path -Destination $Destination -Force
+}
+#endregion
+
 foreach ($dir in $script:_configDir, $script:_outputDir) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
@@ -152,7 +230,7 @@ if (Test-Path $script:_legacyConfigDir) {
     Get-ChildItem -Path $script:_legacyConfigDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
         $dest = Join-Path $script:_configDir $_.Name
         if (-not (Test-Path $dest)) {
-            try { Move-Item -Path $_.FullName -Destination $dest -Force } catch {}
+            try { Move-OwnedItem $_.FullName $dest } catch {}
         }
     }
 }
@@ -389,46 +467,62 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
 
 function Invoke-CitrixCloudUpdateCheck {
     # Interactive only: the scripted -ConfigFile / -CustomerName entry paths (automation) skip it, as does -SkipUpdateCheck.
-    if ($SkipUpdateCheck -or $ConfigFile -or $CustomerName -or -not $script:_updateVersionUrl) { return }
+    if ($SkipUpdateCheck -or $ConfigFile -or $CustomerName -or -not $script:_manifestUrl) { return }
     $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
     if (-not $self) { return }
     try {
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-        # Step 1 (lightweight): read just the tiny version file - a few bytes.
-        $vresp = Invoke-WebRequest -Uri $script:_updateVersionUrl -UseBasicParsing -TimeoutSec 6 -ErrorAction Stop
-        $remoteVer = (("$($vresp.Content)" -split "`r?`n") | Where-Object { "$_".Trim() } | Select-Object -First 1)
-        $remoteVer = "$remoteVer".Trim()
-        $rv = ConvertTo-CollectorVersion $remoteVer; $lv = ConvertTo-CollectorVersion $script:_version
-        if (-not $rv) { Write-Log "Update check: unrecognised remote version '$remoteVer' - skipping" 'WARN'; return }
-        if (-not $lv -or $rv -le $lv) { Write-Log "Update check: up to date (local $($script:_version), remote $remoteVer)"; return }
-        Write-Log "Update check: newer version available - local $($script:_version), remote $remoteVer"
-        if (-not (Show-UpdatePrompt $script:_version $remoteVer)) { Write-Log 'Update check: user chose Not now'; return }
-        # Step 2 (only when updating): download the full script.
-        $resp = Invoke-WebRequest -Uri $script:_updateScriptUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        $content = "$($resp.Content)"
-        # Sanity: recognisably our collector, and carries a version line.
-        if ($content.Length -lt 20000 -or $content -notmatch 'Get-CitrixCloudData' -or $content -notmatch "\`$script:_version\s*=\s*'([^']+)'") {
-            Show-MsgBox 'Could not download a valid update; keeping the current version.' -Icon Warning
-            Write-Log 'Update check: downloaded script not recognised - aborting' 'WARN'; return
-        }
-        # Validate the download parses before replacing anything.
+        # 1. Fetch the tiny manifest and find this collector's entry.
+        $mresp = Invoke-SafeWeb -Uri $script:_manifestUrl -UseBasicParsing -TimeoutSec 6
+        $manifest = "$($mresp.Content)" | ConvertFrom-Json
+        $entry = @($manifest.files) | Where-Object { $_.name -eq $script:_selfName } | Select-Object -First 1
+        if (-not $entry -or -not $entry.sha256) { Write-Log "Update check: no manifest entry for $($script:_selfName) - skipping" 'WARN'; return }
+        $wantHash = "$($entry.sha256)".ToUpperInvariant()
+        # 2. Compare my own bytes to the manifest. Same hash -> nothing to do.
+        $myHash = (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($myHash -eq $wantHash) { Write-Log "Update check: up to date (v$($script:_version), hash matches manifest)"; return }
+        # Never downgrade: only proceed when the manifest version is >= mine (a same-version, different-hash
+        # entry is the unsigned->signed migration, which we DO want).
+        $rv = ConvertTo-CollectorVersion "$($entry.version)"; $lv = ConvertTo-CollectorVersion $script:_version
+        if ($rv -and $lv -and $rv -lt $lv) { Write-Log "Update check: manifest v$($entry.version) older than local v$($script:_version) - skipping" 'WARN'; return }
+        Write-Log "Update check: update available - local v$($script:_version), manifest v$($entry.version)$(if ($entry.signed) { ' (signed)' })"
+        if (-not (Show-UpdatePrompt $script:_version "$($entry.version)")) { Write-Log 'Update check: user chose Not now'; return }
+        # 3. Download the published script BYTE-EXACT (preserves any signature).
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ("CitrixCloudCollector-$([guid]::NewGuid().ToString('N')).ps1")
-        Set-Content -Path $tmp -Value $content -Encoding UTF8
-        $tk = $null; $perr = $null
-        [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        if ($perr -and $perr.Count) { Show-MsgBox 'The downloaded update did not validate (parse errors). Keeping the current version.' -Icon Warning; Write-Log 'Update check: downloaded content failed to parse - aborting' 'WARN'; return }
+        Invoke-SafeWeb -Uri "$($script:_updateRawBase)/$($script:_selfName)" -UseBasicParsing -TimeoutSec 30 -OutFile $tmp | Out-Null
+        # 4. Verify BEFORE replacing anything: hash matches the manifest, it parses, and - when the manifest
+        #    marks it signed - its Authenticode signature is valid.
+        $why = ''
+        $dlHash = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToUpperInvariant()
+        if ($dlHash -ne $wantHash) { $why = "hash mismatch after download (expected $wantHash, got $dlHash)" }
+        if (-not $why) {
+            $tk = $null; $perr = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$perr) | Out-Null
+            if ($perr -and $perr.Count) { $why = "parse errors ($($perr[0].Message))" }
+        }
+        if (-not $why -and $entry.signed) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $tmp
+            if ($sig.Status -ne 'Valid') { $why = "Authenticode signature is $($sig.Status), expected Valid" }
+        }
+        if ($why) {
+            Remove-OwnedItem $tmp
+            Show-MsgBox "The downloaded update did not validate; keeping the current version.`n`n$why" -Icon Warning
+            Write-Log "Update check: download failed validation - $why - aborting" 'WARN'; return
+        }
+        # 5. Back up, replace BYTE-EXACT (Copy-Item, not Set-Content, so the signature survives), relaunch.
         try {
             Copy-Item -LiteralPath $self -Destination "$self.bak" -Force -ErrorAction SilentlyContinue
-            Set-Content -Path $self -Value $content -Encoding UTF8
+            Copy-Item -LiteralPath $tmp -Destination $self -Force
         } catch {
             $alt = Join-Path (Split-Path $self -Parent) 'Get-CitrixCloudData.NEW.ps1'
-            try { Set-Content -Path $alt -Value $content -Encoding UTF8 } catch {}
+            try { Copy-Item -LiteralPath $tmp -Destination $alt -Force } catch {}
+            Remove-OwnedItem $tmp
             Show-MsgBox "Couldn't replace the running script (permissions?). The new version was saved as:`n$alt`n`nReplace the old script with it and re-run." -Icon Warning
             Write-Log "Update check: could not overwrite $self - saved new version to $alt" 'WARN'; return
         }
-        Write-Log "Update check: updated $self to $remoteVer - relaunching"
-        Show-MsgBox "Updated to version $remoteVer.`n`nThe collector will now relaunch." -Icon Info
+        Remove-OwnedItem $tmp
+        Write-Log "Update check: updated $self to v$($entry.version) - relaunching"
+        Show-MsgBox "Updated to version $($entry.version).`n`nThe collector will now relaunch." -Icon Info
         try { Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $self + '"') } catch { Write-Log "Relaunch failed: $($_.Exception.Message)" 'WARN' }
         exit 0
     } catch {
@@ -771,7 +865,7 @@ function Connect-CitrixCloud ([hashtable]$Config) {
                 "&client_secret=$([Uri]::EscapeDataString($secret))"
 
     try {
-        $resp = Invoke-RestMethod -Method Post -Uri $tokenUri `
+        $resp = Invoke-SafeRest -Method Post -Uri $tokenUri `
                     -ContentType 'application/x-www-form-urlencoded' -Body $body
         $script:_token      = $resp.access_token
         $script:_customerId = $customerId
@@ -791,7 +885,7 @@ function Connect-CitrixCloud ([hashtable]$Config) {
     # which all /cvad/manage resource endpoints require.
     Set-SplashStatus 'Resolving DaaS site...'
     try {
-        $me = Invoke-RestMethod -Method Get -Uri "$($script:_daasBase)/me" -Headers $script:_authHeaders
+        $me = Invoke-SafeRest -Method Get -Uri "$($script:_daasBase)/me" -Headers $script:_authHeaders
         $site = $null
         if ($me.Customers) {
             foreach ($cust in $me.Customers) {
@@ -836,7 +930,7 @@ function Invoke-CitrixApi {
     }
 
     try {
-        $r = Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
+        $r = Invoke-SafeRest -Method Get -Uri $uri -Headers $headers
         $script:_lastStatus = 200
         return $r
     } catch {
@@ -907,7 +1001,7 @@ function Invoke-BearerApi {
         'Accept'            = 'application/json'
     }
     try {
-        return Invoke-RestMethod -Method Get -Uri $FullUrl -Headers $headers
+        return Invoke-SafeRest -Method Get -Uri $FullUrl -Headers $headers
     } catch {
         $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
         $body   = ''
@@ -2593,7 +2687,7 @@ function Get-AdvisorRecommendations {
     $body = '{"AspectNameList":["Security","Reliability","Performance","OperationalExcellence","CostOptimization"],"IsRunAllChecks":true,"RecommendationIdList":[]}'
     $jobUrl = $null
     try {
-        $resp   = Invoke-WebRequest -Method Post -Uri ($base + '/Advisor/$generateRecommendations?async=true') -Headers $postHeaders -Body $body -ContentType 'application/json' -UseBasicParsing
+        $resp   = Invoke-SafeWeb -Method Post -Uri ($base + '/Advisor/$generateRecommendations?async=true') -Headers $postHeaders -Body $body -ContentType 'application/json' -UseBasicParsing
         $loc    = $resp.Headers['Location']; if ($loc -is [array]) { $loc = $loc[0] }
         $jobUrl = "$loc"
         Write-Log "Advisor: site check started (job $jobUrl)"
@@ -2609,7 +2703,7 @@ function Get-AdvisorRecommendations {
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 5
             try {
-                $job = Invoke-RestMethod -Method Get -Uri $jobUrl -Headers $ah
+                $job = Invoke-SafeRest -Method Get -Uri $jobUrl -Headers $ah
                 Set-SplashStatus "Citrix Advisor check: $($job.Status) $($job.OverallProgressPercent)%"
                 if ("$($job.Status)" -match 'Complete|Success') { break }
                 if ("$($job.Status)" -match 'Fail|Error')       { Write-Log "Advisor: job reported $($job.Status)" 'WARN'; break }
@@ -2930,10 +3024,10 @@ Write-Log 'Collection routine returned'
 
 
 # SIG # Begin signature block
-# MIIvfgYJKoZIhvcNAQcCoIIvbzCCL2sCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIIvfwYJKoZIhvcNAQcCoIIvcDCCL2wCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDyotPwOElXvreX
-# JXP4qm0Erc7O9vJsEE4aBqLyQDm1X6CCFDwwggVyMIIDWqADAgECAhB2U/6sdUZI
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD7RXSxReght3FQ
+# hVR0jkoUIs4EhP3ghsxF42wvNMgXFKCCFDwwggVyMIIDWqADAgECAhB2U/6sdUZI
 # k/Xl10pIOk74MA0GCSqGSIb3DQEBDAUAMFMxCzAJBgNVBAYTAkJFMRkwFwYDVQQK
 # ExBHbG9iYWxTaWduIG52LXNhMSkwJwYDVQQDEyBHbG9iYWxTaWduIENvZGUgU2ln
 # bmluZyBSb290IFI0NTAeFw0yMDAzMTgwMDAwMDBaFw00NTAzMTgwMDAwMDBaMFMx
@@ -3041,147 +3135,147 @@ Write-Log 'Collection routine returned'
 # vGWL0S6AywGcKdq8yhYrVzHkeJ4RsrdkZHdPTvoTPoF2X92dUNIlqiHG3WZ6/3aK
 # paZOtXTXrml259wsFxr8sZzfHWxfrVMpGC75mNCbwZZhhsNU5Xy3RbPkb31EmyNo
 # cQEskqx9WePUCYLGKT3ioNwegxc79fFGFT4vea4GGSYhErRoW9D/325MZMyQ89lX
-# tt3G/rTOcEVUPTYshnWkr6KsAPh8tTGCGpgwghqUAgEBMGwwXDELMAkGA1UEBhMC
+# tt3G/rTOcEVUPTYshnWkr6KsAPh8tTGCGpkwghqVAgEBMGwwXDELMAkGA1UEBhMC
 # QkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExMjAwBgNVBAMTKUdsb2JhbFNp
 # Z24gR0NDIFI0NSBFViBDb2RlU2lnbmluZyBDQSAyMDIwAgwT+aSpBbjNqY5ohT0w
 # DQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZBgkq
 # hkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYBBAGC
-# NwIBFTAvBgkqhkiG9w0BCQQxIgQg2ozfy1lICRnQqDBHaoYmaizH9se4SxpQTXvo
-# +ux4TBgwDQYJKoZIhvcNAQEBBQAEggIAJ/aWOWyboFD3i1o2Ldd8247WUTBwphse
-# iyE3PCcxmvB2jl5iIY0XBMFaLY5GtoPx08JSLifKUhpWOT9UfK0LdfHHqW/Hx5r4
-# gagv2FKBQyC5l+hyxplD/xRYHjnM3XImRuDiQ/6+aS+0SYYIw+zYMg+d/uH4m5Oe
-# wd4jx9BbpF7zDVpwMp/jNP/51AJleCHRyPD4Qr8nL5NC5vRTzGWBqCXOTEBZ4SGT
-# w8Y/984ihX8nizH3SavPSyDp315BJ1pZrOrap28nFSKYQSLb8TqN+NrdJ7sPDUpF
-# kpL9WuyMXkyHSe0rkuwZbEqCZvT5HxyTnQFKdmJQQjVIeCYTQVncqht5WrUsATan
-# CSdSe1L1aPnXdDEr3f68Gl6ibj2AfW23NwZUNal4syCeq7HdMvSxlHIcqZ8MuTB2
-# NpjxT3UiCVybGi6Kfw1qyuHnD1gB8aBJceN7qq3Yo2hQZMeJYi0D/5zLAzq0N2Wc
-# oJQpTNHFNfleAk+ITLJlOVM5R6+GrmOYOa57TJE98zDwp/KoW1UakQWlp9a32Dnp
-# Inu0OEd7sXu7wqFc2rEYAwtm0KCmbMZ4O9h+aQhj9Sx9ZTeJYQ6qrxj4tNuilzO3
-# OR9L4g0Jf9Oqf0g6zoPDJyhlNtY/GpbqMN8vBoikyZZHk1x12Qm7xqaBsQID9AW9
-# LxnFDQlMGKShghd2MIIXcgYKKwYBBAGCNwMDATGCF2IwghdeBgkqhkiG9w0BBwKg
-# ghdPMIIXSwIBAzEPMA0GCWCGSAFlAwQCAQUAMHcGCyqGSIb3DQEJEAEEoGgEZjBk
-# AgEBBglghkgBhv1sBwEwMTANBglghkgBZQMEAgEFAAQgX1r1eA+oE/9SZT8Id6nT
-# z8Z3xPYZDb5UsS812/L61NECEFYbNb73oWIWBxM67fb9QqUYDzIwMjYwNzIyMDgy
-# MjUzWqCCEzowggbtMIIE1aADAgECAhAKgO8YS43xBYLRxHanlXRoMA0GCSqGSIb3
-# DQEBCwUAMGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFB
-# MD8GA1UEAxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5
-# NiBTSEEyNTYgMjAyNSBDQTEwHhcNMjUwNjA0MDAwMDAwWhcNMzYwOTAzMjM1OTU5
-# WjBjMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xOzA5BgNV
-# BAMTMkRpZ2lDZXJ0IFNIQTI1NiBSU0E0MDk2IFRpbWVzdGFtcCBSZXNwb25kZXIg
-# MjAyNSAxMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0EasLRLGntDq
-# rmBWsytXum9R/4ZwCgHfyjfMGUIwYzKomd8U1nH7C8Dr0cVMF3BsfAFI54um8+dn
-# xk36+jx0Tb+k+87H9WPxNyFPJIDZHhAqlUPt281mHrBbZHqRK71Em3/hCGC5Kyyn
-# eqiZ7syvFXJ9A72wzHpkBaMUNg7MOLxI6E9RaUueHTQKWXymOtRwJXcrcTTPPT2V
-# 1D/+cFllESviH8YjoPFvZSjKs3SKO1QNUdFd2adw44wDcKgH+JRJE5Qg0NP3yiSy
-# i5MxgU6cehGHr7zou1znOM8odbkqoK+lJ25LCHBSai25CFyD23DZgPfDrJJJK77e
-# pTwMP6eKA0kWa3osAe8fcpK40uhktzUd/Yk0xUvhDU6lvJukx7jphx40DQt82yep
-# yekl4i0r8OEps/FNO4ahfvAk12hE5FVs9HVVWcO5J4dVmVzix4A77p3awLbr89A9
-# 0/nWGjXMGn7FQhmSlIUDy9Z2hSgctaepZTd0ILIUbWuhKuAeNIeWrzHKYueMJtIt
-# nj2Q+aTyLLKLM0MheP/9w6CtjuuVHJOVoIJ/DtpJRE7Ce7vMRHoRon4CWIvuiNN1
-# Lk9Y+xZ66lazs2kKFSTnnkrT3pXWETTJkhd76CIDBbTRofOsNyEhzZtCGmnQigpF
-# Hti58CSmvEyJcAlDVcKacJ+A9/z7eacCAwEAAaOCAZUwggGRMAwGA1UdEwEB/wQC
-# MAAwHQYDVR0OBBYEFOQ7/PIx7f391/ORcWMZUEPPYYzoMB8GA1UdIwQYMBaAFO9v
-# U0rp5AZ8esrikFb2L9RJ7MtOMA4GA1UdDwEB/wQEAwIHgDAWBgNVHSUBAf8EDDAK
-# BggrBgEFBQcDCDCBlQYIKwYBBQUHAQEEgYgwgYUwJAYIKwYBBQUHMAGGGGh0dHA6
-# Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBdBggrBgEFBQcwAoZRaHR0cDovL2NhY2VydHMu
-# ZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZEc0VGltZVN0YW1waW5nUlNBNDA5
-# NlNIQTI1NjIwMjVDQTEuY3J0MF8GA1UdHwRYMFYwVKBSoFCGTmh0dHA6Ly9jcmwz
+# NwIBFTAvBgkqhkiG9w0BCQQxIgQgoB4bPwvivHGpTjas6xvN2WRnbCMLWlh4n4wO
+# y4FMOLMwDQYJKoZIhvcNAQEBBQAEggIAIAbKO8lA+px1S0j9E3465Y5BHUUbQBoR
+# HylNGieaKwnkjm7JYdRx5ndcMcZYSxYB2abs+BGq3OQTkleBLFpM9ORP4BUp4UMm
+# b2u2zkLKQ7U2niCn4MY7PV5A+7xsg4OgibaWTv1MnP3n4nOJ9sYQmp29OKltcMLs
+# UDNrytqiTjG1rAY/3sS4svksQOR3qJQDjSsrIk5a1ckl4CnYiiwFpSdikg7GjO7B
+# SRMVpVKSRd3m+H5+dBYH2+naqOM+JG1oElTg4z1LU5erUG8c5hg8Pk7NWNmqIVLs
+# nALqtyHM22adhQji135KN9nDgGTnZxgf4vGM+Njq4C0qABhS1eXVDGbhfhMo4OV9
+# SDTof02vBll7Dmfpc6393kZv5/a69WH8a8t0l8a1WY95KTvCLs020rOeUW0MYnda
+# DRnA7lz+RlLy8TdGwdpJcoI9cLigfrvzrKWlDpXtG8l+PK1gzEmFN2X2oT3n4m0i
+# 4/dPHApPDQl7ADpyn2F8DHBcq7WPMTZ+1DZKKFeduoqHF+ym/aSl1tnIvii1DmCl
+# udYOPMI+6WKdV7Pd6MSoZux4wuYXuCQB5Hl1o9obPkThhlBHeQYtcYtKn4EWWHWU
+# FkhvWdncw6hpCy2A7FiRVz4fzXDWB2zHgQuFs1iZlYiprFJUV95owMY4LHqOwqqa
+# Dl6PJGgfPHGhghd3MIIXcwYKKwYBBAGCNwMDATGCF2MwghdfBgkqhkiG9w0BBwKg
+# ghdQMIIXTAIBAzEPMA0GCWCGSAFlAwQCAQUAMHgGCyqGSIb3DQEJEAEEoGkEZzBl
+# AgEBBglghkgBhv1sBwEwMTANBglghkgBZQMEAgEFAAQgfD8mC4bnQ3iuev0Xdq62
+# U5NnuJyjj6Ul695XxQHli1MCEQCGd7FJG9jZHo2kBhYE2Rw4GA8yMDI2MDcyMjE0
+# MjUwMVqgghM6MIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG
+# 9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4x
+# QTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQw
+# OTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAwMFoXDTM2MDkwMzIzNTk1
+# OVowYzELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMTswOQYD
+# VQQDEzJEaWdpQ2VydCBTSEEyNTYgUlNBNDA5NiBUaW1lc3RhbXAgUmVzcG9uZGVy
+# IDIwMjUgMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBANBGrC0Sxp7Q
+# 6q5gVrMrV7pvUf+GcAoB38o3zBlCMGMyqJnfFNZx+wvA69HFTBdwbHwBSOeLpvPn
+# Z8ZN+vo8dE2/pPvOx/Vj8TchTySA2R4QKpVD7dvNZh6wW2R6kSu9RJt/4QhguSss
+# p3qome7MrxVyfQO9sMx6ZAWjFDYOzDi8SOhPUWlLnh00Cll8pjrUcCV3K3E0zz09
+# ldQ//nBZZREr4h/GI6Dxb2UoyrN0ijtUDVHRXdmncOOMA3CoB/iUSROUINDT98ok
+# souTMYFOnHoRh6+86Ltc5zjPKHW5KqCvpSduSwhwUmotuQhcg9tw2YD3w6ySSSu+
+# 3qU8DD+nigNJFmt6LAHvH3KSuNLoZLc1Hf2JNMVL4Q1OpbybpMe46YceNA0LfNsn
+# qcnpJeItK/DhKbPxTTuGoX7wJNdoRORVbPR1VVnDuSeHVZlc4seAO+6d2sC26/PQ
+# PdP51ho1zBp+xUIZkpSFA8vWdoUoHLWnqWU3dCCyFG1roSrgHjSHlq8xymLnjCbS
+# LZ49kPmk8iyyizNDIXj//cOgrY7rlRyTlaCCfw7aSUROwnu7zER6EaJ+AliL7ojT
+# dS5PWPsWeupWs7NpChUk555K096V1hE0yZIXe+giAwW00aHzrDchIc2bQhpp0IoK
+# RR7YufAkprxMiXAJQ1XCmnCfgPf8+3mnAgMBAAGjggGVMIIBkTAMBgNVHRMBAf8E
+# AjAAMB0GA1UdDgQWBBTkO/zyMe39/dfzkXFjGVBDz2GM6DAfBgNVHSMEGDAWgBTv
+# b1NK6eQGfHrK4pBW9i/USezLTjAOBgNVHQ8BAf8EBAMCB4AwFgYDVR0lAQH/BAww
+# CgYIKwYBBQUHAwgwgZUGCCsGAQUFBwEBBIGIMIGFMCQGCCsGAQUFBzABhhhodHRw
+# Oi8vb2NzcC5kaWdpY2VydC5jb20wXQYIKwYBBQUHMAKGUWh0dHA6Ly9jYWNlcnRz
 # LmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRHNFRpbWVTdGFtcGluZ1JTQTQw
-# OTZTSEEyNTYyMDI1Q0ExLmNybDAgBgNVHSAEGTAXMAgGBmeBDAEEAjALBglghkgB
-# hv1sBwEwDQYJKoZIhvcNAQELBQADggIBAGUqrfEcJwS5rmBB7NEIRJ5jQHIh+OT2
-# Ik/bNYulCrVvhREafBYF0RkP2AGr181o2YWPoSHz9iZEN/FPsLSTwVQWo2H62yGB
-# vg7ouCODwrx6ULj6hYKqdT8wv2UV+Kbz/3ImZlJ7YXwBD9R0oU62PtgxOao872bO
-# ySCILdBghQ/ZLcdC8cbUUO75ZSpbh1oipOhcUT8lD8QAGB9lctZTTOJM3pHfKBAE
-# cxQFoHlt2s9sXoxFizTeHihsQyfFg5fxUFEp7W42fNBVN4ueLaceRf9Cq9ec1v5i
-# QMWTFQa0xNqItH3CPFTG7aEQJmmrJTV3Qhtfparz+BW60OiMEgV5GWoBy4RVPRwq
-# xv7Mk0Sy4QHs7v9y69NBqycz0BZwhB9WOfOu/CIJnzkQTwtSSpGGhLdjnQ4eBpjt
-# P+XB3pQCtv4E5UCSDag6+iX8MmB10nfldPF9SVD7weCC3yXZi/uuhqdwkgVxuiMF
-# zGVFwYbQsiGnoa9F5AaAyBjFBtXVLcKtapnMG3VH3EmAp/jsJ3FVF3+d1SVDTmjF
-# jLbNFZUWMXuZyvgLfgyPehwJVxwC+UpX2MSey2ueIu9THFVkT+um1vshETaWyQo8
-# gmBto/m3acaP9QsuLj3FNwFlTxq25+T4QwX9xa6ILs84ZPvmpovq90K8eWyG2N01
-# c4IhSOxqt81nMIIGtDCCBJygAwIBAgIQDcesVwX/IZkuQEMiDDpJhjANBgkqhkiG
-# 9w0BAQsFADBiMQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkw
-# FwYDVQQLExB3d3cuZGlnaWNlcnQuY29tMSEwHwYDVQQDExhEaWdpQ2VydCBUcnVz
-# dGVkIFJvb3QgRzQwHhcNMjUwNTA3MDAwMDAwWhcNMzgwMTE0MjM1OTU5WjBpMQsw
-# CQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4xQTA/BgNVBAMTOERp
-# Z2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQwOTYgU0hBMjU2IDIw
-# MjUgQ0ExMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAtHgx0wqYQXK+
-# PEbAHKx126NGaHS0URedTa2NDZS1mZaDLFTtQ2oRjzUXMmxCqvkbsDpz4aH+qbxe
-# Lho8I6jY3xL1IusLopuW2qftJYJaDNs1+JH7Z+QdSKWM06qchUP+AbdJgMQB3h2D
-# Z0Mal5kYp77jYMVQXSZH++0trj6Ao+xh/AS7sQRuQL37QXbDhAktVJMQbzIBHYJB
-# YgzWIjk8eDrYhXDEpKk7RdoX0M980EpLtlrNyHw0Xm+nt5pnYJU3Gmq6bNMI1I7G
-# b5IBZK4ivbVCiZv7PNBYqHEpNVWC2ZQ8BbfnFRQVESYOszFI2Wv82wnJRfN20VRS
-# 3hpLgIR4hjzL0hpoYGk81coWJ+KdPvMvaB0WkE/2qHxJ0ucS638ZxqU14lDnki7C
-# coKCz6eum5A19WZQHkqUJfdkDjHkccpL6uoG8pbF0LJAQQZxst7VvwDDjAmSFTUm
-# s+wV/FbWBqi7fTJnjq3hj0XbQcd8hjj/q8d6ylgxCZSKi17yVp2NL+cnT6Toy+rN
-# +nM8M7LnLqCrO2JP3oW//1sfuZDKiDEb1AQ8es9Xr/u6bDTnYCTKIsDq1BtmXUqE
-# G1NqzJKS4kOmxkYp2WyODi7vQTCBZtVFJfVZ3j7OgWmnhFr4yUozZtqgPrHRVHhG
-# NKlYzyjlroPxul+bgIspzOwbtmsgY1MCAwEAAaOCAV0wggFZMBIGA1UdEwEB/wQI
-# MAYBAf8CAQAwHQYDVR0OBBYEFO9vU0rp5AZ8esrikFb2L9RJ7MtOMB8GA1UdIwQY
-# MBaAFOzX44LScV1kTN8uZz/nupiuHA9PMA4GA1UdDwEB/wQEAwIBhjATBgNVHSUE
-# DDAKBggrBgEFBQcDCDB3BggrBgEFBQcBAQRrMGkwJAYIKwYBBQUHMAGGGGh0dHA6
-# Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBBBggrBgEFBQcwAoY1aHR0cDovL2NhY2VydHMu
-# ZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3RlZFJvb3RHNC5jcnQwQwYDVR0fBDww
-# OjA4oDagNIYyaHR0cDovL2NybDMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0VHJ1c3Rl
-# ZFJvb3RHNC5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIwCwYJYIZIAYb9bAcBMA0G
-# CSqGSIb3DQEBCwUAA4ICAQAXzvsWgBz+Bz0RdnEwvb4LyLU0pn/N0IfFiBowf0/D
-# m1wGc/Do7oVMY2mhXZXjDNJQa8j00DNqhCT3t+s8G0iP5kvN2n7Jd2E4/iEIUBO4
-# 1P5F448rSYJ59Ib61eoalhnd6ywFLerycvZTAz40y8S4F3/a+Z1jEMK/DMm/axFS
-# goR8n6c3nuZB9BfBwAQYK9FHaoq2e26MHvVY9gCDA/JYsq7pGdogP8HRtrYfctSL
-# ANEBfHU16r3J05qX3kId+ZOczgj5kjatVB+NdADVZKON/gnZruMvNYY2o1f4MXRJ
-# DMdTSlOLh0HCn2cQLwQCqjFbqrXuvTPSegOOzr4EWj7PtspIHBldNE2K9i697cva
-# iIo2p61Ed2p8xMJb82Yosn0z4y25xUbI7GIN/TpVfHIqQ6Ku/qjTY6hc3hsXMrS+
-# U0yy+GWqAXam4ToWd2UQ1KYT70kZjE4YtL8Pbzg0c1ugMZyZZd/BdHLiRu7hAWE6
-# bTEm4XYRkA6Tl4KSFLFk43esaUeqGkH/wyW4N7OigizwJWeukcyIPbAvjSabnf7+
-# Pu0VrFgoiovRDiyx3zEdmcif/sYQsfch28bZeUz2rtY/9TCA6TD8dC3JE3rYkrhL
-# ULy7Dc90G6e8BlqmyIjlgp2+VqsS9/wQD7yFylIz0scmbKvFoW2jNrbM1pD2T7m3
-# XDCCBY0wggR1oAMCAQICEA6bGI750C3n79tQ4ghAGFowDQYJKoZIhvcNAQEMBQAw
-# ZTELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQ
-# d3d3LmRpZ2ljZXJ0LmNvbTEkMCIGA1UEAxMbRGlnaUNlcnQgQXNzdXJlZCBJRCBS
-# b290IENBMB4XDTIyMDgwMTAwMDAwMFoXDTMxMTEwOTIzNTk1OVowYjELMAkGA1UE
-# BhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZMBcGA1UECxMQd3d3LmRpZ2lj
-# ZXJ0LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1c3RlZCBSb290IEc0MIICIjAN
-# BgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAv+aQc2jeu+RdSjwwIjBpM+zCpyUu
-# ySE98orYWcLhKac9WKt2ms2uexuEDcQwH/MbpDgW61bGl20dq7J58soR0uRf1gU8
-# Ug9SH8aeFaV+vp+pVxZZVXKvaJNwwrK6dZlqczKU0RBEEC7fgvMHhOZ0O21x4i0M
-# G+4g1ckgHWMpLc7sXk7Ik/ghYZs06wXGXuxbGrzryc/NrDRAX7F6Zu53yEioZldX
-# n1RYjgwrt0+nMNlW7sp7XeOtyU9e5TXnMcvak17cjo+A2raRmECQecN4x7axxLVq
-# GDgDEI3Y1DekLgV9iPWCPhCRcKtVgkEy19sEcypukQF8IUzUvK4bA3VdeGbZOjFE
-# mjNAvwjXWkmkwuapoGfdpCe8oU85tRFYF/ckXEaPZPfBaYh2mHY9WV1CdoeJl2l6
-# SPDgohIbZpp0yt5LHucOY67m1O+SkjqePdwA5EUlibaaRBkrfsCUtNJhbesz2cXf
-# SwQAzH0clcOP9yGyshG3u3/y1YxwLEFgqrFjGESVGnZifvaAsPvoZKYz0YkH4b23
-# 5kOkGLimdwHhD5QMIR2yVCkliWzlDlJRR3S+Jqy2QXXeeqxfjT/JvNNBERJb5RBQ
-# 6zHFynIWIgnffEx1P2PsIV/EIFFrb7GrhotPwtZFX50g/KEexcCPorF+CiaZ9eRp
-# L5gdLfXZqbId5RsCAwEAAaOCATowggE2MA8GA1UdEwEB/wQFMAMBAf8wHQYDVR0O
-# BBYEFOzX44LScV1kTN8uZz/nupiuHA9PMB8GA1UdIwQYMBaAFEXroq/0ksuCMS1R
-# i6enIZ3zbcgPMA4GA1UdDwEB/wQEAwIBhjB5BggrBgEFBQcBAQRtMGswJAYIKwYB
-# BQUHMAGGGGh0dHA6Ly9vY3NwLmRpZ2ljZXJ0LmNvbTBDBggrBgEFBQcwAoY3aHR0
-# cDovL2NhY2VydHMuZGlnaWNlcnQuY29tL0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENB
-# LmNydDBFBgNVHR8EPjA8MDqgOKA2hjRodHRwOi8vY3JsMy5kaWdpY2VydC5jb20v
-# RGlnaUNlcnRBc3N1cmVkSURSb290Q0EuY3JsMBEGA1UdIAQKMAgwBgYEVR0gADAN
-# BgkqhkiG9w0BAQwFAAOCAQEAcKC/Q1xV5zhfoKN0Gz22Ftf3v1cHvZqsoYcs7IVe
-# qRq7IviHGmlUIu2kiHdtvRoU9BNKei8ttzjv9P+Aufih9/Jy3iS8UgPITtAq3vot
-# Vs/59PesMHqai7Je1M/RQ0SbQyHrlnKhSLSZy51PpwYDE3cnRNTnf+hZqPC/Lwum
-# 6fI0POz3A8eHqNJMQBk1RmppVLC4oVaO7KTVPeix3P0c2PR3WlxUjG/voVA9/HYJ
-# aISfb8rbII01YBwCA8sgsKxYoA5AY8WYIsGyWfVVa88nq2x2zm8jLfR+cWojayL/
-# ErhULSd+2DrZ8LaHlv1b0VysGMNNn3O3AamfV6peKOK5lDGCA3wwggN4AgEBMH0w
-# aTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQD
-# EzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNIQTI1
-# NiAyMDI1IENBMQIQCoDvGEuN8QWC0cR2p5V0aDANBglghkgBZQMEAgEFAKCB0TAa
-# BgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MDcy
-# MjA4MjI1M1owKwYLKoZIhvcNAQkQAgwxHDAaMBgwFgQU3WIwrIYKLTBr2jixaHlS
-# MAf7QX4wLwYJKoZIhvcNAQkEMSIEIJPzFVy1Eko+G7q256Og64+jS9xCIOOpG3EU
-# GsUyC49SMDcGCyqGSIb3DQEJEAIvMSgwJjAkMCIEIEqgP6Is11yExVyTj4KOZ2uc
-# rsqzP+NtJpqjNPFGEQozMA0GCSqGSIb3DQEBAQUABIICAG7vrFQZ/AZSO8z5I5Ev
-# x0tr8E/GN/sm2aJtnq77ql1O9AJlVHfWPKMNeUFipov96+pCUPf05oPOzmvvW8bm
-# OE92NkNLo2KSZWMonBNXUP8Zi1RYxUagXcDFWoMXeOjyX2hqMub2BrNsAQbGNubY
-# 9uLI35JhdVs9L141hIDdca05HQdY17/wDmt8ORCzvaruwJKNgd1Lc82tvCJHBFyW
-# wuyPBVjsp0T9tzmBmUMfEfQOd9uh7g/3Dm3LmXURyurX+Iugmbbk4bGT6lQn6n4q
-# nTH30f6xePQdTADdCwFrUE7KgFKQdgRkqV2FwyiiX5u4oPBx2nHOyV/Phstf2FIj
-# oU2GKF+cD3WK77l7gowMiopiwx+r+op4U53v4aYsK1J8LlLW+IY1BPO9i3ZvIcAm
-# 9u1+khaBJ0nSjTFW5jetE/6P1ShUZ1wykaw0uUyis/6xkehRFb+iJpjdDj7FLOuB
-# 1Rkc5/BNeFsPXatCHKHN+ExHWad38l48AE1NPBbMY7PQTQACrZIdjxZanw5pKV6K
-# oj6s/dvyfTp89/w6CnzW4hB9UQcCutKWqiBVHCZ8OQap9Qibd3ZhmoUDE0PSSKcg
-# yYnzzp3kO8jNr2i4S/2GLdlmWnYL8RmsaTqi9uaiOyI8M3QTzhjnJZny38QGllTs
-# pO/U4p/9HUxcNoPi5UGe+xHA
+# OTZTSEEyNTYyMDI1Q0ExLmNydDBfBgNVHR8EWDBWMFSgUqBQhk5odHRwOi8vY3Js
+# My5kaWdpY2VydC5jb20vRGlnaUNlcnRUcnVzdGVkRzRUaW1lU3RhbXBpbmdSU0E0
+# MDk2U0hBMjU2MjAyNUNBMS5jcmwwIAYDVR0gBBkwFzAIBgZngQwBBAIwCwYJYIZI
+# AYb9bAcBMA0GCSqGSIb3DQEBCwUAA4ICAQBlKq3xHCcEua5gQezRCESeY0ByIfjk
+# 9iJP2zWLpQq1b4URGnwWBdEZD9gBq9fNaNmFj6Eh8/YmRDfxT7C0k8FUFqNh+tsh
+# gb4O6Lgjg8K8elC4+oWCqnU/ML9lFfim8/9yJmZSe2F8AQ/UdKFOtj7YMTmqPO9m
+# zskgiC3QYIUP2S3HQvHG1FDu+WUqW4daIqToXFE/JQ/EABgfZXLWU0ziTN6R3ygQ
+# BHMUBaB5bdrPbF6MRYs03h4obEMnxYOX8VBRKe1uNnzQVTeLni2nHkX/QqvXnNb+
+# YkDFkxUGtMTaiLR9wjxUxu2hECZpqyU1d0IbX6Wq8/gVutDojBIFeRlqAcuEVT0c
+# Ksb+zJNEsuEB7O7/cuvTQasnM9AWcIQfVjnzrvwiCZ85EE8LUkqRhoS3Y50OHgaY
+# 7T/lwd6UArb+BOVAkg2oOvol/DJgddJ35XTxfUlQ+8Hggt8l2Yv7roancJIFcboj
+# BcxlRcGG0LIhp6GvReQGgMgYxQbV1S3CrWqZzBt1R9xJgKf47CdxVRd/ndUlQ05o
+# xYy2zRWVFjF7mcr4C34Mj3ocCVccAvlKV9jEnstrniLvUxxVZE/rptb7IRE2lskK
+# PIJgbaP5t2nGj/ULLi49xTcBZU8atufk+EMF/cWuiC7POGT75qaL6vdCvHlshtjd
+# NXOCIUjsarfNZzCCBrQwggScoAMCAQICEA3HrFcF/yGZLkBDIgw6SYYwDQYJKoZI
+# hvcNAQELBQAwYjELMAkGA1UEBhMCVVMxFTATBgNVBAoTDERpZ2lDZXJ0IEluYzEZ
+# MBcGA1UECxMQd3d3LmRpZ2ljZXJ0LmNvbTEhMB8GA1UEAxMYRGlnaUNlcnQgVHJ1
+# c3RlZCBSb290IEc0MB4XDTI1MDUwNzAwMDAwMFoXDTM4MDExNDIzNTk1OVowaTEL
+# MAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYDVQQDEzhE
+# aWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNIQTI1NiAy
+# MDI1IENBMTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALR4MdMKmEFy
+# vjxGwBysddujRmh0tFEXnU2tjQ2UtZmWgyxU7UNqEY81FzJsQqr5G7A6c+Gh/qm8
+# Xi4aPCOo2N8S9SLrC6Kbltqn7SWCWgzbNfiR+2fkHUiljNOqnIVD/gG3SYDEAd4d
+# g2dDGpeZGKe+42DFUF0mR/vtLa4+gKPsYfwEu7EEbkC9+0F2w4QJLVSTEG8yAR2C
+# QWIM1iI5PHg62IVwxKSpO0XaF9DPfNBKS7Zazch8NF5vp7eaZ2CVNxpqumzTCNSO
+# xm+SAWSuIr21Qomb+zzQWKhxKTVVgtmUPAW35xUUFREmDrMxSNlr/NsJyUXzdtFU
+# Ut4aS4CEeIY8y9IaaGBpPNXKFifinT7zL2gdFpBP9qh8SdLnEut/GcalNeJQ55Iu
+# wnKCgs+nrpuQNfVmUB5KlCX3ZA4x5HHKS+rqBvKWxdCyQEEGcbLe1b8Aw4wJkhU1
+# JrPsFfxW1gaou30yZ46t4Y9F20HHfIY4/6vHespYMQmUiote8ladjS/nJ0+k6Mvq
+# zfpzPDOy5y6gqztiT96Fv/9bH7mQyogxG9QEPHrPV6/7umw052AkyiLA6tQbZl1K
+# hBtTasySkuJDpsZGKdlsjg4u70EwgWbVRSX1Wd4+zoFpp4Ra+MlKM2baoD6x0VR4
+# RjSpWM8o5a6D8bpfm4CLKczsG7ZrIGNTAgMBAAGjggFdMIIBWTASBgNVHRMBAf8E
+# CDAGAQH/AgEAMB0GA1UdDgQWBBTvb1NK6eQGfHrK4pBW9i/USezLTjAfBgNVHSME
+# GDAWgBTs1+OC0nFdZEzfLmc/57qYrhwPTzAOBgNVHQ8BAf8EBAMCAYYwEwYDVR0l
+# BAwwCgYIKwYBBQUHAwgwdwYIKwYBBQUHAQEEazBpMCQGCCsGAQUFBzABhhhodHRw
+# Oi8vb2NzcC5kaWdpY2VydC5jb20wQQYIKwYBBQUHMAKGNWh0dHA6Ly9jYWNlcnRz
+# LmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0ZWRSb290RzQuY3J0MEMGA1UdHwQ8
+# MDowOKA2oDSGMmh0dHA6Ly9jcmwzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydFRydXN0
+# ZWRSb290RzQuY3JsMCAGA1UdIAQZMBcwCAYGZ4EMAQQCMAsGCWCGSAGG/WwHATAN
+# BgkqhkiG9w0BAQsFAAOCAgEAF877FoAc/gc9EXZxML2+C8i1NKZ/zdCHxYgaMH9P
+# w5tcBnPw6O6FTGNpoV2V4wzSUGvI9NAzaoQk97frPBtIj+ZLzdp+yXdhOP4hCFAT
+# uNT+ReOPK0mCefSG+tXqGpYZ3essBS3q8nL2UwM+NMvEuBd/2vmdYxDCvwzJv2sR
+# UoKEfJ+nN57mQfQXwcAEGCvRR2qKtntujB71WPYAgwPyWLKu6RnaID/B0ba2H3LU
+# iwDRAXx1Neq9ydOal95CHfmTnM4I+ZI2rVQfjXQA1WSjjf4J2a7jLzWGNqNX+DF0
+# SQzHU0pTi4dBwp9nEC8EAqoxW6q17r0z0noDjs6+BFo+z7bKSBwZXTRNivYuve3L
+# 2oiKNqetRHdqfMTCW/NmKLJ9M+MtucVGyOxiDf06VXxyKkOirv6o02OoXN4bFzK0
+# vlNMsvhlqgF2puE6FndlENSmE+9JGYxOGLS/D284NHNboDGcmWXfwXRy4kbu4QFh
+# Om0xJuF2EZAOk5eCkhSxZON3rGlHqhpB/8MluDezooIs8CVnrpHMiD2wL40mm53+
+# /j7tFaxYKIqL0Q4ssd8xHZnIn/7GELH3IdvG2XlM9q7WP/UwgOkw/HQtyRN62JK4
+# S1C8uw3PdBunvAZapsiI5YKdvlarEvf8EA+8hcpSM9LHJmyrxaFtoza2zNaQ9k+5
+# t1wwggWNMIIEdaADAgECAhAOmxiO+dAt5+/bUOIIQBhaMA0GCSqGSIb3DQEBDAUA
+# MGUxCzAJBgNVBAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsT
+# EHd3dy5kaWdpY2VydC5jb20xJDAiBgNVBAMTG0RpZ2lDZXJ0IEFzc3VyZWQgSUQg
+# Um9vdCBDQTAeFw0yMjA4MDEwMDAwMDBaFw0zMTExMDkyMzU5NTlaMGIxCzAJBgNV
+# BAYTAlVTMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdp
+# Y2VydC5jb20xITAfBgNVBAMTGERpZ2lDZXJ0IFRydXN0ZWQgUm9vdCBHNDCCAiIw
+# DQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAL/mkHNo3rvkXUo8MCIwaTPswqcl
+# LskhPfKK2FnC4SmnPVirdprNrnsbhA3EMB/zG6Q4FutWxpdtHauyefLKEdLkX9YF
+# PFIPUh/GnhWlfr6fqVcWWVVyr2iTcMKyunWZanMylNEQRBAu34LzB4TmdDttceIt
+# DBvuINXJIB1jKS3O7F5OyJP4IWGbNOsFxl7sWxq868nPzaw0QF+xembud8hIqGZX
+# V59UWI4MK7dPpzDZVu7Ke13jrclPXuU15zHL2pNe3I6PgNq2kZhAkHnDeMe2scS1
+# ahg4AxCN2NQ3pC4FfYj1gj4QkXCrVYJBMtfbBHMqbpEBfCFM1LyuGwN1XXhm2Tox
+# RJozQL8I11pJpMLmqaBn3aQnvKFPObURWBf3JFxGj2T3wWmIdph2PVldQnaHiZdp
+# ekjw4KISG2aadMreSx7nDmOu5tTvkpI6nj3cAORFJYm2mkQZK37AlLTSYW3rM9nF
+# 30sEAMx9HJXDj/chsrIRt7t/8tWMcCxBYKqxYxhElRp2Yn72gLD76GSmM9GJB+G9
+# t+ZDpBi4pncB4Q+UDCEdslQpJYls5Q5SUUd0viastkF13nqsX40/ybzTQRESW+UQ
+# UOsxxcpyFiIJ33xMdT9j7CFfxCBRa2+xq4aLT8LWRV+dIPyhHsXAj6KxfgommfXk
+# aS+YHS312amyHeUbAgMBAAGjggE6MIIBNjAPBgNVHRMBAf8EBTADAQH/MB0GA1Ud
+# DgQWBBTs1+OC0nFdZEzfLmc/57qYrhwPTzAfBgNVHSMEGDAWgBRF66Kv9JLLgjEt
+# UYunpyGd823IDzAOBgNVHQ8BAf8EBAMCAYYweQYIKwYBBQUHAQEEbTBrMCQGCCsG
+# AQUFBzABhhhodHRwOi8vb2NzcC5kaWdpY2VydC5jb20wQwYIKwYBBQUHMAKGN2h0
+# dHA6Ly9jYWNlcnRzLmRpZ2ljZXJ0LmNvbS9EaWdpQ2VydEFzc3VyZWRJRFJvb3RD
+# QS5jcnQwRQYDVR0fBD4wPDA6oDigNoY0aHR0cDovL2NybDMuZGlnaWNlcnQuY29t
+# L0RpZ2lDZXJ0QXNzdXJlZElEUm9vdENBLmNybDARBgNVHSAECjAIMAYGBFUdIAAw
+# DQYJKoZIhvcNAQEMBQADggEBAHCgv0NcVec4X6CjdBs9thbX979XB72arKGHLOyF
+# XqkauyL4hxppVCLtpIh3bb0aFPQTSnovLbc47/T/gLn4offyct4kvFIDyE7QKt76
+# LVbP+fT3rDB6mouyXtTP0UNEm0Mh65ZyoUi0mcudT6cGAxN3J0TU53/oWajwvy8L
+# punyNDzs9wPHh6jSTEAZNUZqaVSwuKFWjuyk1T3osdz9HNj0d1pcVIxv76FQPfx2
+# CWiEn2/K2yCNNWAcAgPLILCsWKAOQGPFmCLBsln1VWvPJ6tsds5vIy30fnFqI2si
+# /xK4VC0nftg62fC2h5b9W9FcrBjDTZ9ztwGpn1eqXijiuZQxggN8MIIDeAIBATB9
+# MGkxCzAJBgNVBAYTAlVTMRcwFQYDVQQKEw5EaWdpQ2VydCwgSW5jLjFBMD8GA1UE
+# AxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEy
+# NTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUDBAIBBQCggdEw
+# GgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMBwGCSqGSIb3DQEJBTEPFw0yNjA3
+# MjIxNDI1MDFaMCsGCyqGSIb3DQEJEAIMMRwwGjAYMBYEFN1iMKyGCi0wa9o4sWh5
+# UjAH+0F+MC8GCSqGSIb3DQEJBDEiBCBFEekw/ldf75z98xWlHl2ho4npj/HAx8ot
+# VyG5O67xpzA3BgsqhkiG9w0BCRACLzEoMCYwJDAiBCBKoD+iLNdchMVck4+Cjmdr
+# nK7Ksz/jbSaaozTxRhEKMzANBgkqhkiG9w0BAQEFAASCAgBrXbu2Pqx9TMEqvfpE
+# iV4pEbI76gE5swk5XzNWHTSAmiiNL30e/vS8kovxQQIe/4v/NapZ2+05hScsNY+0
+# cM/7lJFtO6cu9FmT7osxx8dRhW491Lnt+p1a8JHtwfV6qNOaYc270wUP0Uo8yBEI
+# Kye3QZZ9BCoeuc228r7hUBTksRVbDhFGA/iB4h01CLsDLEVkQyXHzk6hVOGMa+vO
+# J/ZBNhu1Cs1RIbSRnSl9yXGaadUrziFyyayKl097P99aculNPMPDR2aaM0yA+SsV
+# 53MzpeICzNhLhxOF6MGFxaVAATDwolkkGUkfJK0kM4a6563SjrK+HwCjPbZsz/Ts
+# G0v+gkob/dvpui+owYMRzncy/6GslrwUK5ROW+gS82qLFG/FX3p2WrMpj7BfYkQF
+# 95DFUnMO+woMKkfRNM12oQC7balEr8oSGfMXi29GTFlp2gIG0RLIz8Vxpt5fGKhv
+# b23VXHs/+AjfIs1Nf7mS4TBsBIL+rK3sC+MnJNM462afBlTlB66pz3GjsPB1+S8Q
+# FNlWCUORXFbVudRq1WeShjubB2yYKEdg0vie52rMqDqSCY5qbQZ4Cyp0uBZmZNHn
+# 0qCTe86mVz8BQBE0KD+eCELbhUWBWS50ln49oIoeoTF7l5UTQFgadI5NkQOpDUDD
+# kDNv1Xi956Ciqkyxuk7COC9OTA==
 # SIG # End signature block

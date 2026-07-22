@@ -17,9 +17,9 @@
                   },
                   {
                       "name":  "Get-CitrixCloudData-Signed.ps1",
-                      "version":  "2026-07-22.2",
-                      "sha256":  "E29B4F8E8D93C91CE23619554F290E86D7A4BD5DB60C880A16B82D59D1FCB0A1",
-                      "size":  186454,
+                      "version":  "2026-07-22.4",
+                      "sha256":  "D65E747425ABBC17D7243C42373232A93835335FB190A16E15C4B157B49F3B06",
+                      "size":  192361,
                       "signed":  true
                   },
                   {
