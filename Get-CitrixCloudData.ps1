@@ -114,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22'
+$script:_version      = '2026-07-22.1'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -1199,7 +1199,10 @@ function Get-CloudIdentityProviders {
     # Merge both so every type gets a status where available.
     $listResp   = Invoke-CitrixApi -FullUrl "https://cws.citrixworkspacesapi.net/$cid/identityProviders" -Quiet
     $statusResp = Invoke-CitrixApi -FullUrl "https://cws.citrixworkspacesapi.net/$cid/identityProviders/all/status" -Quiet
-    if (-not $listResp -and -not $statusResp) { Write-Log 'Identity providers: no endpoint responded' 'WARN'; return @() }
+    if (-not $listResp -and -not $statusResp) {
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) { $script:_collectStatus['IdentityProviders'] = 'AccessDenied' }
+        Write-Log 'Identity providers: no endpoint responded' 'WARN'; return @()
+    }
     if ($listResp)   { Write-RawSample 'IdentityProviders' $listResp }
     if ($statusResp) { Write-RawSample 'IdentityProvidersStatus' $statusResp }
 
@@ -1330,7 +1333,10 @@ function Get-ConditionalAuthPolicies {
         "https://cws.citrixworkspacesapi.net/$cid/conditionalAuthentication/policies"
         "https://api.cloud.com/trust/v1/$cid/conditionalAccessPolicies"
     )
-    if (-not $resp) { Write-Log 'Conditional auth: no endpoint responded'; return ,@() }
+    if (-not $resp) {
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) { $script:_collectStatus['ConditionalAuthPolicies'] = 'AccessDenied' }
+        Write-Log 'Conditional auth: no endpoint responded'; return ,@()
+    }
     Write-RawSample 'ConditionalAuthPolicies' $resp
     # Response shape: { "policySets": [{ "id", "name", "type", "policies": [...], ... }] }
     $src = if ($resp.policySets) { $resp.policySets } `
@@ -1539,7 +1545,10 @@ function Get-NetworkLocations {
         "https://network-location.cloud.com/location/v2/sites"
         "https://network-location.cloud.com/location/v1/networklocations"
     )
-    if (-not $resp) { Write-Log 'Network locations: no candidate endpoint responded' 'WARN'; return ,@() }
+    if (-not $resp) {
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) { $script:_collectStatus['NetworkLocations'] = 'AccessDenied' }
+        Write-Log 'Network locations: no candidate endpoint responded' 'WARN'; return ,@()
+    }
     Write-RawSample 'NetworkLocations' $resp
     # NLS response: { "sites": [...] } — ipv4Ranges (string[]), tags (string[]), internal (bool)
     $src = if ($resp.sites)  { $resp.sites }  elseif ($resp.Sites)  { $resp.Sites } `
@@ -1676,7 +1685,10 @@ function Get-CloudAdministrators {
         "https://api.cloud.com/identity/administrators"
         "https://core.citrixworkspacesapi.net/$cid/administrators"
     )
-    if (-not $resp) { return @() }
+    if (-not $resp) {
+        if ($script:_lastStatus -eq 401 -or $script:_lastStatus -eq 403) { $script:_collectStatus['CloudAdministrators'] = 'AccessDenied' }
+        return @()
+    }
     $src = if ($resp.items) { $resp.items } elseif ($resp.Items) { $resp.Items } else { @($resp) }
     $results = @($src | ForEach-Object {
         [ordered]@{
