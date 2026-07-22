@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-22.1   (keep in lock-step with $script:_version below)
+# Version: 2026-07-22.2   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-22.1'
+$script:_version      = '2026-07-22.2'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -779,8 +779,67 @@ function Measure-FolderRecursive ([string]$Root, [System.Collections.Generic.Lis
     }
 }
 
-# Inventory a share root over the FILESYSTEM (UNC or local): top-level folders with recursive totals,
-# immediate files/subfolders, root loose files. $Full = every file recursively per folder.
+# Cheap, depth-bounded probe: is $Dir itself a user-profile ROOT (not a parent/group of profiles)? Uses the
+# same signals as Get-ProductEvidence - a SID-pattern folder name, a Citrix PM marker folder
+# (UPM_Profile/UPM_Data/Pending) as an immediate child, or an FSLogix VHD/VHDX container within the profile's
+# own nesting (<= 3 directory levels: <os>\ProfileContainer\<os>\*.vhdx). The VHDX depth cap is what keeps a
+# GROUP folder - whose VHDX live one level deeper, under each user - from being mistaken for a profile.
+function Test-LooksLikeProfile ([string]$Dir) {
+    try {
+        $name = [System.IO.Path]::GetFileName($Dir.TrimEnd('\', '/'))
+        if ($name -match '(?i)S-1-5-21-[\d\-]+') { return $true }
+        try {
+            foreach ($d in [System.IO.Directory]::EnumerateDirectories($Dir)) {
+                if ([System.IO.Path]::GetFileName($d) -match '(?i)^(UPM_Profile|UPM_Data|Pending)$') { return $true }
+            }
+        } catch {}
+        $stack = [System.Collections.Generic.Stack[object]]::new()
+        $stack.Push(@{ Path = $Dir; Depth = 0 })
+        while ($stack.Count -gt 0) {
+            $node = $stack.Pop()
+            try {
+                foreach ($f in [System.IO.Directory]::EnumerateFiles($node.Path)) {
+                    $ext = [System.IO.Path]::GetExtension($f).ToLower()
+                    if ($ext -eq '.vhd' -or $ext -eq '.vhdx') { return $true }
+                }
+            } catch {}
+            if ($node.Depth -lt 3) {
+                try { foreach ($d in [System.IO.Directory]::EnumerateDirectories($node.Path)) { $stack.Push(@{ Path = $d; Depth = $node.Depth + 1 }) } } catch {}
+            }
+        }
+    } catch {}
+    return $false
+}
+
+# Resolve the actual profile-root folders under $Root, transparently descending ONE level into grouping
+# folders (e.g. \\...\upmprofiles\3EAzureDR\<user>). Per immediate child C: if C is a profile -> keep it; else
+# if any child of C is a profile -> C is a group, keep ALL of C's children (so empty user folders aren't
+# dropped), named 'C\child'; else -> C is neither (an app folder) -> skip and record it. Returns
+# @{ Profiles=@(@{Path;Rel}); Skipped=@(names) }. Descent is bounded to one grouping level by design.
+function Resolve-ProfileRoots ([string]$Root) {
+    $profiles = [System.Collections.Generic.List[object]]::new()
+    $skipped  = [System.Collections.Generic.List[string]]::new()
+    $children = @()
+    try { $children = @([System.IO.Directory]::EnumerateDirectories($Root)) } catch {}
+    foreach ($c in $children) {
+        $cName = [System.IO.Path]::GetFileName($c)
+        if (Test-LooksLikeProfile $c) { [void]$profiles.Add(@{ Path = $c; Rel = $cName }); continue }
+        $gchildren = @()
+        try { $gchildren = @([System.IO.Directory]::EnumerateDirectories($c)) } catch {}
+        $isGroup = $false
+        foreach ($gc in $gchildren) { if (Test-LooksLikeProfile $gc) { $isGroup = $true; break } }
+        if ($isGroup) {
+            foreach ($gc in $gchildren) { [void]$profiles.Add(@{ Path = $gc; Rel = (Join-Path $cName ([System.IO.Path]::GetFileName($gc))) }) }
+        } else {
+            [void]$skipped.Add($cName)
+        }
+    }
+    return @{ Profiles = @($profiles); Skipped = @($skipped) }
+}
+
+# Inventory a share root over the FILESYSTEM (UNC or local): profile folders with recursive totals,
+# immediate files/subfolders, root loose files. Profiles nested one level under grouping folders are
+# discovered automatically (Resolve-ProfileRoots). $Full = every file recursively per folder.
 function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) {
     $folders = [System.Collections.Generic.List[object]]::new()
     $rootFiles = [System.Collections.Generic.List[object]]::new()
@@ -793,14 +852,17 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
         }
     } catch { [void]$errors.Add("root files: $($_.Exception.Message)") }
 
-    $topDirs = @()
-    try { $topDirs = @([System.IO.Directory]::EnumerateDirectories($Root)) } catch { [void]$errors.Add("root dirs: $($_.Exception.Message)") }
+    $resolved = Resolve-ProfileRoots $Root
+    $roots    = @($resolved.Profiles)
+    $skipped  = @($resolved.Skipped)
+    if ($skipped.Count) { Write-Log "Inventory: descended into grouping folders; skipped $($skipped.Count) non-profile folder(s): $($skipped -join ', ')" }
 
     $idx = 0
-    foreach ($dirPath in $topDirs) {
+    foreach ($pr in $roots) {
         $idx++
+        $dirPath = $pr.Path
         $di = [System.IO.DirectoryInfo]::new($dirPath)
-        if ($idx % 25 -eq 0 -or $idx -eq 1) { Set-SplashStatus "$ShareLabel - sizing folder $idx of $($topDirs.Count)..." }
+        if ($idx % 25 -eq 0 -or $idx -eq 1) { Set-SplashStatus "$ShareLabel - sizing folder $idx of $($roots.Count)..." }
         $fErrors = [System.Collections.Generic.List[string]]::new()
         # NB: direct assignment, not `= if (...) { ::new() }` - an empty collection returned through
         # an if-expression is pipeline-unrolled to AutomationNull, which silently disables the adds.
@@ -842,7 +904,7 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
         } catch { [void]$fErrors.Add("subdirs: $dirPath - $($_.Exception.Message)") }
 
         $entry = [ordered]@{
-            Name              = $di.Name
+            Name              = $pr.Rel
             TotalBytes        = [long]($imBytes + $subBytes)
             FileCount         = [long]($imCount + $subFiles)
             DirCount          = [long]$subDirs
@@ -863,6 +925,7 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
         RootFiles  = @($rootFiles)
         TotalBytes = [long]$totBytes
         TotalFiles = [long]$totFiles
+        SkippedFolders = @($skipped)
         Errors     = @($errors)
         Method     = 'Filesystem (SMB)'
     }
@@ -897,15 +960,46 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
         }
     }
 
+    # REST equivalent of Test-LooksLikeProfile: same signals + depth cap (VHD/VHDX within 3 levels; a UPM
+    # marker as an immediate child; SID-pattern leaf name) over the Azure Files data plane.
+    function Test-LooksLikeProfileRest ([string]$Dir) {
+        try {
+            if (($Dir -split '/')[-1] -match '(?i)S-1-5-21-[\d\-]+') { return $true }
+            $stack = [System.Collections.Generic.Stack[object]]::new(); $stack.Push(@{ Path = $Dir; Depth = 0 })
+            while ($stack.Count -gt 0) {
+                $node = $stack.Pop(); $l = $null
+                try { $l = Get-AzureFilesDirList $AccountName $ShareName $node.Path $StorageToken $AccountKey } catch { continue }
+                foreach ($f in $l.Files) { $ext = [System.IO.Path]::GetExtension($f.Name).ToLower(); if ($ext -eq '.vhd' -or $ext -eq '.vhdx') { return $true } }
+                if ($node.Depth -eq 0) { foreach ($d in $l.Dirs) { if ("$d" -match '(?i)^(UPM_Profile|UPM_Data|Pending)$') { return $true } } }
+                if ($node.Depth -lt 3) { foreach ($d in $l.Dirs) { $stack.Push(@{ Path = "$($node.Path)/$d"; Depth = $node.Depth + 1 }) } }
+            }
+        } catch {}
+        return $false
+    }
+
     $rootList = Get-AzureFilesDirList $AccountName $ShareName $SubPath $StorageToken $AccountKey
     $rootFiles = @($rootList.Files | ForEach-Object { [ordered]@{ Name = $_.Name; Bytes = [long]$_.Bytes; Extension = [System.IO.Path]::GetExtension($_.Name).ToLower(); LastWriteUtc = "$($_.LastWriteUtc)" } })
     foreach ($rf in $rootFiles) { $totBytes += [long]$rf.Bytes; $totFiles++ }
 
-    $idx = 0
+    # Resolve profile roots (one grouping level), mirroring the FS Resolve-ProfileRoots.
+    $restRoots = [System.Collections.Generic.List[object]]::new(); $restSkipped = [System.Collections.Generic.List[string]]::new()
     foreach ($dirName in @($rootList.Dirs)) {
+        $childPath = if ($SubPath) { "$SubPath/$dirName" } else { $dirName }
+        if (Test-LooksLikeProfileRest $childPath) { [void]$restRoots.Add(@{ DirPath = $childPath; Rel = $dirName }); continue }
+        $gl = $null; try { $gl = Get-AzureFilesDirList $AccountName $ShareName $childPath $StorageToken $AccountKey } catch {}
+        $gdirs = @(); if ($gl) { $gdirs = @($gl.Dirs) }
+        $isGroup = $false; foreach ($gd in $gdirs) { if (Test-LooksLikeProfileRest "$childPath/$gd") { $isGroup = $true; break } }
+        if ($isGroup) { foreach ($gd in $gdirs) { [void]$restRoots.Add(@{ DirPath = "$childPath/$gd"; Rel = "$dirName\$gd" }) } }
+        else { [void]$restSkipped.Add($dirName) }
+    }
+    $skipped = @($restSkipped)
+    if ($skipped.Count) { Write-Log "Inventory (REST): descended into grouping folders; skipped $($skipped.Count) non-profile folder(s): $($skipped -join ', ')" }
+
+    $idx = 0
+    foreach ($pr in @($restRoots)) {
         $idx++
-        if ($idx % 10 -eq 0 -or $idx -eq 1) { Set-SplashStatus "$ShareLabel - sizing folder $idx of $(@($rootList.Dirs).Count) (REST)..." }
-        $dirPath = if ($SubPath) { "$SubPath/$dirName" } else { $dirName }
+        if ($idx % 10 -eq 0 -or $idx -eq 1) { Set-SplashStatus "$ShareLabel - sizing folder $idx of $(@($restRoots).Count) (REST)..." }
+        $dirPath = $pr.DirPath
         $fErrors = [System.Collections.Generic.List[string]]::new()
         # Direct assignment (see the FS walker note): an if-expression would unroll the empty list.
         $allFiles = $null
@@ -932,7 +1026,7 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
         } catch { [void]$fErrors.Add("list: $dirPath - $($_.Exception.Message)") }
 
         $entry = [ordered]@{
-            Name = $dirName; TotalBytes = [long]($imBytes + $subBytes); FileCount = [long]($imCount + $subFiles); DirCount = [long]$subDirs
+            Name = $pr.Rel; TotalBytes = [long]($imBytes + $subBytes); FileCount = [long]($imCount + $subFiles); DirCount = [long]$subDirs
             LastWriteUtc = ''
             NewestWriteUtc    = $(if ($sawAny) { $fNewest.ToString('o') }    else { '' })
             NewestVhdWriteUtc = $(if ($sawVhd) { $fNewestVhd.ToString('o') } else { '' })
@@ -945,7 +1039,7 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
 
     return [ordered]@{
         Folders = @($folders); RootFiles = @($rootFiles); TotalBytes = [long]$totBytes; TotalFiles = [long]$totFiles
-        Errors = @($errors); Method = 'Azure Files REST'
+        SkippedFolders = @($skipped); Errors = @($errors); Method = 'Azure Files REST'
     }
 }
 
@@ -1114,6 +1208,7 @@ function Invoke-ShareCollection ([string]$Entry, [bool]$Full, [bool]$AzAvailable
         ProductEvidence = $null
         Folders         = @()
         RootFiles       = @()
+        SkippedFolders  = @()
         TotalBytes      = [long]0
         TotalFiles      = [long]0
         CapacityBytes   = $null
@@ -1247,6 +1342,7 @@ function Invoke-ShareCollection ([string]$Entry, [bool]$Full, [bool]$AzAvailable
         $share['TotalBytes']  = [long]$inv['TotalBytes']
         $share['TotalFiles']  = [long]$inv['TotalFiles']
         $share['FolderCount'] = @($inv['Folders']).Count
+        $share['SkippedFolders'] = @($inv['SkippedFolders'])
         foreach ($e in @($inv['Errors'])) { [void]$errs.Add($e) }
         $share['ProductEvidence'] = Get-ProductEvidence $inv
     }

@@ -31,9 +31,9 @@
                   },
                   {
                       "name":  "Get-ProfilesData.ps1",
-                      "version":  "2026-07-22.1",
-                      "sha256":  "0E2F3096420B19F8522ECD1D631DC6BAADADBECBF9B0DE87248ED02A58C3F727",
-                      "size":  80307,
+                      "version":  "2026-07-22.2",
+                      "sha256":  "C822846C34535B678488F35B367118805CEE612792F161B2135AFFFA50D369DB",
+                      "size":  86333,
                       "signed":  false
                   },
                   {
