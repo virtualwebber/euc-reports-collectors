@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-22   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-22.1   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-22'
+$script:_version      = '2026-07-22.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -649,7 +649,9 @@ function Get-AzureFilesDirList ([string]$AccountName, [string]$ShareName, [strin
         try {
             $marker = ''
             do {
-                $uri = "$baseUri/$ShareName$dirSeg`?restype=directory&comp=list&maxresults=5000" + $(if ($marker) { "&marker=$([uri]::EscapeDataString($marker))" })
+                # include=Timestamps surfaces per-file LastWriteTime (needs x-ms-version >= 2020-04-08; ours is
+                # 2022-11-02). If an older service ignores it, LastWriteTime is simply absent and we degrade to ''.
+                $uri = "$baseUri/$ShareName$dirSeg`?restype=directory&comp=list&maxresults=5000&include=Timestamps" + $(if ($marker) { "&marker=$([uri]::EscapeDataString($marker))" })
                 $h = New-FileDataHeaders $mode $AccountName $StorageToken $AccountKey 'GET' $uri
                 $raw = Invoke-WebRequest -Uri $uri -Method Get -Headers $h -UseBasicParsing -ErrorAction Stop
                 # Response is XML with a BOM-ish prefix sometimes; parse defensively.
@@ -657,7 +659,9 @@ function Get-AzureFilesDirList ([string]$AccountName, [string]$ShareName, [strin
                 [xml]$x = $txt
                 foreach ($f in @($x.EnumerationResults.Entries.File)) {
                     if ($null -eq $f) { continue }
-                    [void]$files.Add([ordered]@{ Name = "$($f.Name)"; Bytes = [long]$f.Properties.'Content-Length' })
+                    $lwIso = ''; $lwRaw = "$($f.Properties.LastWriteTime)"
+                    if ($lwRaw) { try { $lwIso = ([datetime]$lwRaw).ToUniversalTime().ToString('o') } catch { } }
+                    [void]$files.Add([ordered]@{ Name = "$($f.Name)"; Bytes = [long]$f.Properties.'Content-Length'; LastWriteUtc = $lwIso })
                 }
                 foreach ($d in @($x.EnumerationResults.Entries.Directory)) {
                     if ($null -eq $d) { continue }
@@ -739,6 +743,9 @@ function Get-RootNtfsAcl ([string]$Path) {
 # walk. Optionally records every file (relative path + size) into $AllFiles for -FullInventory.
 function Measure-FolderRecursive ([string]$Root, [System.Collections.Generic.List[string]]$Errors, $AllFiles, [string]$RelBase) {
     $bytes = [long]0; $files = [long]0; $dirs = [long]0
+    # Recursive newest-write, so staleness can be measured without -FullInventory: the newest write of any
+    # file, and separately the newest write of a VHD/VHDX container (the FSLogix logoff stamp).
+    $newest = [datetime]::MinValue; $newestVhd = [datetime]::MinValue; $sawVhd = $false
     $stack = [System.Collections.Generic.Stack[string]]::new()
     $stack.Push($Root)
     while ($stack.Count -gt 0) {
@@ -750,6 +757,10 @@ function Measure-FolderRecursive ([string]$Root, [System.Collections.Generic.Lis
                 try {
                     $fi = [System.IO.FileInfo]::new($f)
                     $bytes += $fi.Length; $files++
+                    $lw = $fi.LastWriteTimeUtc
+                    if ($lw -gt $newest) { $newest = $lw }
+                    $ext = $fi.Extension.ToLower()
+                    if ($ext -eq '.vhd' -or $ext -eq '.vhdx') { $sawVhd = $true; if ($lw -gt $newestVhd) { $newestVhd = $lw } }
                     if ($null -ne $AllFiles) {
                         [void]$AllFiles.Add([ordered]@{
                             Path = $f.Substring($RelBase.Length).TrimStart('\','/')
@@ -761,7 +772,11 @@ function Measure-FolderRecursive ([string]$Root, [System.Collections.Generic.Lis
             }
         } catch { [void]$Errors.Add("files: $cur - $($_.Exception.Message)") }
     }
-    return @{ Bytes = $bytes; Files = $files; Dirs = $dirs }
+    return @{
+        Bytes = $bytes; Files = $files; Dirs = $dirs
+        NewestUtc    = $(if ($files -gt 0) { $newest }    else { $null })
+        NewestVhdUtc = $(if ($sawVhd)      { $newestVhd } else { $null })
+    }
 }
 
 # Inventory a share root over the FILESYSTEM (UNC or local): top-level folders with recursive totals,
@@ -792,6 +807,10 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
         $allFiles = $null
         if ($Full) { $allFiles = [System.Collections.Generic.List[object]]::new() }
 
+        # Recursive newest-write for this profile folder (immediate files + all subfolders), tracked so the
+        # report can measure staleness from the container/newest write without needing -FullInventory.
+        $fNewest = [datetime]::MinValue; $fNewestVhd = [datetime]::MinValue; $sawAny = $false; $sawVhd = $false
+
         # Immediate files
         $imFiles = [System.Collections.Generic.List[object]]::new()
         $imBytes = [long]0; $imCount = [long]0
@@ -801,6 +820,8 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
                     $fi = [System.IO.FileInfo]::new($f)
                     [void]$imFiles.Add([ordered]@{ Name = $fi.Name; Bytes = [long]$fi.Length; Extension = $fi.Extension.ToLower(); LastWriteUtc = $fi.LastWriteTimeUtc.ToString('o') })
                     $imBytes += $fi.Length; $imCount++
+                    $lw = $fi.LastWriteTimeUtc; $sawAny = $true; if ($lw -gt $fNewest) { $fNewest = $lw }
+                    if ($fi.Extension.ToLower() -in @('.vhd', '.vhdx')) { $sawVhd = $true; if ($lw -gt $fNewestVhd) { $fNewestVhd = $lw } }
                     if ($null -ne $allFiles) { [void]$allFiles.Add([ordered]@{ Path = $fi.Name; Bytes = [long]$fi.Length; LastWriteUtc = $fi.LastWriteTimeUtc.ToString('o') }) }
                 } catch { [void]$fErrors.Add("file: $f - $($_.Exception.Message)") }
             }
@@ -815,18 +836,22 @@ function Get-ShareInventoryFs ([string]$Root, [bool]$Full, [string]$ShareLabel) 
                 $sdi = [System.IO.DirectoryInfo]::new($sd)
                 [void]$subs.Add([ordered]@{ Name = $sdi.Name; TotalBytes = [long]$m.Bytes; FileCount = [long]$m.Files; DirCount = [long]$m.Dirs })
                 $subBytes += $m.Bytes; $subFiles += $m.Files; $subDirs += ([long]$m.Dirs + 1)
+                if ($m.NewestUtc)    { $sawAny = $true; if ($m.NewestUtc    -gt $fNewest)    { $fNewest    = $m.NewestUtc } }
+                if ($m.NewestVhdUtc) { $sawVhd = $true; if ($m.NewestVhdUtc -gt $fNewestVhd) { $fNewestVhd = $m.NewestVhdUtc } }
             }
         } catch { [void]$fErrors.Add("subdirs: $dirPath - $($_.Exception.Message)") }
 
         $entry = [ordered]@{
-            Name         = $di.Name
-            TotalBytes   = [long]($imBytes + $subBytes)
-            FileCount    = [long]($imCount + $subFiles)
-            DirCount     = [long]$subDirs
-            LastWriteUtc = $(try { $di.LastWriteTimeUtc.ToString('o') } catch { '' })
-            Files        = @($imFiles)
-            Subfolders   = @($subs)
-            Errors       = @($fErrors)
+            Name              = $di.Name
+            TotalBytes        = [long]($imBytes + $subBytes)
+            FileCount         = [long]($imCount + $subFiles)
+            DirCount          = [long]$subDirs
+            LastWriteUtc      = $(try { $di.LastWriteTimeUtc.ToString('o') } catch { '' })
+            NewestWriteUtc    = $(if ($sawAny) { $fNewest.ToString('o') }    else { '' })
+            NewestVhdWriteUtc = $(if ($sawVhd) { $fNewestVhd.ToString('o') } else { '' })
+            Files             = @($imFiles)
+            Subfolders        = @($subs)
+            Errors            = @($fErrors)
         }
         if ($Full) { $entry['AllFiles'] = @($allFiles) }
         [void]$folders.Add($entry)
@@ -851,6 +876,7 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
 
     function Measure-RestRecursive ([string]$Dir, [System.Collections.Generic.List[string]]$Errs, $AllFiles, [string]$RelBase) {
         $bytes = [long]0; $files = [long]0; $dirs = [long]0
+        $newest = [datetime]::MinValue; $newestVhd = [datetime]::MinValue; $sawVhd = $false
         $stack = [System.Collections.Generic.Stack[string]]::new(); $stack.Push($Dir)
         while ($stack.Count -gt 0) {
             $cur = $stack.Pop()
@@ -858,16 +884,21 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
                 $l = Get-AzureFilesDirList $AccountName $ShareName $cur $StorageToken $AccountKey
                 foreach ($f in $l.Files) {
                     $bytes += [long]$f.Bytes; $files++
-                    if ($null -ne $AllFiles) { [void]$AllFiles.Add([ordered]@{ Path = ("$cur/$($f.Name)").Substring($RelBase.Length).TrimStart('/'); Bytes = [long]$f.Bytes }) }
+                    if ($f.LastWriteUtc) { try { $t = [datetime]$f.LastWriteUtc; if ($t -gt $newest) { $newest = $t }; if ([System.IO.Path]::GetExtension($f.Name).ToLower() -in @('.vhd','.vhdx')) { $sawVhd = $true; if ($t -gt $newestVhd) { $newestVhd = $t } } } catch { } }
+                    if ($null -ne $AllFiles) { [void]$AllFiles.Add([ordered]@{ Path = ("$cur/$($f.Name)").Substring($RelBase.Length).TrimStart('/'); Bytes = [long]$f.Bytes; LastWriteUtc = "$($f.LastWriteUtc)" }) }
                 }
                 foreach ($d in $l.Dirs) { $dirs++; $stack.Push("$cur/$d") }
             } catch { [void]$Errs.Add("list: $cur - $($_.Exception.Message)") }
         }
-        return @{ Bytes = $bytes; Files = $files; Dirs = $dirs }
+        return @{
+            Bytes = $bytes; Files = $files; Dirs = $dirs
+            NewestUtc    = $(if ($newest -gt [datetime]::MinValue) { $newest } else { $null })
+            NewestVhdUtc = $(if ($sawVhd) { $newestVhd } else { $null })
+        }
     }
 
     $rootList = Get-AzureFilesDirList $AccountName $ShareName $SubPath $StorageToken $AccountKey
-    $rootFiles = @($rootList.Files | ForEach-Object { [ordered]@{ Name = $_.Name; Bytes = [long]$_.Bytes; Extension = [System.IO.Path]::GetExtension($_.Name).ToLower() } })
+    $rootFiles = @($rootList.Files | ForEach-Object { [ordered]@{ Name = $_.Name; Bytes = [long]$_.Bytes; Extension = [System.IO.Path]::GetExtension($_.Name).ToLower(); LastWriteUtc = "$($_.LastWriteUtc)" } })
     foreach ($rf in $rootFiles) { $totBytes += [long]$rf.Bytes; $totFiles++ }
 
     $idx = 0
@@ -882,23 +913,30 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
 
         $imFiles = [System.Collections.Generic.List[object]]::new(); $imBytes = [long]0; $imCount = [long]0
         $subs = [System.Collections.Generic.List[object]]::new(); $subBytes = [long]0; $subFiles = [long]0; $subDirs = [long]0
+        $fNewest = [datetime]::MinValue; $fNewestVhd = [datetime]::MinValue; $sawAny = $false; $sawVhd = $false
         try {
             $l = Get-AzureFilesDirList $AccountName $ShareName $dirPath $StorageToken $AccountKey
             foreach ($f in $l.Files) {
-                [void]$imFiles.Add([ordered]@{ Name = $f.Name; Bytes = [long]$f.Bytes; Extension = [System.IO.Path]::GetExtension($f.Name).ToLower() })
+                [void]$imFiles.Add([ordered]@{ Name = $f.Name; Bytes = [long]$f.Bytes; Extension = [System.IO.Path]::GetExtension($f.Name).ToLower(); LastWriteUtc = "$($f.LastWriteUtc)" })
                 $imBytes += [long]$f.Bytes; $imCount++
-                if ($null -ne $allFiles) { [void]$allFiles.Add([ordered]@{ Path = $f.Name; Bytes = [long]$f.Bytes }) }
+                if ($f.LastWriteUtc) { try { $t = [datetime]$f.LastWriteUtc; $sawAny = $true; if ($t -gt $fNewest) { $fNewest = $t }; if ([System.IO.Path]::GetExtension($f.Name).ToLower() -in @('.vhd','.vhdx')) { $sawVhd = $true; if ($t -gt $fNewestVhd) { $fNewestVhd = $t } } } catch { } }
+                if ($null -ne $allFiles) { [void]$allFiles.Add([ordered]@{ Path = $f.Name; Bytes = [long]$f.Bytes; LastWriteUtc = "$($f.LastWriteUtc)" }) }
             }
             foreach ($sd in $l.Dirs) {
                 $m = Measure-RestRecursive "$dirPath/$sd" $fErrors $allFiles $dirPath
                 [void]$subs.Add([ordered]@{ Name = $sd; TotalBytes = [long]$m.Bytes; FileCount = [long]$m.Files; DirCount = [long]$m.Dirs })
                 $subBytes += $m.Bytes; $subFiles += $m.Files; $subDirs += ([long]$m.Dirs + 1)
+                if ($m.NewestUtc)    { $sawAny = $true; if ($m.NewestUtc    -gt $fNewest)    { $fNewest    = $m.NewestUtc } }
+                if ($m.NewestVhdUtc) { $sawVhd = $true; if ($m.NewestVhdUtc -gt $fNewestVhd) { $fNewestVhd = $m.NewestVhdUtc } }
             }
         } catch { [void]$fErrors.Add("list: $dirPath - $($_.Exception.Message)") }
 
         $entry = [ordered]@{
             Name = $dirName; TotalBytes = [long]($imBytes + $subBytes); FileCount = [long]($imCount + $subFiles); DirCount = [long]$subDirs
-            LastWriteUtc = ''; Files = @($imFiles); Subfolders = @($subs); Errors = @($fErrors)
+            LastWriteUtc = ''
+            NewestWriteUtc    = $(if ($sawAny) { $fNewest.ToString('o') }    else { '' })
+            NewestVhdWriteUtc = $(if ($sawVhd) { $fNewestVhd.ToString('o') } else { '' })
+            Files = @($imFiles); Subfolders = @($subs); Errors = @($fErrors)
         }
         if ($Full) { $entry['AllFiles'] = @($allFiles) }
         [void]$folders.Add($entry)
