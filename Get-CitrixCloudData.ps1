@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-22.4   (keep in lock-step with $script:_version below)
+# Version: 2026-07-22.5   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22.4'
+$script:_version      = '2026-07-22.5'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -561,26 +561,71 @@ function Show-Splash {
     </Border>
 </Window>
 '@
-    $win = New-ThemedWindow $xaml
-    $script:_splash       = $win
-    $script:_splashStatus = $win.FindName('StatusText')
+    # Run the splash on its OWN dedicated STA thread so it stays live - the progress bar keeps animating and
+    # each status line renders - even while the MAIN thread is blocked for a long time on Citrix Cloud API
+    # calls. On the old single-thread splash those calls froze the UI, so it sat on one message ("Resolving
+    # DaaS site...") until collection finished. If the dedicated thread can't start we fall back to the inline
+    # splash, so collection is never affected either way.
+    $sync = [hashtable]::Synchronized(@{ Xaml = $xaml; Dispatcher = $null; Status = $null; Win = $null; Ready = $false; Err = $null })
+    $script:_splashSync = $sync
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
+        $rs.SessionStateProxy.SetVariable('sync', $sync)
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            try {
+                Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+                $w = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new([xml]$sync.Xaml))
+                $sync.Win = $w; $sync.Status = $w.FindName('StatusText'); $sync.Dispatcher = $w.Dispatcher
+                $w.Add_SourceInitialized({ $sync.Ready = $true })
+                # Borderless window - let the user drag it anywhere during collection.
+                $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $w.Show()
+                [System.Windows.Threading.Dispatcher]::Run()
+            } catch { $sync.Err = "$($_.Exception.Message)" }
+        })
+        $script:_splashPs = $ps; $script:_splashRs = $rs; $script:_splashHandle = $ps.BeginInvoke()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $sync.Ready -and -not $sync.Err -and $sw.ElapsedMilliseconds -lt 4000) { Start-Sleep -Milliseconds 25 }
+        if ($sync.Dispatcher) { $script:_splash = $sync.Win; Write-Log 'Splash shown (dedicated UI thread)'; return }
+        Write-Log "Splash thread did not start ($($sync.Err)); using inline splash" 'WARN'
+    } catch { Write-Log "Splash thread error: $($_.Exception.Message); using inline splash" 'WARN' }
+    $script:_splashSync = $null
 
-    # Show() is non-blocking; the window lives on this (the main) thread.
-    # Pump the dispatcher once so it renders before we continue.
+    # Fallback: inline (same-thread) splash.
+    $win = New-ThemedWindow $xaml
+    $script:_splash = $win
+    $script:_splashStatus = $win.FindName('StatusText')
+    $win.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
     $script:_splash.Show()
     $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
-    Write-Log 'Splash shown'
+    Write-Log 'Splash shown (inline)'
 }
 
 function Set-SplashStatus ([string]$Message) {
     Write-Log $Message
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        # Async post to the splash thread - never block the collection waiting on the UI.
+        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        return
+    }
     if ($script:_splash -and $script:_splashStatus) {
-        $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message },
-            [System.Windows.Threading.DispatcherPriority]::Render)
+        try { $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message }, [System.Windows.Threading.DispatcherPriority]::Render) } catch {}
     }
 }
 
 function Close-Splash {
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
+        try { $sync.Dispatcher.InvokeShutdown() } catch {}
+        try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        $script:_splashSync = $null; $script:_splash = $null
+        return
+    }
     if ($script:_splash) {
         try { $script:_splash.Close() } catch {}
         $script:_splash = $null
