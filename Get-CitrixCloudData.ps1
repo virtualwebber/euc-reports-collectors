@@ -114,7 +114,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-21'
+$script:_version      = '2026-07-22'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update (mirrors the on-prem collector): the launch check reads a TINY .version file and only
@@ -140,6 +140,7 @@ $script:_daasBase     = 'https://api.cloud.com/cvad/manage'
 $script:_authHeaders  = @{}
 $script:_lastStatus   = 0       # HTTP status of the most recent Invoke-CitrixApi call
 $script:_collectStatus = [ordered]@{}  # per-resource collection status (e.g. 'AccessDenied') surfaced to the report
+$script:_deniedPaths  = @()     # every path that returned 401/403 - drives the end-of-run access-denied summary
 
 foreach ($dir in $script:_configDir, $script:_outputDir) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -852,6 +853,17 @@ function Invoke-CitrixApi {
         }
         if ($Quiet) { Write-Log "Probe [$status] GET $uri$(if ($body) { " | $body" })" 'INFO' }
         else        { Write-Log "API [$status] GET $uri - $_$(if ($body) { " | $body" })" 'ERROR' }
+        # An access-denial is a permission problem, not a transient error - surface it as its own WARN
+        # regardless of -Quiet (probe calls otherwise only log at INFO and the denial is easy to miss),
+        # and record the path so the end-of-run summary can name every denied section.
+        if ($status -eq 401 -or $status -eq 403) {
+            $what = if ($FullUrl) { $FullUrl } else { $Path }
+            Write-Log "ACCESS DENIED [$status] $what - the API client's admin lacks permission for this" 'WARN'
+            # For the end-of-run summary, record direct calls by their (clean) path. Probe candidates
+            # are -Quiet and tried in bunches; Invoke-ApiProbe records the friendly section label once
+            # instead, so the summary reads by section rather than by raw candidate URL.
+            if (-not $Quiet) { $script:_deniedPaths += $what }
+        }
         return $null
     }
 }
@@ -870,7 +882,12 @@ function Invoke-ApiProbe ([string]$Label, [string[]]$Candidates) {
     }
     # Preserve the access-denied signal: a later 404 candidate would otherwise mask an
     # earlier 403, hiding the real cause (the API client lacks permission, not "no data").
-    if ($denied) { $script:_lastStatus = 403 }
+    if ($denied) {
+        $script:_lastStatus = 403
+        Write-Log "$Label`: ACCESS DENIED (401/403) - the API client's admin lacks permission for this" 'WARN'
+        $script:_deniedPaths += $Label   # friendly section name for the end-of-run summary
+        return $null
+    }
     Write-Log "$Label`: no candidate endpoint responded ($($Candidates.Count) tried)" 'WARN'
     return $null
 }
@@ -2811,6 +2828,14 @@ function Invoke-Collection ([hashtable]$Config) {
     } catch {
         Write-Log "Failed to write JSON: $_" 'ERROR'
         $errors++
+    }
+
+    # One roll-up so the access-denials are impossible to miss without reading the whole log. These are
+    # a permission problem on the API client's admin, not a collector fault - and they explain empty
+    # sections (e.g. Endpoints is empty whenever Advisor is denied, since it is derived from Advisor).
+    $denied = @($script:_deniedPaths | Select-Object -Unique)
+    if ($denied.Count -gt 0) {
+        Write-Log "Access denied on $($denied.Count) call(s) - the API client's admin lacks permission for: $($denied -join ', '). Dependent sections will be empty (e.g. Endpoints <- Advisor)." 'WARN'
     }
 
     Close-Splash
