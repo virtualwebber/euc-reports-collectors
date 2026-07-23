@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.1   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23.2   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-23.1'
+$script:_version      = '2026-07-23.2'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -88,7 +88,7 @@ $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-r
 $script:_selfName       = 'Get-ProfilesData.ps1'
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
-$script:_debugLogPath = Join-Path $script:_scriptDir 'ProfilesData-Debug.log'
+$script:_debugLogPath = Join-Path $script:_scriptDir "ProfilesData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
 $script:_noSplash     = [bool]$NoSplash
 $script:_splashStatus = $null
@@ -448,6 +448,13 @@ function Show-Splash {
                 $w.Add_SourceInitialized({ $sync.Ready = $true })
                 # Borderless window - let the user drag it anywhere during collection.
                 $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                # Apply status updates ON the splash thread via a timer that reads the synced hashtable - the
+                # main thread only writes $sync.Msg, so no scriptblock is marshaled across the runspace/thread
+                # boundary (which is what caused the wrong-thread / out-of-scope errors).
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try { if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" } } catch {} })
+                $sync.Timer = $t; $t.Start()
                 $w.Show()
                 [System.Windows.Threading.Dispatcher]::Run()
             } catch { $sync.Err = "$($_.Exception.Message)" }
@@ -476,8 +483,10 @@ function Set-SplashStatus ([string]$Message) {
     Write-Log $Message
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
-        # Async post to the splash thread - never block the collection waiting on the UI.
-        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        # Hand the message to the splash thread via the synchronized hashtable; the DispatcherTimer set up in
+        # Show-Splash (running ON the splash thread) applies it to the TextBlock. No cross-thread/runspace
+        # scriptblock marshaling.
+        $sync.Msg = $Message
         return
     }
     if ($script:_splash -and $script:_splashStatus) {

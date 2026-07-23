@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23.1   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-23'
+$script:_version      = '2026-07-23.1'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -129,11 +129,16 @@ $script:_selfName       = 'Get-CitrixCloudData.ps1'
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Configs (including the DPAPI-encrypted client secret) live in the user's
 # local profile, not in the repo. LocalAppData is per-user + per-machine,
-# which matches DPAPI's protection scope.
-$script:_appDataDir   = Join-Path $env:LOCALAPPDATA 'Citrix-DaaS-Report'
-$script:_configDir    = Join-Path $script:_appDataDir 'configs'
+# which matches DPAPI's protection scope. All EUC-report collectors share this
+# one folder; each config filename is prefixed with its report ($_configPrefix)
+# so Citrix and AVD configs never collide.
+$script:_appDataDir   = Join-Path $env:LOCALAPPDATA 'euc-reports'
+$script:_configDir    = $script:_appDataDir
+$script:_configPrefix = 'citrix-'
+# Legacy per-user config folder (pre-consolidation); migrated into $_configDir on startup.
+$script:_legacyAppDataDir = Join-Path $env:LOCALAPPDATA 'Citrix-DaaS-Report'
 $script:_outputDir    = Join-Path $script:_scriptDir 'Outputs'
-$script:_debugLogPath = Join-Path $script:_scriptDir 'CitrixCloudData-Debug.log'
+$script:_debugLogPath = Join-Path $script:_scriptDir "CitrixCloudData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
 $script:_splashStatus = $null
 $script:_splashLogoB64 = @'
@@ -201,6 +206,7 @@ function Invoke-SafeWeb {
 $script:_ownedRoots = @(
     [System.IO.Path]::GetTempPath()
     $script:_appDataDir
+    $script:_legacyAppDataDir   # so the one-time migration may move configs out of the old folder
     $script:_outputDir
     $script:_scriptDir
 ) | Where-Object { $_ } | ForEach-Object { try { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') } catch { $_ } }
@@ -227,11 +233,18 @@ foreach ($dir in $script:_configDir, $script:_outputDir) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
-# One-time migration: move any configs from the legacy in-repo location to LocalAppData.
-$script:_legacyConfigDir = Join-Path $script:_scriptDir 'configs'
-if (Test-Path $script:_legacyConfigDir) {
-    Get-ChildItem -Path $script:_legacyConfigDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
-        $dest = Join-Path $script:_configDir $_.Name
+# One-time migration: move any configs from the two legacy locations - the old per-user folder
+# (%LOCALAPPDATA%\Citrix-DaaS-Report\configs) and the even older in-repo <script>\configs - into the
+# consolidated flat folder, adding the 'citrix-' prefix so they sit alongside the AVD configs.
+$script:_legacyConfigDirs = @(
+    (Join-Path $script:_legacyAppDataDir 'configs')   # previous LocalAppData location
+    (Join-Path $script:_scriptDir 'configs')          # original in-repo location
+)
+foreach ($legacyDir in $script:_legacyConfigDirs) {
+    if (-not (Test-Path $legacyDir)) { continue }
+    Get-ChildItem -Path $legacyDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
+        $leaf = if ($_.Name -like "$($script:_configPrefix)*") { $_.Name } else { "$($script:_configPrefix)$($_.Name)" }
+        $dest = Join-Path $script:_configDir $leaf
         if (-not (Test-Path $dest)) {
             try { Move-OwnedItem $_.FullName $dest } catch {}
         }
@@ -299,12 +312,12 @@ function Start-DebugLog {
 
 function Get-ConfigList {
     if (-not (Test-Path $script:_configDir)) { return @() }
-    @(Get-ChildItem -Path $script:_configDir -Filter '*.config.json' |
-        ForEach-Object { $_.BaseName -replace '\.config$', '' })
+    @(Get-ChildItem -Path $script:_configDir -Filter "$($script:_configPrefix)*.config.json" |
+        ForEach-Object { ($_.BaseName -replace '\.config$', '') -replace "^$([regex]::Escape($script:_configPrefix))", '' })
 }
 
 function Read-CollectConfig ([string]$Name) {
-    $path = Join-Path $script:_configDir "$Name.config.json"
+    $path = Join-Path $script:_configDir "$($script:_configPrefix)$Name.config.json"
     if (-not (Test-Path $path)) { return $null }
     try {
         $json = Get-Content $path -Raw | ConvertFrom-Json
@@ -319,7 +332,7 @@ function Read-CollectConfig ([string]$Name) {
 
 function Save-CollectConfig ([hashtable]$Config) {
     $name = $Config['CustomerName'] -replace '[^\w\-]', '_'
-    $path = Join-Path $script:_configDir "$name.config.json"
+    $path = Join-Path $script:_configDir "$($script:_configPrefix)$name.config.json"
     try {
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $path -Encoding UTF8
         Write-Log "Config saved: $path"
@@ -586,6 +599,10 @@ function Show-Splash {
                 $w.Add_SourceInitialized({ $sync.Ready = $true })
                 # Borderless window - let the user drag it anywhere during collection.
                 $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try { if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" } } catch {} })
+                $sync.Timer = $t; $t.Start()
                 $w.Show()
                 [System.Windows.Threading.Dispatcher]::Run()
             } catch { $sync.Err = "$($_.Exception.Message)" }
@@ -613,7 +630,7 @@ function Set-SplashStatus ([string]$Message) {
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         # Async post to the splash thread - never block the collection waiting on the UI.
-        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        $sync.Msg = $Message   # the splash-thread DispatcherTimer applies this to the UI (no cross-thread/runspace marshaling)
         return
     }
     if ($script:_splash -and $script:_splashStatus) {
@@ -894,7 +911,7 @@ function Show-CompletionDialog ([string]$OutputFile, [int]$ErrorCount) {
     $icon = if ($ErrorCount -gt 0) { 'Warning' } else { 'Info' }
     $msg  = "Collection complete.`n`nOutput file:`n$OutputFile"
     if ($ErrorCount -gt 0) {
-        $msg += "`n`n$ErrorCount resource(s) had collection errors. See CitrixCloudData-Debug.log for details."
+        $msg += "`n`n$ErrorCount resource(s) had collection errors. See $(Split-Path $script:_debugLogPath -Leaf) for details."
     }
     Show-MsgBox $msg -Icon $icon
 }
@@ -1706,8 +1723,11 @@ function Get-NetworkLocations {
            else { @($resp) }
     $out = [System.Collections.Generic.List[object]]::new()
     foreach ($loc in @($src)) {
-        $ipRanges = @($loc.ipv4Ranges | ForEach-Object { "$_" })
-        $tags     = @($loc.tags       | ForEach-Object { "$_" })
+        $ipRanges = @($loc.ipv4Ranges | ForEach-Object { "$_" } | Where-Object { $_ })
+        $tags     = @($loc.tags       | ForEach-Object { "$_" } | Where-Object { $_ })
+        # An empty NLS response can serialise as a single blank object (no id/name/ranges) when it doesn't
+        # match a known wrapper shape - skip it rather than emitting a phantom "1 network location".
+        if (-not "$($loc.id)" -and -not "$($loc.name)" -and $ipRanges.Count -eq 0) { continue }
         $network  = if ($null -ne $loc.internal) { if ($loc.internal) { 'Internal' } else { 'External' } } `
                     elseif ($loc.network) { "$($loc.network)" } else { '' }
         [void]$out.Add([ordered]@{

@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-07-23.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Azure Virtual Desktop data across subscriptions and saves it as JSON.
@@ -35,7 +35,7 @@ param(
     [switch]$SkipUpdateCheck
 )
 
-$script:CollectorVersion = '2026-07-23'
+$script:CollectorVersion = '2026-07-23.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:CollectorVersion, and the published .version file in lock-step.
@@ -229,6 +229,17 @@ function Show-Splash {
                 $w.Add_SourceInitialized({ $sync.Ready = $true })
                 # Borderless window - let the user drag it anywhere during collection.
                 $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                # Apply status/progress/sub updates ON the splash thread via a timer that reads the synced
+                # hashtable - the main thread only writes $sync.Msg/$sync.Prog/$sync.SubText, so no scriptblock
+                # is marshaled across the runspace/thread boundary.
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try {
+                    if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" }
+                    if ($null -ne $sync.Prog -and "$($sync.Prog)" -ne "$($sync.ProgShown)") { $sync.Progress.Value = [double]$sync.Prog; $sync.ProgShown = "$($sync.Prog)" }
+                    if ("$($sync.SubText)" -ne "$($sync.SubShown)") { $sync.Sub.Text = "$($sync.SubText)"; $sync.SubShown = "$($sync.SubText)" }
+                } catch {} })
+                $sync.Timer = $t; $t.Start()
                 $w.Show()
                 [System.Windows.Threading.Dispatcher]::Run()
             } catch { $sync.Err = "$($_.Exception.Message)" }
@@ -258,12 +269,11 @@ function Set-ReportStatus {
     param([string]$Text, [int]$Progress = -1, [string]$Sub = '')
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
-        # Async post to the splash thread - never block the collection waiting on the UI.
-        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{
-            $sync.Status.Text = $Text
-            if ($Progress -ge 0) { $sync.Progress.Value = $Progress }
-            $sync.Sub.Text = $Sub
-        }) } catch {}
+        # Hand the values to the splash thread via the synchronized hashtable; the DispatcherTimer set up in
+        # Show-Splash (running ON the splash thread) applies them. No cross-thread/runspace scriptblock.
+        $sync.Msg = $Text
+        if ($Progress -ge 0) { $sync.Prog = $Progress }
+        $sync.SubText = $Sub
         return
     }
     if ($script:_splash -and $script:_splashStatus) {
@@ -875,7 +885,25 @@ $script:_splash.Dispatcher.Invoke([Action]{ $script:_splash.Hide() }, [System.Wi
 
 #region -- Config Helpers ------------------------------------------------------
 
-$script:_configDir = Join-Path $PSScriptRoot 'configs'
+# Consolidated per-user config folder shared by all EUC-report collectors. Each config filename is
+# prefixed with its report ('avd-') so Citrix and AVD configs coexist here without colliding.
+$script:_configDir    = Join-Path $env:LOCALAPPDATA 'euc-reports'
+$script:_configPrefix = 'avd-'
+
+# One-time migration: move any configs from the old in-repo <script>\configs folder into the
+# consolidated folder, adding the 'avd-' prefix. (AVD is not under the read-only audit, so a plain
+# Move-Item is fine.)
+$script:_legacyConfigDir = Join-Path $PSScriptRoot 'configs'
+try {
+    if (-not (Test-Path $script:_configDir)) { New-Item -ItemType Directory -Path $script:_configDir -Force | Out-Null }
+    if (Test-Path $script:_legacyConfigDir) {
+        Get-ChildItem -Path $script:_legacyConfigDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
+            $leaf = if ($_.Name -like "$($script:_configPrefix)*") { $_.Name } else { "$($script:_configPrefix)$($_.Name)" }
+            $dest = Join-Path $script:_configDir $leaf
+            if (-not (Test-Path $dest)) { try { Move-Item -LiteralPath $_.FullName -Destination $dest -Force } catch {} }
+        }
+    }
+} catch {}
 
 function Read-CollectConfig {
     param([string]$Path)
@@ -888,7 +916,7 @@ function Save-CollectConfig {
     try {
         if (-not (Test-Path $script:_configDir)) { New-Item -ItemType Directory -Path $script:_configDir -Force | Out-Null }
         $safeName = if ($CustomerName) { ($CustomerName -replace '[^A-Za-z0-9\-_\s]', '_').Trim() } else { 'Default' }
-        $path = Join-Path $script:_configDir "$safeName.config.json"
+        $path = Join-Path $script:_configDir "$($script:_configPrefix)$safeName.config.json"
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $path -Encoding UTF8
         return $path
     } catch { return $null }
@@ -1419,7 +1447,7 @@ function Show-AzureAuthDialog {
         try {
             $ofd = [Microsoft.Win32.OpenFileDialog]::new()
             $ofd.Title  = 'Open Configuration File'
-            $ofd.Filter = 'Config files (*.config.json)|*.config.json|All files (*.*)|*.*'
+            $ofd.Filter = 'AVD config files (avd-*.config.json)|avd-*.config.json|All config files (*.config.json)|*.config.json|All files (*.*)|*.*'
             if (Test-Path $script:_configDir) { $ofd.InitialDirectory = $script:_configDir }
             if ($ofd.ShowDialog() -eq $true) {
                 $cfg = Read-CollectConfig -Path $ofd.FileName
@@ -1580,7 +1608,7 @@ $subCount        = $selectedSubscriptions.Count
 $subBudget       = if ($subCount -gt 0) { [int](90 / $subCount) } else { 90 }
 $subBaseProgress = 5
 
-$debugLog = Join-Path $OutputPath 'AVDData-Debug.log'
+$debugLog = Join-Path $OutputPath "AVDData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 [System.IO.File]::WriteAllText($debugLog, '', [System.Text.Encoding]::UTF8)
 function Write-DebugLog { param([string]$Msg) [System.IO.File]::AppendAllText($debugLog, "$(Get-Date -Format 'HH:mm:ss') $Msg`n") }
 

@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-23.1   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -56,7 +56,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-23'
+$script:_version = '2026-07-23.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -70,7 +70,7 @@ $script:_selfName       = 'Get-VsphereData.ps1'
 $script:_scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $script:_scriptDir) { $script:_scriptDir = (Get-Location).Path }
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
-$script:_debugLogPath = Join-Path $script:_scriptDir 'VsphereData-Debug.log'
+$script:_debugLogPath = Join-Path $script:_scriptDir "VsphereData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_noSplash     = [bool]$NoSplash
 
 # TLS + self-signed cert bypass. PS 5.1 uses the ServicePointManager callback; PS7 needs
@@ -230,6 +230,10 @@ function Show-Splash {
                 try { $lb=[Convert]::FromBase64String($sync.Logo); $lbi=New-Object System.Windows.Media.Imaging.BitmapImage; $lbi.BeginInit(); $lbi.CacheOption='OnLoad'; $lbi.StreamSource=(New-Object System.IO.MemoryStream(,$lb)); $lbi.EndInit(); $lbi.Freeze(); $lg=$w.FindName('Logo'); if($lg){$lg.Source=$lbi} } catch {}
                 $w.Add_SourceInitialized({ $sync.Ready = $true })
                 $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try { if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" } } catch {} })
+                $sync.Timer = $t; $t.Start()
                 $w.Show()
                 [System.Windows.Threading.Dispatcher]::Run()
             } catch { $sync.Err = "$($_.Exception.Message)" }
@@ -253,7 +257,7 @@ function Set-SplashStatus ([string]$Message) {
     Write-Log $Message
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
-        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        $sync.Msg = $Message   # the splash-thread DispatcherTimer applies this to the UI (no cross-thread/runspace marshaling)
         return
     }
     if ($script:_splash -and $script:_splashStatus) {

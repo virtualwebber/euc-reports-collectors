@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23   (must match $script:_version below and the published .version file)
+# Version: 2026-07-23.1   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-23'
+$script:_version      = '2026-07-23.1'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -141,7 +141,7 @@ $script:_selfName       = 'Get-OnPremComponentsData.ps1'
 $script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
-$script:_debugLogPath = Join-Path $script:_scriptDir 'OnPremComponentsData-Debug.log'
+$script:_debugLogPath = Join-Path $script:_scriptDir "OnPremComponentsData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
 $script:_noSplash     = [bool]$NoSplash   # headless: suppress splash + message boxes
 $script:_splashStatus = $null
@@ -457,6 +457,10 @@ function Show-Splash {
                 $w.Add_SourceInitialized({ $sync.Ready = $true })
                 # Borderless window - let the user drag it anywhere during collection.
                 $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try { if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" } } catch {} })
+                $sync.Timer = $t; $t.Start()
                 $w.Show()
                 [System.Windows.Threading.Dispatcher]::Run()
             } catch { $sync.Err = "$($_.Exception.Message)" }
@@ -488,7 +492,7 @@ function Set-SplashStatus ([string]$Message) {
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         # Async post to the splash thread - never block the collection waiting on the UI.
-        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        $sync.Msg = $Message   # the splash-thread DispatcherTimer applies this to the UI (no cross-thread/runspace marshaling)
         return
     }
     if ($script:_splash -and $script:_splashStatus) {
