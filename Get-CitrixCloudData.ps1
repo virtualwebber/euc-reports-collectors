@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.1   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23.2   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-23.1'
+$script:_version      = '2026-07-23.2'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -664,7 +664,7 @@ function Show-CustomerDialog {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Citrix DaaS Report" Width="460" SizeToContent="Height"
+        Title="Citrix Cloud DaaS - Data Collector" Width="460" SizeToContent="Height"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="#F4F6F9" FontFamily="Segoe UI" FontSize="13">
     <Window.Resources>
@@ -702,8 +702,8 @@ function Show-CustomerDialog {
             <TextBlock Text="&#x1F5A5;" FontSize="26" Foreground="#0E7C86" DockPanel.Dock="Left"
                        VerticalAlignment="Center" Margin="0,0,12,0"/>
             <StackPanel>
-                <TextBlock Text="Citrix DaaS Report" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
-                <TextBlock Text="Data Collection" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
+                <TextBlock Text="Citrix Cloud DaaS" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
+                <TextBlock Text="Data Collector" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
             </StackPanel>
         </DockPanel>
 
