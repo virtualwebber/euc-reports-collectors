@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-22.2   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-22.2'
+$script:_version      = '2026-07-23'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -779,62 +779,62 @@ function Measure-FolderRecursive ([string]$Root, [System.Collections.Generic.Lis
     }
 }
 
-# Cheap, depth-bounded probe: is $Dir itself a user-profile ROOT (not a parent/group of profiles)? Uses the
-# same signals as Get-ProductEvidence - a SID-pattern folder name, a Citrix PM marker folder
-# (UPM_Profile/UPM_Data/Pending) as an immediate child, or an FSLogix VHD/VHDX container within the profile's
-# own nesting (<= 3 directory levels: <os>\ProfileContainer\<os>\*.vhdx). The VHDX depth cap is what keeps a
-# GROUP folder - whose VHDX live one level deeper, under each user - from being mistaken for a profile.
+# Is $Dir a single USER-PROFILE folder? Detected by the profile's own markers within a shallow, capped depth:
+# an FSLogix 'ProfileContainer'/'ODFC' folder (or a ProfileContainer/ODFC/O365 *.vhdx file) within <=2 levels,
+# a Citrix PM marker folder (UPM_Profile/UPM_Data/Pending) one level down, or a SID-named folder. The depth
+# cap and the specific ProfileContainer marker (NOT any .vhdx) are what keep a GROUP folder - whose markers
+# sit one level deeper, under each user - and an app-attach folder (generic .vhdx) from being matched.
 function Test-LooksLikeProfile ([string]$Dir) {
     try {
-        $name = [System.IO.Path]::GetFileName($Dir.TrimEnd('\', '/'))
-        if ($name -match '(?i)S-1-5-21-[\d\-]+') { return $true }
-        try {
-            foreach ($d in [System.IO.Directory]::EnumerateDirectories($Dir)) {
-                if ([System.IO.Path]::GetFileName($d) -match '(?i)^(UPM_Profile|UPM_Data|Pending)$') { return $true }
-            }
-        } catch {}
-        $stack = [System.Collections.Generic.Stack[object]]::new()
-        $stack.Push(@{ Path = $Dir; Depth = 0 })
-        while ($stack.Count -gt 0) {
-            $node = $stack.Pop()
+        if ([System.IO.Path]::GetFileName($Dir.TrimEnd('\', '/')) -match '(?i)S-1-5-21-[\d\-]+') { return $true }
+        $pcFile = '(?i)^(profilecontainer|odfc|o365)[^\\/]*\.vhdx?$'
+        try { foreach ($f in [System.IO.Directory]::EnumerateFiles($Dir)) { if ([System.IO.Path]::GetFileName($f) -match $pcFile) { return $true } } } catch {}
+        $d1s = @(); try { $d1s = @([System.IO.Directory]::EnumerateDirectories($Dir)) } catch {}
+        foreach ($d1 in $d1s) {
+            $n1 = [System.IO.Path]::GetFileName($d1)
+            if ($n1 -match '(?i)^(UPM_Profile|UPM_Data|Pending|ProfileContainer|ODFC)$') { return $true }
+            try { foreach ($f in [System.IO.Directory]::EnumerateFiles($d1)) { if ([System.IO.Path]::GetFileName($f) -match $pcFile) { return $true } } } catch {}
             try {
-                foreach ($f in [System.IO.Directory]::EnumerateFiles($node.Path)) {
-                    $ext = [System.IO.Path]::GetExtension($f).ToLower()
-                    if ($ext -eq '.vhd' -or $ext -eq '.vhdx') { return $true }
+                foreach ($d2 in [System.IO.Directory]::EnumerateDirectories($d1)) {
+                    if ([System.IO.Path]::GetFileName($d2) -match '(?i)^(ProfileContainer|ODFC)$') { return $true }
+                    try { foreach ($f in [System.IO.Directory]::EnumerateFiles($d2)) { if ([System.IO.Path]::GetFileName($f) -match $pcFile) { return $true } } } catch {}
                 }
             } catch {}
-            if ($node.Depth -lt 3) {
-                try { foreach ($d in [System.IO.Directory]::EnumerateDirectories($node.Path)) { $stack.Push(@{ Path = $d; Depth = $node.Depth + 1 }) } } catch {}
-            }
         }
     } catch {}
     return $false
 }
 
-# Resolve the actual profile-root folders under $Root, transparently descending ONE level into grouping
-# folders (e.g. \\...\upmprofiles\3EAzureDR\<user>). Per immediate child C: if C is a profile -> keep it; else
-# if any child of C is a profile -> C is a group, keep ALL of C's children (so empty user folders aren't
-# dropped), named 'C\child'; else -> C is neither (an app folder) -> skip and record it. Returns
-# @{ Profiles=@(@{Path;Rel}); Skipped=@(names) }. Descent is bounded to one grouping level by design.
+# Find every profile GROUP under $Root - a folder whose immediate children are user profiles - so each is
+# collected as its OWN share. Supports every layout: $Root holds profiles directly (returns @($Root)); $Root
+# holds group folders (returns each group); or there is extra nesting (\...\upmprofiles\<group>\<user> -
+# descends bounded to find the groups). Non-profile branches (app/system folders) yield no groups and are
+# skipped. Falls back to @($Root) when nothing is found so the path is still collected as-is.
+function Get-ProfileGroupPaths ([string]$Root, [int]$MaxDepth = 4) {
+    $test = {
+        param($d)
+        try { foreach ($c in [System.IO.Directory]::EnumerateDirectories($d)) { if (Test-LooksLikeProfile $c) { return $true } } } catch {}
+        return $false
+    }
+    if (& $test $Root) { return @($Root) }
+    $groups = [System.Collections.Generic.List[string]]::new()
+    $stack = [System.Collections.Generic.Stack[object]]::new()
+    try { foreach ($c in [System.IO.Directory]::EnumerateDirectories($Root)) { $stack.Push(@{ Path = $c; Depth = 1 }) } } catch {}
+    while ($stack.Count -gt 0) {
+        $node = $stack.Pop()
+        if (& $test $node.Path) { [void]$groups.Add($node.Path); continue }
+        if ($node.Depth -lt $MaxDepth) { try { foreach ($c in [System.IO.Directory]::EnumerateDirectories($node.Path)) { $stack.Push(@{ Path = $c; Depth = $node.Depth + 1 }) } } catch {} }
+    }
+    if ($groups.Count -eq 0) { return @($Root) }
+    return @($groups | Sort-Object)
+}
+
+# List the user-profile folders directly under a collected path (which is already resolved to a profile group
+# or a flat profile share by Get-ProfileGroupPaths). Its immediate child directories are the profiles.
 function Resolve-ProfileRoots ([string]$Root) {
     $profiles = [System.Collections.Generic.List[object]]::new()
-    $skipped  = [System.Collections.Generic.List[string]]::new()
-    $children = @()
-    try { $children = @([System.IO.Directory]::EnumerateDirectories($Root)) } catch {}
-    foreach ($c in $children) {
-        $cName = [System.IO.Path]::GetFileName($c)
-        if (Test-LooksLikeProfile $c) { [void]$profiles.Add(@{ Path = $c; Rel = $cName }); continue }
-        $gchildren = @()
-        try { $gchildren = @([System.IO.Directory]::EnumerateDirectories($c)) } catch {}
-        $isGroup = $false
-        foreach ($gc in $gchildren) { if (Test-LooksLikeProfile $gc) { $isGroup = $true; break } }
-        if ($isGroup) {
-            foreach ($gc in $gchildren) { [void]$profiles.Add(@{ Path = $gc; Rel = (Join-Path $cName ([System.IO.Path]::GetFileName($gc))) }) }
-        } else {
-            [void]$skipped.Add($cName)
-        }
-    }
-    return @{ Profiles = @($profiles); Skipped = @($skipped) }
+    try { foreach ($c in [System.IO.Directory]::EnumerateDirectories($Root)) { [void]$profiles.Add(@{ Path = $c; Rel = [System.IO.Path]::GetFileName($c) }) } } catch {}
+    return @{ Profiles = @($profiles); Skipped = @() }
 }
 
 # Inventory a share root over the FILESYSTEM (UNC or local): profile folders with recursive totals,
@@ -960,18 +960,26 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
         }
     }
 
-    # REST equivalent of Test-LooksLikeProfile: same signals + depth cap (VHD/VHDX within 3 levels; a UPM
-    # marker as an immediate child; SID-pattern leaf name) over the Azure Files data plane.
+    # REST equivalent of Test-LooksLikeProfile: is $Dir a single USER-PROFILE folder? Same tight signals -
+    # a ProfileContainer/ODFC folder (FSLogix AND Citrix PM both use this) within <=2 levels, a
+    # ProfileContainer/ODFC/O365 *.vhdx within <=2, a UPM_Profile/UPM_Data/Pending marker one level down, or a
+    # SID-named leaf. The depth cap keeps a GROUP folder (whose markers sit one level deeper, under each user)
+    # from being matched - the same cap the FS Test-LooksLikeProfile uses.
     function Test-LooksLikeProfileRest ([string]$Dir) {
+        $pcFile = '(?i)^(profilecontainer|odfc|o365)[^/]*\.vhdx?$'
         try {
             if (($Dir -split '/')[-1] -match '(?i)S-1-5-21-[\d\-]+') { return $true }
-            $stack = [System.Collections.Generic.Stack[object]]::new(); $stack.Push(@{ Path = $Dir; Depth = 0 })
-            while ($stack.Count -gt 0) {
-                $node = $stack.Pop(); $l = $null
-                try { $l = Get-AzureFilesDirList $AccountName $ShareName $node.Path $StorageToken $AccountKey } catch { continue }
-                foreach ($f in $l.Files) { $ext = [System.IO.Path]::GetExtension($f.Name).ToLower(); if ($ext -eq '.vhd' -or $ext -eq '.vhdx') { return $true } }
-                if ($node.Depth -eq 0) { foreach ($d in $l.Dirs) { if ("$d" -match '(?i)^(UPM_Profile|UPM_Data|Pending)$') { return $true } } }
-                if ($node.Depth -lt 3) { foreach ($d in $l.Dirs) { $stack.Push(@{ Path = "$($node.Path)/$d"; Depth = $node.Depth + 1 }) } }
+            $l0 = $null; try { $l0 = Get-AzureFilesDirList $AccountName $ShareName $Dir $StorageToken $AccountKey } catch { return $false }
+            foreach ($f in $l0.Files) { if ("$($f.Name)" -match $pcFile) { return $true } }
+            foreach ($d1 in $l0.Dirs) {
+                if ("$d1" -match '(?i)^(UPM_Profile|UPM_Data|Pending|ProfileContainer|ODFC)$') { return $true }
+                $l1 = $null; try { $l1 = Get-AzureFilesDirList $AccountName $ShareName "$Dir/$d1" $StorageToken $AccountKey } catch { continue }
+                foreach ($f in $l1.Files) { if ("$($f.Name)" -match $pcFile) { return $true } }
+                foreach ($d2 in $l1.Dirs) {
+                    if ("$d2" -match '(?i)^(ProfileContainer|ODFC)$') { return $true }
+                    $l2 = $null; try { $l2 = Get-AzureFilesDirList $AccountName $ShareName "$Dir/$d1/$d2" $StorageToken $AccountKey } catch { continue }
+                    foreach ($f in $l2.Files) { if ("$($f.Name)" -match $pcFile) { return $true } }
+                }
             }
         } catch {}
         return $false
@@ -981,7 +989,10 @@ function Get-ShareInventoryRest ([string]$AccountName, [string]$ShareName, [stri
     $rootFiles = @($rootList.Files | ForEach-Object { [ordered]@{ Name = $_.Name; Bytes = [long]$_.Bytes; Extension = [System.IO.Path]::GetExtension($_.Name).ToLower(); LastWriteUtc = "$($_.LastWriteUtc)" } })
     foreach ($rf in $rootFiles) { $totBytes += [long]$rf.Bytes; $totFiles++ }
 
-    # Resolve profile roots (one grouping level), mirroring the FS Resolve-ProfileRoots.
+    # Resolve profile roots. The FS path splits each profile GROUP into its own share up front
+    # (Get-ProfileGroupPaths); REST can't do that here, so within this one share it descends one grouping
+    # level - point REST targets at the folder that directly holds the group folders (e.g. ...\upmprofiles).
+    # Discovered profiles carry a 'group\user' Name; non-profile folders are skipped.
     $restRoots = [System.Collections.Generic.List[object]]::new(); $restSkipped = [System.Collections.Generic.List[string]]::new()
     foreach ($dirName in @($rootList.Dirs)) {
         $childPath = if ($SubPath) { "$SubPath/$dirName" } else { $dirName }
@@ -1403,12 +1414,28 @@ Show-Splash
 $shareResults = [System.Collections.Generic.List[object]]::new()
 $i = 0
 foreach ($t in $targets) {
-    $i++
-    Set-SplashStatus "Share $i of $($targets.Count): $t"
-    try { [void]$shareResults.Add((Invoke-ShareCollection $t $full $azAvailable)) }
-    catch {
-        Write-Log "Share '$t' failed: $($_.Exception.Message)" 'ERROR'
-        [void]$shareResults.Add([ordered]@{ Path = "$t"; Kind = 'Unknown'; Reachable = $false; Errors = @("$($_.Exception.Message)") })
+    # A path can hold several profile GROUP folders, each reported as its own share. Expand a filesystem-
+    # reachable path into its groups (Get-ProfileGroupPaths); a path that directly holds profiles - or is
+    # REST-only / unreachable over SMB - stays as a single share.
+    $parts = $t -split '\|', 2
+    $tPath = $parts[0].Trim().TrimEnd('\')
+    $tHint = if ($parts.Count -gt 1) { '|' + $parts[1].Trim() } else { '' }
+    $expanded = @($tPath)
+    if (Test-Path -LiteralPath $tPath -ErrorAction SilentlyContinue) {
+        $g = @(Get-ProfileGroupPaths $tPath)
+        if ($g.Count -gt 0) { $expanded = $g }
+        if ($g.Count -gt 1 -or ($g.Count -eq 1 -and $g[0] -ne $tPath)) {
+            Write-Log "Path '$tPath' expanded into $($g.Count) profile group(s): $(($g | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')"
+        }
+    }
+    foreach ($gp in $expanded) {
+        $i++
+        Set-SplashStatus "Collecting profile share $i`: $(Split-Path $gp -Leaf)"
+        try { [void]$shareResults.Add((Invoke-ShareCollection "$gp$tHint" $full $azAvailable)) }
+        catch {
+            Write-Log "Share '$gp' failed: $($_.Exception.Message)" 'ERROR'
+            [void]$shareResults.Add([ordered]@{ Path = "$gp"; Kind = 'Unknown'; Reachable = $false; Errors = @("$($_.Exception.Message)") })
+        }
     }
 }
 
