@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.1   (must match $script:_version below and the published .version file)
+# Version: 2026-07-23.2   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-23.1'
+$script:_version      = '2026-07-23.2'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -522,13 +522,19 @@ function Start-SleepResponsive ([int]$Seconds) {
 }
 
 function Close-Splash {
+    # Idempotent: safe to call more than once (the entry-point finally is a backstop for the inline call).
+    # Shuts down the dedicated STA dispatcher thread AND disposes the runspace/PowerShell so no ghost
+    # powershell.exe is left behind.
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
         try { $sync.Dispatcher.InvokeShutdown() } catch {}
         try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
         try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
         $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
         return
     }
     if ($script:_splash) {
@@ -751,6 +757,18 @@ function Close-LiveView {
         try { $script:_liveWin.Close() } catch {}
         $script:_liveWin = $null
     }
+}
+
+function Invoke-OnPremCleanup {
+    # Idempotent teardown of every long-lived resource, invoked from the entry-point finally so it runs on
+    # ANY exit path - a terminating error, a Ctrl+C during the (up to N-minute) perf sampling, or an early
+    # exit. Without it those paths orphan wsmprovhost sessions on each target server, the perf runspace, and
+    # the splash dispatcher thread (a ghost powershell.exe). In a fresh collector process every open PSSession
+    # belongs to us, so removing them all is safe and also catches any the inline Phase-3 loop missed.
+    try { Get-PSSession | Remove-PSSession -ErrorAction SilentlyContinue } catch {}
+    try { Stop-OnPremPerfRunspace } catch {}
+    Close-Splash
+    Close-LiveView
 }
 
 # ── Background performance polling (mirrors Get-VsphereData.ps1's Invoke-VimPumped/Start-PerfRunspace) ──
@@ -2953,6 +2971,10 @@ if (-not (Test-Path $script:_outputDir)) { New-Item -ItemType Directory -Path $s
 $useLive = $liveView -and -not $noPerf -and -not $script:_noSplash
 $script:_customer = $customer   # used by Write-OnPremSiteJson for the site file name / CustomerName
 Write-Log "Targets: $($targets -join ', '); duration=$(if ($noPerf) { 'n/a (NoPerf)' } else { "${duration}m" }); cred=$([bool]$cred); noSplash=$([bool]$NoSplash); liveView=$useLive"
+# Guard everything from the splash/live-view onward: a terminating error, a Ctrl+C during the (up to
+# N-minute) perf sampling, or any throw runs the finally below, so no WinRM session (wsmprovhost on a
+# target), perf runspace, or UI dispatcher thread is left behind as a ghost.
+try {
 if ($useLive) { Show-LiveView -Servers $targets } else { Show-Splash }
 $files = Invoke-OnPremCollection -ServerList $targets -DurationMin $duration -Cred $cred -NoPerf:$noPerf
 if (-not $useLive) { Close-Splash }
@@ -2985,6 +3007,9 @@ if ($useLive -and $script:_liveWin) {
     Close-LiveView
 } else {
     Show-MsgBox $msg -Icon $icon
+}
+} finally {
+    Invoke-OnPremCleanup
 }
 Write-Log 'On-premises collector finished'
 

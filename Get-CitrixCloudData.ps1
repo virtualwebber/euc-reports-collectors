@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.2   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23.3   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-23.2'
+$script:_version      = '2026-07-23.3'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -297,7 +297,7 @@ function Write-Log {
 function Start-DebugLog {
     Set-Content -Path $script:_debugLogPath -Value (@(
         '=' * 70
-        "Citrix DaaS Data Collector  v$($script:_version)"
+        "Citrix Cloud DaaS Data Collector  v$($script:_version)"
         "Started : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         "User    : $env:USERDOMAIN\$env:USERNAME"
         "Machine : $env:COMPUTERNAME"
@@ -369,7 +369,7 @@ function Unprotect-Secret ([string]$Encrypted) {
 function Show-MsgBox {
     param(
         [string]$Message,
-        [string]$Title = 'Citrix DaaS Collector',
+        [string]$Title = 'Citrix Cloud DaaS Collector',
         [ValidateSet('Info','Warning','Error')][string]$Icon = 'Info'
     )
     $iconChar  = switch ($Icon) { 'Error' { '&#x2716;' } 'Warning' { '&#x26A0;' } default { '&#x2139;' } }
@@ -554,7 +554,7 @@ function Show-Splash {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Citrix DaaS Collector" Height="205" Width="440"
+        Title="Citrix Cloud DaaS Collector" Height="205" Width="440"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
         AllowsTransparency="True" Background="Transparent" Topmost="True"
         FontFamily="Segoe UI">
@@ -565,7 +565,7 @@ function Show-Splash {
         </Border.Effect>
         <StackPanel VerticalAlignment="Center" Margin="32,24">
             <Image x:Name="Logo" Height="34" HorizontalAlignment="Center" Stretch="Uniform" Margin="0,0,0,12"/>
-            <TextBlock Text="Citrix DaaS - Data Collector"
+            <TextBlock Text="Citrix Cloud DaaS - Data Collector"
                        FontSize="15" FontWeight="Bold" Foreground="#0E7C86"
                        HorizontalAlignment="Center" Margin="0,0,0,6"/>
             <TextBlock x:Name="StatusText" Text="Starting..."
@@ -639,13 +639,19 @@ function Set-SplashStatus ([string]$Message) {
 }
 
 function Close-Splash {
+    # Idempotent: safe to call more than once (the top-level finally is a backstop for the inline call).
+    # Shuts down the dedicated STA dispatcher thread AND disposes the runspace/PowerShell so no ghost
+    # powershell.exe is left behind.
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
         try { $sync.Dispatcher.InvokeShutdown() } catch {}
         try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
         try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
         $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
         return
     }
     if ($script:_splash) {
@@ -3087,7 +3093,15 @@ if (-not $config) {
 }
 
 Write-Log "Starting collection for customer '$($config['CustomerName'])'"
-Invoke-Collection -Config $config
+# The splash runs on a dedicated STA runspace/dispatcher thread (created inside Invoke-Collection). Guarantee
+# it is shut down on EVERY exit path - a terminating error (e.g. auth failure), a thrown API error, or a
+# user Ctrl+C - so no ghost powershell.exe is left behind. Close-Splash is idempotent, so the inline call on
+# the happy path plus this backstop are safe together.
+try {
+    Invoke-Collection -Config $config
+} finally {
+    Close-Splash
+}
 Write-Log 'Collection routine returned'
 
 #endregion

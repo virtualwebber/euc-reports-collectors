@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.1   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-07-23.2   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -56,7 +56,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-23.1'
+$script:_version = '2026-07-23.2'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -275,13 +275,19 @@ function Set-SplashVisible ([bool]$Visible) {
     if ($script:_splash) { try { if ($Visible) { $script:_splash.Show(); [void]$script:_splash.Activate() } else { $script:_splash.Hide() } } catch {} }
 }
 function Close-Splash {
+    # Idempotent: safe to call more than once (the entry-point finally is a backstop for the inline call).
+    # Shuts down the dedicated STA dispatcher thread AND disposes the runspace/PowerShell so no ghost
+    # powershell.exe is left behind.
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
         try { $sync.Dispatcher.InvokeShutdown() } catch {}
         try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
         try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
         $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
         return
     }
     if ($script:_splash) { try { $script:_splash.Close() } catch {} ; $script:_splash = $null }
@@ -389,7 +395,12 @@ function Connect-Vsphere ([string]$VC, [string]$User, [string]$PwPlain) {
     $resp = Invoke-Vim "<urn:Login><urn:_this type=`"SessionManager`">$($script:_svc.sessionManager.'#text')</urn:_this><urn:userName>$uE</urn:userName><urn:password>$pE</urn:password></urn:Login>"
     return $resp.Envelope.Body.LoginResponse.returnval
 }
-function Disconnect-Vsphere { try { if ($script:_svc) { Invoke-Vim "<urn:Logout><urn:_this type=`"SessionManager`">$($script:_svc.sessionManager.'#text')</urn:_this></urn:Logout>" | Out-Null } } catch {} }
+function Disconnect-Vsphere {
+    # Idempotent: logs the vCenter SOAP session out once, then nulls the handles so a repeat call (the
+    # entry-point finally after the inline call) is a no-op and never re-sends a Logout on a dead session.
+    try { if ($script:_svc) { Invoke-Vim "<urn:Logout><urn:_this type=`"SessionManager`">$($script:_svc.sessionManager.'#text')</urn:_this></urn:Logout>" | Out-Null } } catch {}
+    $script:_svc = $null; $script:_ws = $null
+}
 function Get-Prop ($o, [string]$Name) {
     $p = @($o.propSet) | Where-Object { $_.name -eq $Name } | Select-Object -First 1
     if (-not $p) { return $null }
@@ -450,6 +461,14 @@ function Start-PerfRunspace {
 }
 function Stop-PerfRunspace {
     if ($script:_perfRs) { try { $script:_perfRs.Close(); $script:_perfRs.Dispose() } catch {} ; $script:_perfRs = $null }
+}
+function Invoke-VsphereCleanup {
+    # Idempotent teardown from the entry-point finally - runs on error, Ctrl+C during the perf run, or an
+    # exit 1 from a write failure, so the vCenter SOAP session is logged out (not left open on the VCSA until
+    # idle timeout), the perf runspace is stopped, and the splash dispatcher thread is shut down.
+    Disconnect-Vsphere
+    try { Stop-PerfRunspace } catch {}
+    Close-Splash
 }
 # Like Invoke-Vim, but the POST runs in the background runspace and the UI is pumped while waiting. Falls
 # back to synchronous Invoke-Vim when there's no runspace (headless). Returns $null if the user closed
@@ -1146,6 +1165,10 @@ $writer = {
 
 Show-Splash
 $data = $null
+# Outer guard: the vCenter SOAP session, the perf runspace and the splash dispatcher thread are torn down
+# in the finally on EVERY exit path (error, Ctrl+C during the perf run, or an exit 1 from a write failure).
+# The inner try/catch below stays for error messaging; teardown is guaranteed by the finally.
+try {
 try {
     Set-SplashStatus "Connecting to $VCenter..."
     $pwPlain = ConvertFrom-SecureStringPlain $Password
@@ -1173,4 +1196,7 @@ Close-Splash
 $hc = @($data.Hosts).Count; $vc = [int]$data.Summary.VmCount; $oc = $data.Summary.ClusterOvercommit
 Show-MsgBox "vSphere collection complete.`n`nScope: $($data.Scope.Type) '$($data.Scope.Name)'`nHosts: $hc   VMs: $vc   Overcommit: ${oc}:1`n`nOutput:`n$outFile" -Icon Info
 if ($script:_noSplash) { Write-Host "Output: $outFile" }
+} finally {
+    Invoke-VsphereCleanup
+}
 #endregion

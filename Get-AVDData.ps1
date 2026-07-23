@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-07-23.2   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Azure Virtual Desktop data across subscriptions and saves it as JSON.
@@ -35,7 +35,7 @@ param(
     [switch]$SkipUpdateCheck
 )
 
-$script:CollectorVersion = '2026-07-23.1'
+$script:CollectorVersion = '2026-07-23.2'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:CollectorVersion, and the published .version file in lock-step.
@@ -286,13 +286,18 @@ function Set-ReportStatus {
 }
 
 function Close-Splash {
+    # Idempotent: safe to call more than once. Shuts down the dedicated STA dispatcher thread AND disposes
+    # the runspace/PowerShell so no ghost powershell.exe is left behind.
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
         try { $sync.Dispatcher.InvokeShutdown() } catch {}
         try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
         try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
         $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
         return
     }
     if ($script:_splash) { try { $script:_splash.Close() } catch {} ; $script:_splash = $null }
@@ -1557,6 +1562,7 @@ function Show-AzureAuthDialog {
 $dialogResult = Show-AzureAuthDialog
 
 if (-not $dialogResult) {
+    Close-Splash   # user cancelled the auth dialog - shut the splash thread down so no ghost powershell.exe lingers
     exit 0
 }
 
@@ -1570,6 +1576,7 @@ $rgFilterSet           = [System.Collections.Generic.HashSet[string]]::new([Syst
 foreach ($rg in $rgFilter) { [void]$rgFilterSet.Add($rg) }
 
 if ($selectedSubscriptions.Count -eq 0) {
+    Close-Splash   # no subscriptions selected - shut the splash thread down before exiting
     exit 0
 }
 
@@ -2811,6 +2818,9 @@ catch {
     $errLine = $_.InvocationInfo.ScriptLineNumber
     Write-Host "ERROR at line $errLine`: $errMsg" -ForegroundColor Red
     Show-MsgBox "An error occurred during data collection.`n`nLine $errLine`: $errMsg" -Title 'AVD Data Collector Error' -Icon 'Error'
+}
+finally {
+    Close-Splash   # backstop: guarantees the splash STA thread is shut down even on a Ctrl+C that bypasses catch
 }
 
 #endregion

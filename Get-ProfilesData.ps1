@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.2   (keep in lock-step with $script:_version below)
+# Version: 2026-07-23.3   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -76,7 +76,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-23.2'
+$script:_version      = '2026-07-23.3'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -498,13 +498,19 @@ function Set-SplashStatus ([string]$Message) {
 }
 
 function Close-Splash {
+    # Idempotent: safe to call more than once (the entry-point finally is a backstop for the inline call).
+    # Shuts down the dedicated STA dispatcher thread AND disposes the runspace/PowerShell so no ghost
+    # powershell.exe is left behind.
     $sync = $script:_splashSync
     if ($sync -and $sync.Dispatcher) {
         try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
         try { $sync.Dispatcher.InvokeShutdown() } catch {}
         try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
         try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
         $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
         return
     }
     if ($script:_splash) {
@@ -1478,6 +1484,9 @@ if ($azAvailable) { try { $c = Get-AzContext; $azCtx = [ordered]@{ Account = "$(
 
 Show-Splash
 
+# Guard the collection + write: any throw or a Ctrl+C runs the finally below, shutting the splash STA
+# thread down so no ghost powershell.exe is left behind. Close-Splash is idempotent (the inline call stays).
+try {
 $shareResults = [System.Collections.Generic.List[object]]::new()
 $i = 0
 foreach ($t in $targets) {
@@ -1535,6 +1544,9 @@ try {
 Close-Splash
 $totErr = (@($shareResults | ForEach-Object { @($_['Errors']).Count }) | Measure-Object -Sum).Sum
 Show-MsgBox "Profile share collection complete.`n`nShares: $($shareResults.Count)   Issues recorded: $totErr`n`nOutput:`n$outFile" -Icon $(if ($totErr -gt 0) { 'Warning' } else { 'Info' })
+} finally {
+    Close-Splash
+}
 
 #endregion
 
