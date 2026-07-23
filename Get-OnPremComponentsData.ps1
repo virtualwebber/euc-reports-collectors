@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-22   (must match $script:_version below and the published .version file)
+# Version: 2026-07-23   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -129,7 +129,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-22'
+$script:_version      = '2026-07-23'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -145,6 +145,13 @@ $script:_debugLogPath = Join-Path $script:_scriptDir 'OnPremComponentsData-Debug
 $script:_splash       = $null
 $script:_noSplash     = [bool]$NoSplash   # headless: suppress splash + message boxes
 $script:_splashStatus = $null
+$script:_splashSync   = $null   # synchronized hashtable bridging to the dedicated splash UI thread
+$script:_splashPs     = $null
+$script:_splashRs     = $null
+$script:_splashHandle = $null
+$script:_splashLogoB64 = @'
+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
+'@
 
 # True when this process holds an elevated (local-administrator) token. Local collection of IIS
 # bindings / SSL certificate and the StoreFront / FAS / PVS admin cmdlets needs it; remote (WinRM)
@@ -225,7 +232,7 @@ function Show-MsgBox {
     )
     if ($script:_noSplash) { Write-Host "[$Icon] $Message"; Write-Log $Message; return }
     $iconChar  = switch ($Icon) { 'Error' { '&#x2716;' } 'Warning' { '&#x26A0;' } default { '&#x2139;' } }
-    $iconColor = switch ($Icon) { 'Error' { '#D83B01' } 'Warning' { '#CA5010' }   default { '#0078D4'  } }
+    $iconColor = switch ($Icon) { 'Error' { '#D83B01' } 'Warning' { '#CA5010' }   default { '#0E7C86'  } }
     $msg = [System.Security.SecurityElement]::Escape($Message)
     $ttl = [System.Security.SecurityElement]::Escape($Title)
     $win = New-ThemedWindow @"
@@ -236,7 +243,7 @@ function Show-MsgBox {
         FontFamily="Segoe UI" FontSize="13" Background="#F4F6F9">
   <Window.Resources>
     <Style x:Key="BlueBtn" TargetType="Button">
-      <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
       <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
@@ -245,7 +252,7 @@ function Show-MsgBox {
                             TextBlock.Foreground="{TemplateBinding Foreground}"/>
         </Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
@@ -297,12 +304,12 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
         FontFamily="Segoe UI" FontSize="13" Background="#F4F6F9">
   <Window.Resources>
     <Style x:Key="BlueBtn" TargetType="Button">
-      <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
       <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
         <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}">
           <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}"/></Border>
-        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger></ControlTemplate.Triggers>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger></ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="GreyBtn" TargetType="Button">
@@ -318,7 +325,7 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
   <StackPanel Margin="22,20,22,16">
     <TextBlock Text="A newer version of the collector is available." FontSize="14" FontWeight="Bold" Foreground="#1F2937" Margin="0,0,0,8"/>
     <TextBlock FontSize="13" Foreground="#555" TextWrapping="Wrap" Margin="0,0,0,4">
-      <Run Text="Installed: "/><Run Text="$l" FontWeight="SemiBold"/><Run Text="    Available: "/><Run Text="$r" FontWeight="SemiBold" Foreground="#0078D4"/>
+      <Run Text="Installed: "/><Run Text="$l" FontWeight="SemiBold"/><Run Text="    Available: "/><Run Text="$r" FontWeight="SemiBold" Foreground="#0E7C86"/>
     </TextBlock>
     <TextBlock Text="Update now? The script will download the new version and relaunch." FontSize="12" Foreground="#8a8f98" TextWrapping="Wrap" Margin="0,0,0,16"/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -407,7 +414,7 @@ function Show-Splash {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Citrix On-Premises Collector" Height="170" Width="460"
+        Title="Citrix On-Premises Collector" Height="205" Width="460"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
         AllowsTransparency="True" Background="Transparent" Topmost="True"
         ShowInTaskbar="True" FontFamily="Segoe UI">
@@ -416,39 +423,81 @@ function Show-Splash {
             <DropShadowEffect BlurRadius="24" ShadowDepth="3" Opacity="0.12" Color="#000000"/>
         </Border.Effect>
         <StackPanel VerticalAlignment="Center" Margin="32,24">
+            <Image x:Name="Logo" Height="34" HorizontalAlignment="Center" Stretch="Uniform" Margin="0,0,0,12"/>
             <TextBlock Text="Citrix On-Premises - Data Collector"
-                       FontSize="15" FontWeight="Bold" Foreground="#0078D4"
+                       FontSize="15" FontWeight="Bold" Foreground="#0E7C86"
                        HorizontalAlignment="Center" Margin="0,0,0,6"/>
             <TextBlock x:Name="StatusText" Text="Starting..."
                        FontSize="12" Foreground="#555"
                        HorizontalAlignment="Center" Margin="0,0,0,18"/>
             <ProgressBar x:Name="Bar" IsIndeterminate="True"
-                         Height="3" Background="#E8EAED" Foreground="#0078D4"
+                         Height="3" Background="#E8EAED" Foreground="#0E7C86"
                          BorderThickness="0"/>
         </StackPanel>
     </Border>
 </Window>
 '@
+    # Run the splash on its OWN dedicated STA thread so it stays live - the progress bar keeps animating and
+    # each status line renders - even while the MAIN thread is blocked for a long time on WinRM / server
+    # queries. If the dedicated thread can't start we fall back to the inline splash, so collection is never
+    # affected either way.
+    $sync = [hashtable]::Synchronized(@{ Xaml = $xaml; Dispatcher = $null; Status = $null; Win = $null; Ready = $false; Err = $null; Logo = $script:_splashLogoB64 })
+    $script:_splashSync = $sync
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
+        $rs.SessionStateProxy.SetVariable('sync', $sync)
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            try {
+                Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+                $w = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new([xml]$sync.Xaml))
+                $sync.Win = $w; $sync.Status = $w.FindName('StatusText'); $sync.Dispatcher = $w.Dispatcher
+                try { $lb=[Convert]::FromBase64String($sync.Logo); $lbi=New-Object System.Windows.Media.Imaging.BitmapImage; $lbi.BeginInit(); $lbi.CacheOption='OnLoad'; $lbi.StreamSource=(New-Object System.IO.MemoryStream(,$lb)); $lbi.EndInit(); $lbi.Freeze(); $lg=$w.FindName('Logo'); if($lg){$lg.Source=$lbi} } catch {}
+                $w.Add_SourceInitialized({ $sync.Ready = $true })
+                # Borderless window - let the user drag it anywhere during collection.
+                $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $w.Show()
+                [System.Windows.Threading.Dispatcher]::Run()
+            } catch { $sync.Err = "$($_.Exception.Message)" }
+        })
+        $script:_splashPs = $ps; $script:_splashRs = $rs; $script:_splashHandle = $ps.BeginInvoke()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $sync.Ready -and -not $sync.Err -and $sw.ElapsedMilliseconds -lt 4000) { Start-Sleep -Milliseconds 25 }
+        if ($sync.Dispatcher) { $script:_splash = $sync.Win; Write-Log 'Splash shown (dedicated UI thread)'; return }
+        Write-Log "Splash thread did not start ($($sync.Err)); using inline splash" 'WARN'
+    } catch { Write-Log "Splash thread error: $($_.Exception.Message); using inline splash" 'WARN' }
+    $script:_splashSync = $null
+
+    # Fallback: inline (same-thread) splash.
     $win = New-ThemedWindow $xaml
     $script:_splash       = $win
     $script:_splashStatus = $win.FindName('StatusText')
+    $win.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
     $script:_splash.Show()
     [void]$script:_splash.Activate()    # bring to the foreground on launch (void: Activate() returns a bool)
     $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
     # Shown on top initially, but then drop to normal z-order so it doesn't stay above
     # other apps during the (potentially long) run - it can be re-summoned from the taskbar.
     $script:_splash.Topmost = $false
-    Write-Log 'Splash shown'
+    Write-Log 'Splash shown (inline)'
 }
 
 function Set-SplashStatus ([string]$Message) {
     Write-Log $Message
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        # Async post to the splash thread - never block the collection waiting on the UI.
+        try { [void]$sync.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Normal, [Action]{ $sync.Status.Text = $Message }) } catch {}
+        return
+    }
     if ($script:_splash -and $script:_splashStatus) {
-        $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message },
-            [System.Windows.Threading.DispatcherPriority]::Send)
-        # Setting Text alone does not repaint when the caller then blocks the thread (e.g. the
-        # inter-sample sleep). Pump the dispatcher at Background priority to force a render pass.
-        $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        try {
+            $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message }, [System.Windows.Threading.DispatcherPriority]::Send)
+            # Setting Text alone does not repaint when the caller then blocks the thread (e.g. the
+            # inter-sample sleep). Pump the dispatcher at Background priority to force a render pass.
+            $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+        } catch {}
     }
 }
 
@@ -469,6 +518,15 @@ function Start-SleepResponsive ([int]$Seconds) {
 }
 
 function Close-Splash {
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
+        try { $sync.Dispatcher.InvokeShutdown() } catch {}
+        try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        $script:_splashSync = $null; $script:_splash = $null
+        return
+    }
     if ($script:_splash) {
         try { $script:_splash.Close() } catch {}
         $script:_splash = $null
@@ -515,9 +573,9 @@ function Show-LiveView ([string[]]$Servers) {
         WindowStartupLocation="CenterScreen" Background="#F4F6F9" FontFamily="Segoe UI">
     <DockPanel Margin="16">
         <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12">
-            <TextBlock Text="Citrix On-Premises - Live Collection" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+            <TextBlock Text="Citrix On-Premises - Live Collection" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
             <TextBlock x:Name="StatusText" Text="Starting..." FontSize="12" Foreground="#555" Margin="0,3,0,8"/>
-            <ProgressBar x:Name="Bar" IsIndeterminate="True" Height="3" Background="#E8EAED" Foreground="#0078D4" BorderThickness="0"/>
+            <ProgressBar x:Name="Bar" IsIndeterminate="True" Height="3" Background="#E8EAED" Foreground="#0E7C86" BorderThickness="0"/>
         </StackPanel>
         <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="RowsPanel"/></ScrollViewer>
     </DockPanel>
@@ -802,7 +860,7 @@ function Show-OnPremDialog {
         Background="#F4F6F9" FontFamily="Segoe UI" FontSize="13">
     <Window.Resources>
         <Style x:Key="BlueBtn" TargetType="Button">
-            <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+            <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
             <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="FontSize" Value="12"/><Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
@@ -811,8 +869,8 @@ function Show-OnPremDialog {
                                       TextBlock.Foreground="{TemplateBinding Foreground}"/>
                 </Border>
                 <ControlTemplate.Triggers>
-                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger>
-                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#004E8C"/></Trigger>
+                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger>
+                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#082A2E"/></Trigger>
                 </ControlTemplate.Triggers>
             </ControlTemplate></Setter.Value></Setter>
         </Style>
@@ -832,10 +890,10 @@ function Show-OnPremDialog {
     </Window.Resources>
     <StackPanel Margin="24,20,24,20">
         <DockPanel Margin="0,0,0,16">
-            <TextBlock Text="&#x1F5A5;" FontSize="26" Foreground="#0078D4" DockPanel.Dock="Left"
+            <TextBlock Text="&#x1F5A5;" FontSize="26" Foreground="#0E7C86" DockPanel.Dock="Left"
                        VerticalAlignment="Center" Margin="0,0,12,0"/>
             <StackPanel>
-                <TextBlock Text="Citrix On-Premises Collector" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+                <TextBlock Text="Citrix On-Premises Collector" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
                 <TextBlock Text="Cloud Connector / StoreFront / FAS spec + performance" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
             </StackPanel>
         </DockPanel>
@@ -2300,7 +2358,7 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
         $display = if ($isLocal) { "$env:COMPUTERNAME (local)" } else { $server }
         $name    = if ($isLocal) { "$env:COMPUTERNAME" } else { $server }
         Set-SplashStatus "Connecting to $display..."
-        Set-LiveServerState $server 'Connecting' '#0078D4'
+        Set-LiveServerState $server 'Connecting' '#0E7C86'
 
         $swConn = [System.Diagnostics.Stopwatch]::StartNew()   # per-server connect timing (logged)
         $session = $null
@@ -2366,7 +2424,7 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
             $safe  = $name -replace '[^\w\-]', '_'
             $roleLabel = if ($roles.Count) { $roles -join ', ' } else { 'No Citrix role detected' }
             if ($NoPerf) { Set-LiveServerState $server 'Collected' '#107C10' -Role $roleLabel }
-            else         { Set-LiveServerState $server 'Sampling'  '#0078D4' -Role $roleLabel }
+            else         { Set-LiveServerState $server 'Sampling'  '#0E7C86' -Role $roleLabel }
 
             Set-LiveServerStep $server 'Counting Citrix event-log errors...'
             Set-SplashStatus "Counting Citrix event errors on $display..."
