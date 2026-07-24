@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-23.3   (keep in lock-step with $script:_version below)
+# Version: 2026-07-24   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-23.3'
+$script:_version      = '2026-07-24'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -1105,6 +1105,19 @@ function ConvertTo-Iso ($Value) {
     return "$Value"
 }
 
+# Like ConvertTo-Iso but returns a [datetime] (UTC) for arithmetic - the session
+# trend needs real DateTimes to run its interval/event-sweep bucketing. Returns
+# $null when the value is empty or unparseable so callers can skip bad rows.
+function ConvertTo-Utc ($Value) {
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParse("$Value", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
+        return $dt
+    }
+    return $null
+}
+
 function Get-PagedResults {
     param(
         [string]$Path,
@@ -2043,6 +2056,155 @@ function Get-LogonPerformance {
     return ,$out.ToArray()
 }
 
+# Session-usage history for the per-delivery-group trend chart (Director-style):
+# peak concurrent + peak disconnected sessions per day over the window. Pulls two
+# Monitor OData entities and buckets them here into compact per-DG daily points, so
+# the report is a pure renderer and the JSON stays small even on large estates.
+#   Sessions    -> active concurrency (a session is "active" over [Start,End)).
+#   Connections -> connected concurrency; disconnected = active - connected.
+# 30-day window (Citrix grooms raw session detail, so older days may return empty -
+# the chart simply shows what's retained). Delivery groups are keyed by Name, since
+# the Monitor DesktopGroup Id is numeric and the Management DG Id is a GUID.
+function Get-SessionHistory {
+    $days = 30
+    Set-SplashStatus "Collecting session history (Monitor, $days days)..."
+    # Align the window start to midnight-UTC of today-(days-1) so the first day bucket
+    # isn't a partial day and a session ending just before it isn't charted as 0.
+    $sinceDt = [datetime]::UtcNow.Date.AddDays(-($days - 1))
+    $since   = $sinceDt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+    # --- Sessions overlapping the window: still active OR ended within it. ---
+    $sFilter = [Uri]::EscapeDataString("EndDate eq null or EndDate ge cast($since,Edm.DateTimeOffset)")
+    $sExpand = [Uri]::EscapeDataString('Machine($expand=DesktopGroup($select=Id,Name))')
+    $sSelect = [Uri]::EscapeDataString('SessionKey,StartDate,EndDate')
+    $sRows   = Get-MonitorOData "Sessions?`$select=$sSelect&`$expand=$sExpand&`$filter=$sFilter"
+    if (-not $sRows -or @($sRows).Count -eq 0) { Write-Log 'Session history: no data / endpoint unavailable'; return ,@() }
+    Write-RawSample 'SessionHistory' (@($sRows)[0])
+
+    $sessions = [System.Collections.Generic.List[object]]::new()
+    $skipped  = 0
+    foreach ($s in @($sRows)) {
+        if ($null -eq $s) { continue }
+        $dg = if ($s.Machine -and $s.Machine.DesktopGroup) { $s.Machine.DesktopGroup } else { $null }
+        if (-not $dg -or -not "$($dg.Name)") { $skipped++; continue }
+        $start = ConvertTo-Utc $s.StartDate
+        if ($null -eq $start) { continue }
+        [void]$sessions.Add([ordered]@{
+            SessionKey      = "$($s.SessionKey)"
+            DeliveryGroupId = "$($dg.Id)"
+            DeliveryGroup   = "$($dg.Name)"
+            Start           = $start
+            End             = ConvertTo-Utc $s.EndDate   # $null = still active
+        })
+    }
+    Write-Log "Session history: $($sessions.Count) usable session(s), $skipped without a delivery group"
+    if ($sessions.Count -eq 0) { return ,@() }
+
+    # --- Connections overlapping the window (for the disconnected series). ---
+    # Map SessionKey -> DG from the session rows (avoids a deep $expand). The V4
+    # Connection schema varies by tenant, so discover the date fields from one sample
+    # row before filtering - a blind $filter on a missing column 400s the whole query.
+    $conns        = [System.Collections.Generic.List[object]]::new()
+    $discAvailable = $false
+    $keyToDg = @{}
+    foreach ($s in $sessions) { $k = "$($s['SessionKey'])"; if ($k -and -not $keyToDg.ContainsKey($k)) { $keyToDg[$k] = $s } }
+    $sample = Get-MonitorOData 'Connections?$top=1'
+    if ($sample -and @($sample).Count -gt 0) {
+        $props = @(@($sample)[0].PSObject.Properties.Name)
+        Write-Log "Connection properties: $($props -join ', ')"
+        $startField = @('EstablishmentDate','LogOnStartDate','BrokeringDate','StartDate','ConnectionDate') | Where-Object { $props -contains $_ } | Select-Object -First 1
+        $endFields  = @('DisconnectDate','LogOffDate','LogOnEndDate','TerminationDate','EndDate','ExitDate') | Where-Object { $props -contains $_ }
+        if ($startField) {
+            $cFilter = [Uri]::EscapeDataString("$startField ge cast($since,Edm.DateTimeOffset)")
+            $cRows   = Get-MonitorOData "Connections?`$filter=$cFilter"
+            $unmapped = 0
+            foreach ($c in @($cRows)) {
+                if ($null -eq $c) { continue }
+                $s = $keyToDg["$($c.SessionKey)"]
+                if (-not $s) { $unmapped++; continue }
+                $cStart = ConvertTo-Utc $c.$startField
+                if ($null -eq $cStart) { continue }
+                $cEnd = $null
+                foreach ($f in $endFields) { $v = ConvertTo-Utc $c.$f; if ($null -ne $v) { $cEnd = $v; break } }
+                [void]$conns.Add([ordered]@{
+                    DeliveryGroup = $s['DeliveryGroup']
+                    Start         = $cStart
+                    End           = $cEnd   # $null = still connected
+                })
+            }
+            $discAvailable = ($conns.Count -gt 0)
+            Write-Log "Connection history: $($conns.Count) connected interval(s), $unmapped without a matching session"
+        } else {
+            Write-Log "Connections: no recognised start-date field among [$($props -join ', ')]; disconnected unavailable" 'WARN'
+        }
+    } else {
+        Write-Log 'Connections: no sample row returned; disconnected unavailable'
+    }
+
+    # --- Bucket per delivery group into daily peak concurrent / disconnected. ---
+    # Clamp each interval to a UTC day and sweep +1/-1 events (ends before starts at
+    # equal timestamps) to find the day's peak active and peak (active-connected).
+    $addEvents = {
+        param($events, $rs, $re, $dayStart, $dayEnd, $kind)
+        $effEnd = if ($null -eq $re) { $dayEnd } else { $re }   # open interval runs to day end
+        if ($rs -lt $dayEnd -and $effEnd -gt $dayStart) {
+            $cs = if ($rs -gt $dayStart) { $rs } else { $dayStart }
+            $ce = if ($effEnd -lt $dayEnd) { $effEnd } else { $dayEnd }
+            [void]$events.Add([pscustomobject]@{ T = $cs; D = 1;  K = $kind })
+            [void]$events.Add([pscustomobject]@{ T = $ce; D = -1; K = $kind })
+        }
+    }
+
+    $sessByDg = @{}
+    foreach ($s in $sessions) { $n = "$($s['DeliveryGroup'])"; if (-not $sessByDg.ContainsKey($n)) { $sessByDg[$n] = [System.Collections.Generic.List[object]]::new() }; [void]$sessByDg[$n].Add($s) }
+    $connByDg = @{}
+    foreach ($c in $conns)    { $n = "$($c['DeliveryGroup'])"; if (-not $connByDg.ContainsKey($n)) { $connByDg[$n] = [System.Collections.Generic.List[object]]::new() }; [void]$connByDg[$n].Add($c) }
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in ($sessByDg.Keys | Sort-Object)) {
+        $dgSess = $sessByDg[$name]
+        $dgConn = if ($connByDg.ContainsKey($name)) { $connByDg[$name] } else { @() }
+        $dgId   = "$((@($dgSess)[0])['DeliveryGroupId'])"
+
+        $points = [System.Collections.Generic.List[object]]::new()
+        $peakC = 0; $peakD = 0
+        for ($i = 0; $i -lt $days; $i++) {
+            $dayStart = $sinceDt.AddDays($i)
+            $dayEnd   = $dayStart.AddDays(1)
+            $events   = [System.Collections.Generic.List[object]]::new()
+            foreach ($r in $dgSess) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'S' }
+            foreach ($r in $dgConn) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'C' }
+
+            $active = 0; $connected = 0; $dayC = 0; $dayD = 0
+            foreach ($ev in ($events | Sort-Object @{ E = { $_.T } }, @{ E = { $_.D } })) {
+                if ($ev.K -eq 'S') { $active += $ev.D } else { $connected += $ev.D }
+                if ($active -gt $dayC) { $dayC = $active }
+                if ($discAvailable) {
+                    $disc = $active - $connected
+                    if ($disc -lt 0) { $disc = 0 }
+                    if ($disc -gt $dayD) { $dayD = $disc }
+                }
+            }
+            if ($dayC -gt $peakC) { $peakC = $dayC }
+            if ($dayD -gt $peakD) { $peakD = $dayD }
+            [void]$points.Add([ordered]@{ Date = $dayStart.ToString('yyyy-MM-ddTHH:mm:ssZ'); Conc = $dayC; Disc = $dayD })
+        }
+
+        [void]$out.Add([ordered]@{
+            DeliveryGroup   = $name
+            DeliveryGroupId = $dgId
+            WindowDays      = $days
+            Total           = @($dgSess).Count
+            PeakC           = $peakC
+            PeakD           = $peakD
+            DiscAvailable   = $discAvailable
+            Points          = $points.ToArray()
+        })
+    }
+    Write-Log "Session history: bucketed $($out.Count) delivery group(s) over $days days (disconnected: $(if ($discAvailable) { 'available' } else { 'unavailable' }))"
+    return ,$out.ToArray()
+}
+
 # Citrix Cloud "Identity and access management > Domains" lists AD forests with the
 # domains under each AND per-domain connectivity status (the red/amber/green icons).
 # Primary source: the forests/domains endpoint (carries the status). Falls back to
@@ -2940,6 +3102,8 @@ function Invoke-Collection ([hashtable]$Config) {
 
     # Performance (Monitor OData) - raw logon-performance rows for the last 30 days.
     $logonPerf         = Collect 'LogonPerformance'  { Get-LogonPerformance }
+    # Session usage (Monitor OData) - per-DG daily peak concurrent/disconnected, 30 days.
+    $sessionHistory    = Collect 'SessionHistory'    { Get-SessionHistory }
 
     Set-SplashStatus 'Writing output file...'
 
@@ -2982,6 +3146,7 @@ function Invoke-Collection ([hashtable]$Config) {
         Endpoints          = $endpoints
         # Performance
         LogonPerformance   = $logonPerf
+        SessionHistory     = $sessionHistory
     }
 
     # Normalise list fields so an empty collection serialises as [] rather than
@@ -2989,7 +3154,7 @@ function Invoke-Collection ([hashtable]$Config) {
     $listKeys = 'ResourceLocations','NetworkLocations','IdentityProviders','ConditionalAuthPolicies','CloudAdministrators',
                 'ServicePrincipals','SecureClients','ProductRegistrations','IdentityDomains','Sites','Zones',
                 'DeliveryGroups','MachineCatalogs','Machines','Applications','ApplicationGroups',
-                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance','Endpoints'
+                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance','SessionHistory','Endpoints'
     foreach ($k in $listKeys) {
         $clean = @(@($output[$k]) | Where-Object {
             if ($null -eq $_) { $false }
