@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-24.1   (keep in lock-step with $script:_version below)
+# Version: 2026-07-24.2   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-24.1'
+$script:_version      = '2026-07-24.2'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -2537,6 +2537,30 @@ function Get-DeliveryGroups {
                 }
             }
         }
+        # Additional Studio "Edit Delivery Group" config surfaced on the report card (display-only). All read
+        # off the per-DG detail already fetched, except the reboot schedules (one extra call). Kept defensive
+        # ($null/empty when the API omits a field) so older collections and unmanaged groups degrade cleanly.
+        $dd = $dgDetail
+        $prelaunchOn = if ($dd -and $dd.PrelaunchSettings) { [bool]$dd.PrelaunchSettings.Enabled } else { $null }
+        $lingerOn    = if ($dd -and $dd.LingerSettings)    { [bool]$dd.LingerSettings.Enabled }    else { $null }
+        $sfServers   = @(if ($dd) { @($dd.StoreFrontServersForHostedReceiver) | ForEach-Object { "$($_.Url)" } | Where-Object { $_ } })
+        $accessPols  = @(if ($dd) { @($dd.AdvancedAccessPolicy) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name               = "$($_.Name)"
+                AllowedConnections = "$($_.AllowedConnections)"
+                Enabled            = $_.Enabled
+                SmartAccessTags    = @(@($_.IncludedSmartAccessTags) | ForEach-Object { if ($_ -is [string]) { $_ } else { "$($_.Tag)$($_.Name)$($_.Filter)" } } | Where-Object { $_ })
+            } } })
+        $rebootResp  = Invoke-CitrixApi -Path "/DeliveryGroups/$($dg.Id)/RebootSchedules" -Quiet
+        $reboots     = @(if ($rebootResp -and $rebootResp.Items) { @($rebootResp.Items) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name            = "$($_.Name)"
+                Enabled         = $_.Enabled
+                Frequency       = "$($_.Frequency)"
+                Day             = "$($_.Day)"
+                StartTime       = "$($_.StartTime)"
+                WarningDuration = $_.WarningDurationMinutes
+            } } })
         [ordered]@{
             Id                           = $dg.Id
             Name                         = $dg.Name
@@ -2547,6 +2571,19 @@ function Get-DeliveryGroups {
             SessionSupport               = $dg.SessionSupport
             SecureIcaRequired            = $secIca
             HdxSslEnabled                = $tls
+            LoadBalanceType              = if ($dd) { "$($dd.LoadBalanceType)" } else { '' }
+            ColorDepth                   = if ($dd) { "$($dd.ColorDepth)" } else { '' }
+            TimeZone                     = if ($dd) { "$($dd.TimeZone)" } else { '' }
+            MachineLogOnType             = if ($dd) { "$($dd.MachineLogOnType)" } else { '' }
+            AppProtectionKeyLogging      = if ($dd -and $dd.PSObject.Properties['AppProtectionKeyLoggingRequired'])    { [bool]$dd.AppProtectionKeyLoggingRequired }    else { $null }
+            AppProtectionScreenCapture   = if ($dd -and $dd.PSObject.Properties['AppProtectionScreenCaptureRequired']) { [bool]$dd.AppProtectionScreenCaptureRequired } else { $null }
+            PrelaunchEnabled             = $prelaunchOn
+            LingerEnabled                = $lingerOn
+            LicenseModel                 = if ($dd) { "$($dd.LicenseModel)" } else { '' }
+            ProductCode                  = if ($dd) { "$($dd.ProductCode)" } else { '' }
+            StoreFrontServers            = $sfServers
+            AccessPolicies               = $accessPols
+            RebootSchedules              = $reboots
             TotalMachines                = $dg.TotalMachines
             RegisteredMachines           = $dg.RegisteredMachines
             TotalApplications            = $dg.TotalApplications
