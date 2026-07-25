@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-24",
+  "generated": "2026-07-25",
   "files": [
     {
       "name": "Get-AVDData.ps1",
@@ -17,9 +17,9 @@
     },
     {
       "name": "Get-CitrixCloudData.ps1",
-      "version": "2026-07-24",
-      "sha256": "75791AE32ED02DB71B73B9DF68955EA3152DE384090CAF0CBB35B152587C35AB",
-      "size": 198266,
+      "version": "2026-07-24.1",
+      "sha256": "A17DA30A7A08B7D8EE0C67C8873F4B6A6AE5DF3E1DB07E02CF61DFC11BD51578",
+      "size": 199966,
       "signed": false
     },
     {

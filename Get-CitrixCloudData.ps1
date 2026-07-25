@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-24   (keep in lock-step with $script:_version below)
+# Version: 2026-07-24.1   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-24'
+$script:_version      = '2026-07-24.1'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -2515,6 +2515,28 @@ function Get-DeliveryGroups {
                 })
             }
         }
+        # Secure ICA (legacy basic RC5 encryption) - whether the delivery group requires it. Read from the
+        # per-DG detail first (already fetched), then the list item; keep $null if the API omits it so the
+        # report shows "Not reported" rather than a false "Not required".
+        $secIca = if ($dgDetail -and $dgDetail.PSObject.Properties['SecureIcaRequired']) { [bool]$dgDetail.SecureIcaRequired }
+                  elseif ($dg.PSObject.Properties['SecureIcaRequired'])                   { [bool]$dg.SecureIcaRequired }
+                  else { $null }
+        # TLS on the delivery group is set on its broker access-policy rule(s) (HdxSslEnabled) - not a direct
+        # DG property. Read it defensively from the DG detail (top-level or within an access-policy-rule
+        # collection); $null when the API doesn't surface it, shown as "Not reported".
+        $tls = $null
+        if ($dgDetail) {
+            if ($dgDetail.PSObject.Properties['HdxSslEnabled']) { $tls = [bool]$dgDetail.HdxSslEnabled }
+            else {
+                foreach ($k in 'AccessPolicyRules','AccessPolicies','PolicyRules','AccessPolicy') {
+                    if (-not $dgDetail.PSObject.Properties[$k]) { continue }
+                    $rules   = @($dgDetail.$k)
+                    $withSsl = @($rules | Where-Object { $_ -and $_.PSObject.Properties['HdxSslEnabled'] })
+                    if ($withSsl.Count -gt 0) { $tls = [bool](@($withSsl | Where-Object { [bool]$_.HdxSslEnabled }).Count -gt 0) }
+                    break
+                }
+            }
+        }
         [ordered]@{
             Id                           = $dg.Id
             Name                         = $dg.Name
@@ -2523,6 +2545,8 @@ function Get-DeliveryGroups {
             InMaintenanceMode            = $dg.InMaintenanceMode
             DeliveryType                 = $dg.DeliveryType
             SessionSupport               = $dg.SessionSupport
+            SecureIcaRequired            = $secIca
+            HdxSslEnabled                = $tls
             TotalMachines                = $dg.TotalMachines
             RegisteredMachines           = $dg.RegisteredMachines
             TotalApplications            = $dg.TotalApplications
