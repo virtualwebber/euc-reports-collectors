@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-22.4   (keep in lock-step with $script:_version below)
+# Version: 2026-07-24.2   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-22.4'
+$script:_version      = '2026-07-24.2'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -125,17 +125,25 @@ $script:_version      = '2026-07-22.4'
 # stays signed. The published Get-CitrixCloudData.ps1 is the SIGNED copy of this script.
 $script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
 $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
-$script:_selfName       = 'Get-CitrixCloudData-Signed.ps1'
+$script:_selfName       = 'Get-CitrixCloudData.ps1'
 $script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 # Configs (including the DPAPI-encrypted client secret) live in the user's
 # local profile, not in the repo. LocalAppData is per-user + per-machine,
-# which matches DPAPI's protection scope.
-$script:_appDataDir   = Join-Path $env:LOCALAPPDATA 'Citrix-DaaS-Report'
-$script:_configDir    = Join-Path $script:_appDataDir 'configs'
+# which matches DPAPI's protection scope. All EUC-report collectors share this
+# one folder; each config filename is prefixed with its report ($_configPrefix)
+# so Citrix and AVD configs never collide.
+$script:_appDataDir   = Join-Path $env:LOCALAPPDATA 'euc-reports'
+$script:_configDir    = $script:_appDataDir
+$script:_configPrefix = 'citrix-'
+# Legacy per-user config folder (pre-consolidation); migrated into $_configDir on startup.
+$script:_legacyAppDataDir = Join-Path $env:LOCALAPPDATA 'Citrix-DaaS-Report'
 $script:_outputDir    = Join-Path $script:_scriptDir 'Outputs'
-$script:_debugLogPath = Join-Path $script:_scriptDir 'CitrixCloudData-Debug.log'
+$script:_debugLogPath = Join-Path $script:_scriptDir "CitrixCloudData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
 $script:_splashStatus = $null
+$script:_splashLogoB64 = @'
+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
+'@
 $script:_token        = $null
 $script:_customerId   = $null
 $script:_siteId       = $null
@@ -198,6 +206,7 @@ function Invoke-SafeWeb {
 $script:_ownedRoots = @(
     [System.IO.Path]::GetTempPath()
     $script:_appDataDir
+    $script:_legacyAppDataDir   # so the one-time migration may move configs out of the old folder
     $script:_outputDir
     $script:_scriptDir
 ) | Where-Object { $_ } | ForEach-Object { try { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') } catch { $_ } }
@@ -224,11 +233,18 @@ foreach ($dir in $script:_configDir, $script:_outputDir) {
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
-# One-time migration: move any configs from the legacy in-repo location to LocalAppData.
-$script:_legacyConfigDir = Join-Path $script:_scriptDir 'configs'
-if (Test-Path $script:_legacyConfigDir) {
-    Get-ChildItem -Path $script:_legacyConfigDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
-        $dest = Join-Path $script:_configDir $_.Name
+# One-time migration: move any configs from the two legacy locations - the old per-user folder
+# (%LOCALAPPDATA%\Citrix-DaaS-Report\configs) and the even older in-repo <script>\configs - into the
+# consolidated flat folder, adding the 'citrix-' prefix so they sit alongside the AVD configs.
+$script:_legacyConfigDirs = @(
+    (Join-Path $script:_legacyAppDataDir 'configs')   # previous LocalAppData location
+    (Join-Path $script:_scriptDir 'configs')          # original in-repo location
+)
+foreach ($legacyDir in $script:_legacyConfigDirs) {
+    if (-not (Test-Path $legacyDir)) { continue }
+    Get-ChildItem -Path $legacyDir -Filter '*.config.json' -ErrorAction SilentlyContinue | ForEach-Object {
+        $leaf = if ($_.Name -like "$($script:_configPrefix)*") { $_.Name } else { "$($script:_configPrefix)$($_.Name)" }
+        $dest = Join-Path $script:_configDir $leaf
         if (-not (Test-Path $dest)) {
             try { Move-OwnedItem $_.FullName $dest } catch {}
         }
@@ -281,7 +297,7 @@ function Write-Log {
 function Start-DebugLog {
     Set-Content -Path $script:_debugLogPath -Value (@(
         '=' * 70
-        "Citrix DaaS Data Collector  v$($script:_version)"
+        "Citrix Cloud DaaS Data Collector  v$($script:_version)"
         "Started : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         "User    : $env:USERDOMAIN\$env:USERNAME"
         "Machine : $env:COMPUTERNAME"
@@ -296,12 +312,12 @@ function Start-DebugLog {
 
 function Get-ConfigList {
     if (-not (Test-Path $script:_configDir)) { return @() }
-    @(Get-ChildItem -Path $script:_configDir -Filter '*.config.json' |
-        ForEach-Object { $_.BaseName -replace '\.config$', '' })
+    @(Get-ChildItem -Path $script:_configDir -Filter "$($script:_configPrefix)*.config.json" |
+        ForEach-Object { ($_.BaseName -replace '\.config$', '') -replace "^$([regex]::Escape($script:_configPrefix))", '' })
 }
 
 function Read-CollectConfig ([string]$Name) {
-    $path = Join-Path $script:_configDir "$Name.config.json"
+    $path = Join-Path $script:_configDir "$($script:_configPrefix)$Name.config.json"
     if (-not (Test-Path $path)) { return $null }
     try {
         $json = Get-Content $path -Raw | ConvertFrom-Json
@@ -316,7 +332,7 @@ function Read-CollectConfig ([string]$Name) {
 
 function Save-CollectConfig ([hashtable]$Config) {
     $name = $Config['CustomerName'] -replace '[^\w\-]', '_'
-    $path = Join-Path $script:_configDir "$name.config.json"
+    $path = Join-Path $script:_configDir "$($script:_configPrefix)$name.config.json"
     try {
         $Config | ConvertTo-Json -Depth 5 | Set-Content -Path $path -Encoding UTF8
         Write-Log "Config saved: $path"
@@ -353,11 +369,11 @@ function Unprotect-Secret ([string]$Encrypted) {
 function Show-MsgBox {
     param(
         [string]$Message,
-        [string]$Title = 'Citrix DaaS Collector',
+        [string]$Title = 'Citrix Cloud DaaS Collector',
         [ValidateSet('Info','Warning','Error')][string]$Icon = 'Info'
     )
     $iconChar  = switch ($Icon) { 'Error' { '&#x2716;' } 'Warning' { '&#x26A0;' } default { '&#x2139;' } }
-    $iconColor = switch ($Icon) { 'Error' { '#D83B01' } 'Warning' { '#CA5010' }   default { '#0078D4'  } }
+    $iconColor = switch ($Icon) { 'Error' { '#D83B01' } 'Warning' { '#CA5010' }   default { '#0E7C86'  } }
     $msg = [System.Security.SecurityElement]::Escape($Message)
     $ttl = [System.Security.SecurityElement]::Escape($Title)
     $win = New-ThemedWindow @"
@@ -368,7 +384,7 @@ function Show-MsgBox {
         FontFamily="Segoe UI" FontSize="13" Background="#F4F6F9">
   <Window.Resources>
     <Style x:Key="BlueBtn" TargetType="Button">
-      <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
       <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/>
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
@@ -377,7 +393,7 @@ function Show-MsgBox {
                             TextBlock.Foreground="{TemplateBinding Foreground}"/>
         </Border>
         <ControlTemplate.Triggers>
-          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger>
+          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger>
         </ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
@@ -428,12 +444,12 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
         FontFamily="Segoe UI" FontSize="13" Background="#F4F6F9">
   <Window.Resources>
     <Style x:Key="BlueBtn" TargetType="Button">
-      <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+      <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
       <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
         <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="4" Padding="{TemplateBinding Padding}">
           <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" TextBlock.Foreground="{TemplateBinding Foreground}"/></Border>
-        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger></ControlTemplate.Triggers>
+        <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger></ControlTemplate.Triggers>
       </ControlTemplate></Setter.Value></Setter>
     </Style>
     <Style x:Key="GreyBtn" TargetType="Button">
@@ -449,7 +465,7 @@ function Show-UpdatePrompt ([string]$Local, [string]$Remote) {
   <StackPanel Margin="22,20,22,16">
     <TextBlock Text="A newer version of the collector is available." FontSize="14" FontWeight="Bold" Foreground="#1F2937" Margin="0,0,0,8"/>
     <TextBlock FontSize="13" Foreground="#555" TextWrapping="Wrap" Margin="0,0,0,4">
-      <Run Text="Installed: "/><Run Text="$l" FontWeight="SemiBold"/><Run Text="    Available: "/><Run Text="$r" FontWeight="SemiBold" Foreground="#0078D4"/>
+      <Run Text="Installed: "/><Run Text="$l" FontWeight="SemiBold"/><Run Text="    Available: "/><Run Text="$r" FontWeight="SemiBold" Foreground="#0E7C86"/>
     </TextBlock>
     <TextBlock Text="Update now? The script will download the new version and relaunch." FontSize="12" Foreground="#8a8f98" TextWrapping="Wrap" Margin="0,0,0,16"/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -538,7 +554,7 @@ function Show-Splash {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Citrix DaaS Collector" Height="170" Width="440"
+        Title="Citrix Cloud DaaS Collector" Height="205" Width="440"
         WindowStartupLocation="CenterScreen" WindowStyle="None"
         AllowsTransparency="True" Background="Transparent" Topmost="True"
         FontFamily="Segoe UI">
@@ -548,39 +564,96 @@ function Show-Splash {
             <DropShadowEffect BlurRadius="24" ShadowDepth="3" Opacity="0.12" Color="#000000"/>
         </Border.Effect>
         <StackPanel VerticalAlignment="Center" Margin="32,24">
-            <TextBlock Text="Citrix DaaS - Data Collector"
-                       FontSize="15" FontWeight="Bold" Foreground="#0078D4"
+            <Image x:Name="Logo" Height="34" HorizontalAlignment="Center" Stretch="Uniform" Margin="0,0,0,12"/>
+            <TextBlock Text="Citrix Cloud DaaS - Data Collector"
+                       FontSize="15" FontWeight="Bold" Foreground="#0E7C86"
                        HorizontalAlignment="Center" Margin="0,0,0,6"/>
             <TextBlock x:Name="StatusText" Text="Starting..."
                        FontSize="12" Foreground="#555"
                        HorizontalAlignment="Center" Margin="0,0,0,18"/>
             <ProgressBar x:Name="Bar" IsIndeterminate="True"
-                         Height="3" Background="#E8EAED" Foreground="#0078D4"
+                         Height="3" Background="#E8EAED" Foreground="#0E7C86"
                          BorderThickness="0"/>
         </StackPanel>
     </Border>
 </Window>
 '@
-    $win = New-ThemedWindow $xaml
-    $script:_splash       = $win
-    $script:_splashStatus = $win.FindName('StatusText')
+    # Run the splash on its OWN dedicated STA thread so it stays live - the progress bar keeps animating and
+    # each status line renders - even while the MAIN thread is blocked for a long time on Citrix Cloud API
+    # calls. On the old single-thread splash those calls froze the UI, so it sat on one message ("Resolving
+    # DaaS site...") until collection finished. If the dedicated thread can't start we fall back to the inline
+    # splash, so collection is never affected either way.
+    $sync = [hashtable]::Synchronized(@{ Xaml = $xaml; Dispatcher = $null; Status = $null; Win = $null; Ready = $false; Err = $null; Logo = $script:_splashLogoB64 })
+    $script:_splashSync = $sync
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
+        $rs.SessionStateProxy.SetVariable('sync', $sync)
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            try {
+                Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+                $w = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new([xml]$sync.Xaml))
+                $sync.Win = $w; $sync.Status = $w.FindName('StatusText'); $sync.Dispatcher = $w.Dispatcher
+                try { $lb=[Convert]::FromBase64String($sync.Logo); $lbi=New-Object System.Windows.Media.Imaging.BitmapImage; $lbi.BeginInit(); $lbi.CacheOption='OnLoad'; $lbi.StreamSource=(New-Object System.IO.MemoryStream(,$lb)); $lbi.EndInit(); $lbi.Freeze(); $lg=$w.FindName('Logo'); if($lg){$lg.Source=$lbi} } catch {}
+                $w.Add_SourceInitialized({ $sync.Ready = $true })
+                # Borderless window - let the user drag it anywhere during collection.
+                $w.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
+                $t = New-Object System.Windows.Threading.DispatcherTimer
+                $t.Interval = [TimeSpan]::FromMilliseconds(120)
+                $t.Add_Tick({ try { if ("$($sync.Msg)" -ne "$($sync.Shown)") { $sync.Status.Text = "$($sync.Msg)"; $sync.Shown = "$($sync.Msg)" } } catch {} })
+                $sync.Timer = $t; $t.Start()
+                $w.Show()
+                [System.Windows.Threading.Dispatcher]::Run()
+            } catch { $sync.Err = "$($_.Exception.Message)" }
+        })
+        $script:_splashPs = $ps; $script:_splashRs = $rs; $script:_splashHandle = $ps.BeginInvoke()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $sync.Ready -and -not $sync.Err -and $sw.ElapsedMilliseconds -lt 4000) { Start-Sleep -Milliseconds 25 }
+        if ($sync.Dispatcher) { $script:_splash = $sync.Win; Write-Log 'Splash shown (dedicated UI thread)'; return }
+        Write-Log "Splash thread did not start ($($sync.Err)); using inline splash" 'WARN'
+    } catch { Write-Log "Splash thread error: $($_.Exception.Message); using inline splash" 'WARN' }
+    $script:_splashSync = $null
 
-    # Show() is non-blocking; the window lives on this (the main) thread.
-    # Pump the dispatcher once so it renders before we continue.
+    # Fallback: inline (same-thread) splash.
+    $win = New-ThemedWindow $xaml
+    $script:_splash = $win
+    $script:_splashStatus = $win.FindName('StatusText')
+    $win.Add_MouseLeftButtonDown({ try { $this.DragMove() } catch {} })
     $script:_splash.Show()
     $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
-    Write-Log 'Splash shown'
+    Write-Log 'Splash shown (inline)'
 }
 
 function Set-SplashStatus ([string]$Message) {
     Write-Log $Message
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        # Async post to the splash thread - never block the collection waiting on the UI.
+        $sync.Msg = $Message   # the splash-thread DispatcherTimer applies this to the UI (no cross-thread/runspace marshaling)
+        return
+    }
     if ($script:_splash -and $script:_splashStatus) {
-        $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message },
-            [System.Windows.Threading.DispatcherPriority]::Render)
+        try { $script:_splash.Dispatcher.Invoke([Action]{ $script:_splashStatus.Text = $Message }, [System.Windows.Threading.DispatcherPriority]::Render) } catch {}
     }
 }
 
 function Close-Splash {
+    # Idempotent: safe to call more than once (the top-level finally is a backstop for the inline call).
+    # Shuts down the dedicated STA dispatcher thread AND disposes the runspace/PowerShell so no ghost
+    # powershell.exe is left behind.
+    $sync = $script:_splashSync
+    if ($sync -and $sync.Dispatcher) {
+        try { $sync.Dispatcher.Invoke([Action]{ try { $sync.Win.Close() } catch {} }) } catch {}
+        try { $sync.Dispatcher.InvokeShutdown() } catch {}
+        try { if ($script:_splashPs -and $script:_splashHandle) { [void]$script:_splashPs.EndInvoke($script:_splashHandle) } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Close() } } catch {}
+        try { if ($script:_splashPs) { $script:_splashPs.Dispose() } } catch {}
+        try { if ($script:_splashRs) { $script:_splashRs.Dispose() } } catch {}
+        $script:_splashSync = $null; $script:_splash = $null
+        $script:_splashPs = $null; $script:_splashRs = $null; $script:_splashHandle = $null
+        return
+    }
     if ($script:_splash) {
         try { $script:_splash.Close() } catch {}
         $script:_splash = $null
@@ -597,12 +670,12 @@ function Show-CustomerDialog {
     $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Citrix DaaS Report" Width="460" SizeToContent="Height"
+        Title="Citrix Cloud DaaS - Data Collector" Width="460" SizeToContent="Height"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="#F4F6F9" FontFamily="Segoe UI" FontSize="13">
     <Window.Resources>
         <Style x:Key="BlueBtn" TargetType="Button">
-            <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+            <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
             <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="FontSize" Value="12"/><Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
@@ -611,8 +684,8 @@ function Show-CustomerDialog {
                                       TextBlock.Foreground="{TemplateBinding Foreground}"/>
                 </Border>
                 <ControlTemplate.Triggers>
-                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger>
-                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#004E8C"/></Trigger>
+                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger>
+                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#082A2E"/></Trigger>
                 </ControlTemplate.Triggers>
             </ControlTemplate></Setter.Value></Setter>
         </Style>
@@ -632,11 +705,11 @@ function Show-CustomerDialog {
     </Window.Resources>
     <StackPanel Margin="24,20,24,20">
         <DockPanel Margin="0,0,0,16">
-            <TextBlock Text="&#x1F5A5;" FontSize="26" Foreground="#0078D4" DockPanel.Dock="Left"
+            <TextBlock Text="&#x1F5A5;" FontSize="26" Foreground="#0E7C86" DockPanel.Dock="Left"
                        VerticalAlignment="Center" Margin="0,0,12,0"/>
             <StackPanel>
-                <TextBlock Text="Citrix DaaS Report" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
-                <TextBlock Text="Data Collection" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
+                <TextBlock Text="Citrix Cloud DaaS" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
+                <TextBlock Text="Data Collector" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
             </StackPanel>
         </DockPanel>
 
@@ -743,7 +816,7 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
         Background="#F4F6F9" FontFamily="Segoe UI" FontSize="13">
     <Window.Resources>
         <Style x:Key="BlueBtn" TargetType="Button">
-            <Setter Property="Background" Value="#0078D4"/><Setter Property="Foreground" Value="White"/>
+            <Setter Property="Background" Value="#0E7C86"/><Setter Property="Foreground" Value="White"/>
             <Setter Property="BorderThickness" Value="0"/><Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="FontSize" Value="12"/><Setter Property="Cursor" Value="Hand"/>
             <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
@@ -752,8 +825,8 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
                                       TextBlock.Foreground="{TemplateBinding Foreground}"/>
                 </Border>
                 <ControlTemplate.Triggers>
-                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#005BA1"/></Trigger>
-                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#004E8C"/></Trigger>
+                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#0D3A40"/></Trigger>
+                    <Trigger Property="IsPressed"   Value="True"><Setter TargetName="bd" Property="Background" Value="#082A2E"/></Trigger>
                 </ControlTemplate.Triggers>
             </ControlTemplate></Setter.Value></Setter>
         </Style>
@@ -773,10 +846,10 @@ function Show-CloudSetupDialog ([string]$CustomerName) {
     </Window.Resources>
     <StackPanel Margin="24,20,24,20">
         <DockPanel Margin="0,0,0,14">
-            <TextBlock Text="&#x1F511;" FontSize="24" Foreground="#0078D4" DockPanel.Dock="Left"
+            <TextBlock Text="&#x1F511;" FontSize="24" Foreground="#0E7C86" DockPanel.Dock="Left"
                        VerticalAlignment="Center" Margin="0,0,12,0"/>
             <StackPanel>
-                <TextBlock Text="Citrix Cloud Credentials" FontSize="16" FontWeight="Bold" Foreground="#0078D4"/>
+                <TextBlock Text="Citrix Cloud Credentials" FontSize="16" FontWeight="Bold" Foreground="#0E7C86"/>
                 <TextBlock Text="API client configuration" FontSize="12" Foreground="#555" Margin="0,2,0,0"/>
             </StackPanel>
         </DockPanel>
@@ -844,7 +917,7 @@ function Show-CompletionDialog ([string]$OutputFile, [int]$ErrorCount) {
     $icon = if ($ErrorCount -gt 0) { 'Warning' } else { 'Info' }
     $msg  = "Collection complete.`n`nOutput file:`n$OutputFile"
     if ($ErrorCount -gt 0) {
-        $msg += "`n`n$ErrorCount resource(s) had collection errors. See CitrixCloudData-Debug.log for details."
+        $msg += "`n`n$ErrorCount resource(s) had collection errors. See $(Split-Path $script:_debugLogPath -Leaf) for details."
     }
     Show-MsgBox $msg -Icon $icon
 }
@@ -1030,6 +1103,19 @@ function ConvertTo-Iso ($Value) {
         return $dt.ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
     return "$Value"
+}
+
+# Like ConvertTo-Iso but returns a [datetime] (UTC) for arithmetic - the session
+# trend needs real DateTimes to run its interval/event-sweep bucketing. Returns
+# $null when the value is empty or unparseable so callers can skip bad rows.
+function ConvertTo-Utc ($Value) {
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParse("$Value", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
+        return $dt
+    }
+    return $null
 }
 
 function Get-PagedResults {
@@ -1656,8 +1742,11 @@ function Get-NetworkLocations {
            else { @($resp) }
     $out = [System.Collections.Generic.List[object]]::new()
     foreach ($loc in @($src)) {
-        $ipRanges = @($loc.ipv4Ranges | ForEach-Object { "$_" })
-        $tags     = @($loc.tags       | ForEach-Object { "$_" })
+        $ipRanges = @($loc.ipv4Ranges | ForEach-Object { "$_" } | Where-Object { $_ })
+        $tags     = @($loc.tags       | ForEach-Object { "$_" } | Where-Object { $_ })
+        # An empty NLS response can serialise as a single blank object (no id/name/ranges) when it doesn't
+        # match a known wrapper shape - skip it rather than emitting a phantom "1 network location".
+        if (-not "$($loc.id)" -and -not "$($loc.name)" -and $ipRanges.Count -eq 0) { continue }
         $network  = if ($null -ne $loc.internal) { if ($loc.internal) { 'Internal' } else { 'External' } } `
                     elseif ($loc.network) { "$($loc.network)" } else { '' }
         [void]$out.Add([ordered]@{
@@ -1964,6 +2053,155 @@ function Get-LogonPerformance {
         })
     }
     Write-Log "Logon performance: $($out.Count) measured logon(s) over 14 days"
+    return ,$out.ToArray()
+}
+
+# Session-usage history for the per-delivery-group trend chart (Director-style):
+# peak concurrent + peak disconnected sessions per day over the window. Pulls two
+# Monitor OData entities and buckets them here into compact per-DG daily points, so
+# the report is a pure renderer and the JSON stays small even on large estates.
+#   Sessions    -> active concurrency (a session is "active" over [Start,End)).
+#   Connections -> connected concurrency; disconnected = active - connected.
+# 30-day window (Citrix grooms raw session detail, so older days may return empty -
+# the chart simply shows what's retained). Delivery groups are keyed by Name, since
+# the Monitor DesktopGroup Id is numeric and the Management DG Id is a GUID.
+function Get-SessionHistory {
+    $days = 30
+    Set-SplashStatus "Collecting session history (Monitor, $days days)..."
+    # Align the window start to midnight-UTC of today-(days-1) so the first day bucket
+    # isn't a partial day and a session ending just before it isn't charted as 0.
+    $sinceDt = [datetime]::UtcNow.Date.AddDays(-($days - 1))
+    $since   = $sinceDt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+    # --- Sessions overlapping the window: still active OR ended within it. ---
+    $sFilter = [Uri]::EscapeDataString("EndDate eq null or EndDate ge cast($since,Edm.DateTimeOffset)")
+    $sExpand = [Uri]::EscapeDataString('Machine($expand=DesktopGroup($select=Id,Name))')
+    $sSelect = [Uri]::EscapeDataString('SessionKey,StartDate,EndDate')
+    $sRows   = Get-MonitorOData "Sessions?`$select=$sSelect&`$expand=$sExpand&`$filter=$sFilter"
+    if (-not $sRows -or @($sRows).Count -eq 0) { Write-Log 'Session history: no data / endpoint unavailable'; return ,@() }
+    Write-RawSample 'SessionHistory' (@($sRows)[0])
+
+    $sessions = [System.Collections.Generic.List[object]]::new()
+    $skipped  = 0
+    foreach ($s in @($sRows)) {
+        if ($null -eq $s) { continue }
+        $dg = if ($s.Machine -and $s.Machine.DesktopGroup) { $s.Machine.DesktopGroup } else { $null }
+        if (-not $dg -or -not "$($dg.Name)") { $skipped++; continue }
+        $start = ConvertTo-Utc $s.StartDate
+        if ($null -eq $start) { continue }
+        [void]$sessions.Add([ordered]@{
+            SessionKey      = "$($s.SessionKey)"
+            DeliveryGroupId = "$($dg.Id)"
+            DeliveryGroup   = "$($dg.Name)"
+            Start           = $start
+            End             = ConvertTo-Utc $s.EndDate   # $null = still active
+        })
+    }
+    Write-Log "Session history: $($sessions.Count) usable session(s), $skipped without a delivery group"
+    if ($sessions.Count -eq 0) { return ,@() }
+
+    # --- Connections overlapping the window (for the disconnected series). ---
+    # Map SessionKey -> DG from the session rows (avoids a deep $expand). The V4
+    # Connection schema varies by tenant, so discover the date fields from one sample
+    # row before filtering - a blind $filter on a missing column 400s the whole query.
+    $conns        = [System.Collections.Generic.List[object]]::new()
+    $discAvailable = $false
+    $keyToDg = @{}
+    foreach ($s in $sessions) { $k = "$($s['SessionKey'])"; if ($k -and -not $keyToDg.ContainsKey($k)) { $keyToDg[$k] = $s } }
+    $sample = Get-MonitorOData 'Connections?$top=1'
+    if ($sample -and @($sample).Count -gt 0) {
+        $props = @(@($sample)[0].PSObject.Properties.Name)
+        Write-Log "Connection properties: $($props -join ', ')"
+        $startField = @('EstablishmentDate','LogOnStartDate','BrokeringDate','StartDate','ConnectionDate') | Where-Object { $props -contains $_ } | Select-Object -First 1
+        $endFields  = @('DisconnectDate','LogOffDate','LogOnEndDate','TerminationDate','EndDate','ExitDate') | Where-Object { $props -contains $_ }
+        if ($startField) {
+            $cFilter = [Uri]::EscapeDataString("$startField ge cast($since,Edm.DateTimeOffset)")
+            $cRows   = Get-MonitorOData "Connections?`$filter=$cFilter"
+            $unmapped = 0
+            foreach ($c in @($cRows)) {
+                if ($null -eq $c) { continue }
+                $s = $keyToDg["$($c.SessionKey)"]
+                if (-not $s) { $unmapped++; continue }
+                $cStart = ConvertTo-Utc $c.$startField
+                if ($null -eq $cStart) { continue }
+                $cEnd = $null
+                foreach ($f in $endFields) { $v = ConvertTo-Utc $c.$f; if ($null -ne $v) { $cEnd = $v; break } }
+                [void]$conns.Add([ordered]@{
+                    DeliveryGroup = $s['DeliveryGroup']
+                    Start         = $cStart
+                    End           = $cEnd   # $null = still connected
+                })
+            }
+            $discAvailable = ($conns.Count -gt 0)
+            Write-Log "Connection history: $($conns.Count) connected interval(s), $unmapped without a matching session"
+        } else {
+            Write-Log "Connections: no recognised start-date field among [$($props -join ', ')]; disconnected unavailable" 'WARN'
+        }
+    } else {
+        Write-Log 'Connections: no sample row returned; disconnected unavailable'
+    }
+
+    # --- Bucket per delivery group into daily peak concurrent / disconnected. ---
+    # Clamp each interval to a UTC day and sweep +1/-1 events (ends before starts at
+    # equal timestamps) to find the day's peak active and peak (active-connected).
+    $addEvents = {
+        param($events, $rs, $re, $dayStart, $dayEnd, $kind)
+        $effEnd = if ($null -eq $re) { $dayEnd } else { $re }   # open interval runs to day end
+        if ($rs -lt $dayEnd -and $effEnd -gt $dayStart) {
+            $cs = if ($rs -gt $dayStart) { $rs } else { $dayStart }
+            $ce = if ($effEnd -lt $dayEnd) { $effEnd } else { $dayEnd }
+            [void]$events.Add([pscustomobject]@{ T = $cs; D = 1;  K = $kind })
+            [void]$events.Add([pscustomobject]@{ T = $ce; D = -1; K = $kind })
+        }
+    }
+
+    $sessByDg = @{}
+    foreach ($s in $sessions) { $n = "$($s['DeliveryGroup'])"; if (-not $sessByDg.ContainsKey($n)) { $sessByDg[$n] = [System.Collections.Generic.List[object]]::new() }; [void]$sessByDg[$n].Add($s) }
+    $connByDg = @{}
+    foreach ($c in $conns)    { $n = "$($c['DeliveryGroup'])"; if (-not $connByDg.ContainsKey($n)) { $connByDg[$n] = [System.Collections.Generic.List[object]]::new() }; [void]$connByDg[$n].Add($c) }
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($name in ($sessByDg.Keys | Sort-Object)) {
+        $dgSess = $sessByDg[$name]
+        $dgConn = if ($connByDg.ContainsKey($name)) { $connByDg[$name] } else { @() }
+        $dgId   = "$((@($dgSess)[0])['DeliveryGroupId'])"
+
+        $points = [System.Collections.Generic.List[object]]::new()
+        $peakC = 0; $peakD = 0
+        for ($i = 0; $i -lt $days; $i++) {
+            $dayStart = $sinceDt.AddDays($i)
+            $dayEnd   = $dayStart.AddDays(1)
+            $events   = [System.Collections.Generic.List[object]]::new()
+            foreach ($r in $dgSess) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'S' }
+            foreach ($r in $dgConn) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'C' }
+
+            $active = 0; $connected = 0; $dayC = 0; $dayD = 0
+            foreach ($ev in ($events | Sort-Object @{ E = { $_.T } }, @{ E = { $_.D } })) {
+                if ($ev.K -eq 'S') { $active += $ev.D } else { $connected += $ev.D }
+                if ($active -gt $dayC) { $dayC = $active }
+                if ($discAvailable) {
+                    $disc = $active - $connected
+                    if ($disc -lt 0) { $disc = 0 }
+                    if ($disc -gt $dayD) { $dayD = $disc }
+                }
+            }
+            if ($dayC -gt $peakC) { $peakC = $dayC }
+            if ($dayD -gt $peakD) { $peakD = $dayD }
+            [void]$points.Add([ordered]@{ Date = $dayStart.ToString('yyyy-MM-ddTHH:mm:ssZ'); Conc = $dayC; Disc = $dayD })
+        }
+
+        [void]$out.Add([ordered]@{
+            DeliveryGroup   = $name
+            DeliveryGroupId = $dgId
+            WindowDays      = $days
+            Total           = @($dgSess).Count
+            PeakC           = $peakC
+            PeakD           = $peakD
+            DiscAvailable   = $discAvailable
+            Points          = $points.ToArray()
+        })
+    }
+    Write-Log "Session history: bucketed $($out.Count) delivery group(s) over $days days (disconnected: $(if ($discAvailable) { 'available' } else { 'unavailable' }))"
     return ,$out.ToArray()
 }
 
@@ -2277,6 +2515,52 @@ function Get-DeliveryGroups {
                 })
             }
         }
+        # Secure ICA (legacy basic RC5 encryption) - whether the delivery group requires it. Read from the
+        # per-DG detail first (already fetched), then the list item; keep $null if the API omits it so the
+        # report shows "Not reported" rather than a false "Not required".
+        $secIca = if ($dgDetail -and $dgDetail.PSObject.Properties['SecureIcaRequired']) { [bool]$dgDetail.SecureIcaRequired }
+                  elseif ($dg.PSObject.Properties['SecureIcaRequired'])                   { [bool]$dg.SecureIcaRequired }
+                  else { $null }
+        # TLS on the delivery group is set on its broker access-policy rule(s) (HdxSslEnabled) - not a direct
+        # DG property. Read it defensively from the DG detail (top-level or within an access-policy-rule
+        # collection); $null when the API doesn't surface it, shown as "Not reported".
+        $tls = $null
+        if ($dgDetail) {
+            if ($dgDetail.PSObject.Properties['HdxSslEnabled']) { $tls = [bool]$dgDetail.HdxSslEnabled }
+            else {
+                foreach ($k in 'AccessPolicyRules','AccessPolicies','PolicyRules','AccessPolicy') {
+                    if (-not $dgDetail.PSObject.Properties[$k]) { continue }
+                    $rules   = @($dgDetail.$k)
+                    $withSsl = @($rules | Where-Object { $_ -and $_.PSObject.Properties['HdxSslEnabled'] })
+                    if ($withSsl.Count -gt 0) { $tls = [bool](@($withSsl | Where-Object { [bool]$_.HdxSslEnabled }).Count -gt 0) }
+                    break
+                }
+            }
+        }
+        # Additional Studio "Edit Delivery Group" config surfaced on the report card (display-only). All read
+        # off the per-DG detail already fetched, except the reboot schedules (one extra call). Kept defensive
+        # ($null/empty when the API omits a field) so older collections and unmanaged groups degrade cleanly.
+        $dd = $dgDetail
+        $prelaunchOn = if ($dd -and $dd.PrelaunchSettings) { [bool]$dd.PrelaunchSettings.Enabled } else { $null }
+        $lingerOn    = if ($dd -and $dd.LingerSettings)    { [bool]$dd.LingerSettings.Enabled }    else { $null }
+        $sfServers   = @(if ($dd) { @($dd.StoreFrontServersForHostedReceiver) | ForEach-Object { "$($_.Url)" } | Where-Object { $_ } })
+        $accessPols  = @(if ($dd) { @($dd.AdvancedAccessPolicy) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name               = "$($_.Name)"
+                AllowedConnections = "$($_.AllowedConnections)"
+                Enabled            = $_.Enabled
+                SmartAccessTags    = @(@($_.IncludedSmartAccessTags) | ForEach-Object { if ($_ -is [string]) { $_ } else { "$($_.Tag)$($_.Name)$($_.Filter)" } } | Where-Object { $_ })
+            } } })
+        $rebootResp  = Invoke-CitrixApi -Path "/DeliveryGroups/$($dg.Id)/RebootSchedules" -Quiet
+        $reboots     = @(if ($rebootResp -and $rebootResp.Items) { @($rebootResp.Items) | Where-Object { $_ } | ForEach-Object {
+            [ordered]@{
+                Name            = "$($_.Name)"
+                Enabled         = $_.Enabled
+                Frequency       = "$($_.Frequency)"
+                Day             = "$($_.Day)"
+                StartTime       = "$($_.StartTime)"
+                WarningDuration = $_.WarningDurationMinutes
+            } } })
         [ordered]@{
             Id                           = $dg.Id
             Name                         = $dg.Name
@@ -2285,6 +2569,21 @@ function Get-DeliveryGroups {
             InMaintenanceMode            = $dg.InMaintenanceMode
             DeliveryType                 = $dg.DeliveryType
             SessionSupport               = $dg.SessionSupport
+            SecureIcaRequired            = $secIca
+            HdxSslEnabled                = $tls
+            LoadBalanceType              = if ($dd) { "$($dd.LoadBalanceType)" } else { '' }
+            ColorDepth                   = if ($dd) { "$($dd.ColorDepth)" } else { '' }
+            TimeZone                     = if ($dd) { "$($dd.TimeZone)" } else { '' }
+            MachineLogOnType             = if ($dd) { "$($dd.MachineLogOnType)" } else { '' }
+            AppProtectionKeyLogging      = if ($dd -and $dd.PSObject.Properties['AppProtectionKeyLoggingRequired'])    { [bool]$dd.AppProtectionKeyLoggingRequired }    else { $null }
+            AppProtectionScreenCapture   = if ($dd -and $dd.PSObject.Properties['AppProtectionScreenCaptureRequired']) { [bool]$dd.AppProtectionScreenCaptureRequired } else { $null }
+            PrelaunchEnabled             = $prelaunchOn
+            LingerEnabled                = $lingerOn
+            LicenseModel                 = if ($dd) { "$($dd.LicenseModel)" } else { '' }
+            ProductCode                  = if ($dd) { "$($dd.ProductCode)" } else { '' }
+            StoreFrontServers            = $sfServers
+            AccessPolicies               = $accessPols
+            RebootSchedules              = $reboots
             TotalMachines                = $dg.TotalMachines
             RegisteredMachines           = $dg.RegisteredMachines
             TotalApplications            = $dg.TotalApplications
@@ -2864,6 +3163,8 @@ function Invoke-Collection ([hashtable]$Config) {
 
     # Performance (Monitor OData) - raw logon-performance rows for the last 30 days.
     $logonPerf         = Collect 'LogonPerformance'  { Get-LogonPerformance }
+    # Session usage (Monitor OData) - per-DG daily peak concurrent/disconnected, 30 days.
+    $sessionHistory    = Collect 'SessionHistory'    { Get-SessionHistory }
 
     Set-SplashStatus 'Writing output file...'
 
@@ -2906,6 +3207,7 @@ function Invoke-Collection ([hashtable]$Config) {
         Endpoints          = $endpoints
         # Performance
         LogonPerformance   = $logonPerf
+        SessionHistory     = $sessionHistory
     }
 
     # Normalise list fields so an empty collection serialises as [] rather than
@@ -2913,7 +3215,7 @@ function Invoke-Collection ([hashtable]$Config) {
     $listKeys = 'ResourceLocations','NetworkLocations','IdentityProviders','ConditionalAuthPolicies','CloudAdministrators',
                 'ServicePrincipals','SecureClients','ProductRegistrations','IdentityDomains','Sites','Zones',
                 'DeliveryGroups','MachineCatalogs','Machines','Applications','ApplicationGroups',
-                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance','Endpoints'
+                'Sessions','Policies','HostingConnections','Administrators','LogonPerformance','SessionHistory','Endpoints'
     foreach ($k in $listKeys) {
         $clean = @(@($output[$k]) | Where-Object {
             if ($null -eq $_) { $false }
@@ -3017,7 +3319,15 @@ if (-not $config) {
 }
 
 Write-Log "Starting collection for customer '$($config['CustomerName'])'"
-Invoke-Collection -Config $config
+# The splash runs on a dedicated STA runspace/dispatcher thread (created inside Invoke-Collection). Guarantee
+# it is shut down on EVERY exit path - a terminating error (e.g. auth failure), a thrown API error, or a
+# user Ctrl+C - so no ghost powershell.exe is left behind. Close-Splash is idempotent, so the inline call on
+# the happy path plus this backstop are safe together.
+try {
+    Invoke-Collection -Config $config
+} finally {
+    Close-Splash
+}
 Write-Log 'Collection routine returned'
 
 #endregion
@@ -3026,8 +3336,8 @@ Write-Log 'Collection routine returned'
 # SIG # Begin signature block
 # MIIvfwYJKoZIhvcNAQcCoIIvcDCCL2wCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD7RXSxReght3FQ
-# hVR0jkoUIs4EhP3ghsxF42wvNMgXFKCCFDwwggVyMIIDWqADAgECAhB2U/6sdUZI
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBKpD3lEb+Zz5zH
+# Ny1jOtlIU9ecC9xT0UXeuJ7HYZNaj6CCFDwwggVyMIIDWqADAgECAhB2U/6sdUZI
 # k/Xl10pIOk74MA0GCSqGSIb3DQEBDAUAMFMxCzAJBgNVBAYTAkJFMRkwFwYDVQQK
 # ExBHbG9iYWxTaWduIG52LXNhMSkwJwYDVQQDEyBHbG9iYWxTaWduIENvZGUgU2ln
 # bmluZyBSb290IFI0NTAeFw0yMDAzMTgwMDAwMDBaFw00NTAzMTgwMDAwMDBaMFMx
@@ -3140,23 +3450,23 @@ Write-Log 'Collection routine returned'
 # Z24gR0NDIFI0NSBFViBDb2RlU2lnbmluZyBDQSAyMDIwAgwT+aSpBbjNqY5ohT0w
 # DQYJYIZIAWUDBAIBBQCggYQwGAYKKwYBBAGCNwIBDDEKMAigAoAAoQKAADAZBgkq
 # hkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4wDAYKKwYBBAGC
-# NwIBFTAvBgkqhkiG9w0BCQQxIgQgoB4bPwvivHGpTjas6xvN2WRnbCMLWlh4n4wO
-# y4FMOLMwDQYJKoZIhvcNAQEBBQAEggIAIAbKO8lA+px1S0j9E3465Y5BHUUbQBoR
-# HylNGieaKwnkjm7JYdRx5ndcMcZYSxYB2abs+BGq3OQTkleBLFpM9ORP4BUp4UMm
-# b2u2zkLKQ7U2niCn4MY7PV5A+7xsg4OgibaWTv1MnP3n4nOJ9sYQmp29OKltcMLs
-# UDNrytqiTjG1rAY/3sS4svksQOR3qJQDjSsrIk5a1ckl4CnYiiwFpSdikg7GjO7B
-# SRMVpVKSRd3m+H5+dBYH2+naqOM+JG1oElTg4z1LU5erUG8c5hg8Pk7NWNmqIVLs
-# nALqtyHM22adhQji135KN9nDgGTnZxgf4vGM+Njq4C0qABhS1eXVDGbhfhMo4OV9
-# SDTof02vBll7Dmfpc6393kZv5/a69WH8a8t0l8a1WY95KTvCLs020rOeUW0MYnda
-# DRnA7lz+RlLy8TdGwdpJcoI9cLigfrvzrKWlDpXtG8l+PK1gzEmFN2X2oT3n4m0i
-# 4/dPHApPDQl7ADpyn2F8DHBcq7WPMTZ+1DZKKFeduoqHF+ym/aSl1tnIvii1DmCl
-# udYOPMI+6WKdV7Pd6MSoZux4wuYXuCQB5Hl1o9obPkThhlBHeQYtcYtKn4EWWHWU
-# FkhvWdncw6hpCy2A7FiRVz4fzXDWB2zHgQuFs1iZlYiprFJUV95owMY4LHqOwqqa
-# Dl6PJGgfPHGhghd3MIIXcwYKKwYBBAGCNwMDATGCF2MwghdfBgkqhkiG9w0BBwKg
+# NwIBFTAvBgkqhkiG9w0BCQQxIgQg8YvmyJ3yFTgUcyT7zrHRT4lnVvx5Unx8YABI
+# PQPr5twwDQYJKoZIhvcNAQEBBQAEggIAhiYEdSRo9OBK0tVrcAp9762QsmqAYEl1
+# 9OU1sQDrcCCbm4yUFSvgafXpqATXdpqH3WJzhTW8sgoxo00gmyy/cRzt7+TkTu8M
+# LiHqMUDUTbyON9ZNcIXczu9eJT3qK1jj2TCTD15fc9/0xjMrLgwAJnN8UG/gL4//
+# 0XAbq8bhu2wDmE3WI3mC7HC43YBrkT9gi3jQGuJZK/9eLKkfU36FWXu2cYtSgZJY
+# 48At+aivFm7exvtnQo+lV22TCqCjNAFktUT+keZ5stUEuAsxtFYw/0NjxoatsH+z
+# ujoShiyA4TCUuw24uYXRTsUbmuAuFO3hBGniIE09iwgk55SOmEEUuVtzAIhUpLki
+# GoSuBR5AliH/MpmVOjR026dqhDJ1LnYONhYuI0P5hmVz0L3advQtfu9ZF6Ol9pjV
+# yipvZ04x7BpG30Qom0CkLirioWA6LVOnk3xe6lKus3Qnkosn5EqXu8OasBevoD9H
+# xj3ecridxR/LtLkQRM8ZNUPHau/RYclufvI9biVVUNlDs7ayXUWc+6l2qcwUbnUh
+# zO6nQ9SoBdaF8Y8PU0hmmQ/CGI1JjVNABgNFdOv2mbOcBL42Ew/Fjf3lAB9MelBu
+# /nca0G9PiUvcj912yu9qm+phVZ4jT9HYQnCwmEv8ewBOsko64Jm7qP51LiXk3+2k
+# 56cIAshdEFKhghd3MIIXcwYKKwYBBAGCNwMDATGCF2MwghdfBgkqhkiG9w0BBwKg
 # ghdQMIIXTAIBAzEPMA0GCWCGSAFlAwQCAQUAMHgGCyqGSIb3DQEJEAEEoGkEZzBl
-# AgEBBglghkgBhv1sBwEwMTANBglghkgBZQMEAgEFAAQgfD8mC4bnQ3iuev0Xdq62
-# U5NnuJyjj6Ul695XxQHli1MCEQCGd7FJG9jZHo2kBhYE2Rw4GA8yMDI2MDcyMjE0
-# MjUwMVqgghM6MIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG
+# AgEBBglghkgBhv1sBwEwMTANBglghkgBZQMEAgEFAAQgXZMJFY0TATgRF1bPrVfG
+# NhTwIAxztdQzG+DKRJloIcUCEQCpNvG0K2bcR6fZRY5++RaOGA8yMDI2MDcyNzEy
+# MjgyNFqgghM6MIIG7TCCBNWgAwIBAgIQCoDvGEuN8QWC0cR2p5V0aDANBgkqhkiG
 # 9w0BAQsFADBpMQswCQYDVQQGEwJVUzEXMBUGA1UEChMORGlnaUNlcnQsIEluYy4x
 # QTA/BgNVBAMTOERpZ2lDZXJ0IFRydXN0ZWQgRzQgVGltZVN0YW1waW5nIFJTQTQw
 # OTYgU0hBMjU2IDIwMjUgQ0ExMB4XDTI1MDYwNDAwMDAwMFoXDTM2MDkwMzIzNTk1
@@ -3263,19 +3573,19 @@ Write-Log 'Collection routine returned'
 # AxM4RGlnaUNlcnQgVHJ1c3RlZCBHNCBUaW1lU3RhbXBpbmcgUlNBNDA5NiBTSEEy
 # NTYgMjAyNSBDQTECEAqA7xhLjfEFgtHEdqeVdGgwDQYJYIZIAWUDBAIBBQCggdEw
 # GgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMBwGCSqGSIb3DQEJBTEPFw0yNjA3
-# MjIxNDI1MDFaMCsGCyqGSIb3DQEJEAIMMRwwGjAYMBYEFN1iMKyGCi0wa9o4sWh5
-# UjAH+0F+MC8GCSqGSIb3DQEJBDEiBCBFEekw/ldf75z98xWlHl2ho4npj/HAx8ot
-# VyG5O67xpzA3BgsqhkiG9w0BCRACLzEoMCYwJDAiBCBKoD+iLNdchMVck4+Cjmdr
-# nK7Ksz/jbSaaozTxRhEKMzANBgkqhkiG9w0BAQEFAASCAgBrXbu2Pqx9TMEqvfpE
-# iV4pEbI76gE5swk5XzNWHTSAmiiNL30e/vS8kovxQQIe/4v/NapZ2+05hScsNY+0
-# cM/7lJFtO6cu9FmT7osxx8dRhW491Lnt+p1a8JHtwfV6qNOaYc270wUP0Uo8yBEI
-# Kye3QZZ9BCoeuc228r7hUBTksRVbDhFGA/iB4h01CLsDLEVkQyXHzk6hVOGMa+vO
-# J/ZBNhu1Cs1RIbSRnSl9yXGaadUrziFyyayKl097P99aculNPMPDR2aaM0yA+SsV
-# 53MzpeICzNhLhxOF6MGFxaVAATDwolkkGUkfJK0kM4a6563SjrK+HwCjPbZsz/Ts
-# G0v+gkob/dvpui+owYMRzncy/6GslrwUK5ROW+gS82qLFG/FX3p2WrMpj7BfYkQF
-# 95DFUnMO+woMKkfRNM12oQC7balEr8oSGfMXi29GTFlp2gIG0RLIz8Vxpt5fGKhv
-# b23VXHs/+AjfIs1Nf7mS4TBsBIL+rK3sC+MnJNM462afBlTlB66pz3GjsPB1+S8Q
-# FNlWCUORXFbVudRq1WeShjubB2yYKEdg0vie52rMqDqSCY5qbQZ4Cyp0uBZmZNHn
-# 0qCTe86mVz8BQBE0KD+eCELbhUWBWS50ln49oIoeoTF7l5UTQFgadI5NkQOpDUDD
-# kDNv1Xi956Ciqkyxuk7COC9OTA==
+# MjcxMjI4MjRaMCsGCyqGSIb3DQEJEAIMMRwwGjAYMBYEFN1iMKyGCi0wa9o4sWh5
+# UjAH+0F+MC8GCSqGSIb3DQEJBDEiBCBEaHbWVJIaqVaZTHM/8oa6B8oPgyVvt+l+
+# WsK9ItZ9yDA3BgsqhkiG9w0BCRACLzEoMCYwJDAiBCBKoD+iLNdchMVck4+Cjmdr
+# nK7Ksz/jbSaaozTxRhEKMzANBgkqhkiG9w0BAQEFAASCAgACBJK3oiYSAhzncFTj
+# SeLvb16rhvhu8uKOBGsnHmGuKDd8Gly7622n1kca1RbDeNaC13ov6MLDXxhKrwcv
+# E4EZwh28fQDoZGvC/e2xBgkPHUw37GRv29J5xS8ZU4AS+Ew27ptgP9SpNcow+e/G
+# uXP5lBmG9BlglviDsOGpZfpZvVgeSDsTPtxR43T4lJXfMOmcqzANLLWvvhT0BrP2
+# X9QQtPdJAZUwYm4tkkaJeH/yVNTZgqTIKjI9ew0gU3t+qUKgN4ihPSeq2MMas65u
+# 5Z1wbYwOTrYAU8+0F4cKYToUd0vA/EnQrCFKwNLOs/q4xD0J2Mud181yAyKlFkx6
+# gWk64dmtcH3ONJSCmeFCNsVz8gM+LAfLnN/bIvkP/is94gHIrdQvOKF8wJdYxYH7
+# hH8tRgrdbae9tk2WdGBI3SvZI6OfJZyFB9MNeJYsxO7UcwN+VFITarPEkf+Bmz4C
+# 0NEndlWgymSZnGcXY+yjzGcx3cLZ8MBaKFMbsHPuV7ETbxud80Pn3AeY5CP2ibW/
+# 0kIc0jSdJ76blDCNnNqH2dra49ppDY49Cg52FQgTtx53lQx/b/hhT/nif1PjUMuJ
+# 67lZaxk8HQo7V555KAUCyBTk2iS1G/b6mQXrbAK8dVIyfFH38Wh0ioD/ftbxp0h1
+# +OUWyphRL92eKMQ5IBhmDU6Kyw==
 # SIG # End signature block
