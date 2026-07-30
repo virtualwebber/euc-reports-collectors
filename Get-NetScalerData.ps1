@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-30   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-07-30.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -14,6 +14,10 @@
 
 .PARAMETER OutputPath
     Directory where the JSON data file will be saved. Defaults to the current directory.
+
+.PARAMETER EncryptPassword
+    Encrypt the data file with this password. The file is written as .cdenc instead of .json and the
+    report (and the hosted app) will ask for the same password to open it. Omit for a plain .json.
 
 .PARAMETER SkipUpdateCheck
     Skip the launch-time check for a newer published version of this collector.
@@ -34,10 +38,13 @@ param(
     [string]$OutputPath = (Get-Location).Path,
 
     [Parameter()]
+    [System.Security.SecureString]$EncryptPassword,
+
+    [Parameter()]
     [switch]$SkipUpdateCheck
 )
 
-$script:CollectorVersion = '2026-07-30'
+$script:CollectorVersion = '2026-07-30.1'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -50,6 +57,42 @@ $ErrorActionPreference = 'Stop'
 # PS 5.1 defaults to TLS 1.0 — NetScaler management interfaces require TLS 1.2+.
 # -bor rather than a flat assignment so an environment that already enabled TLS 1.3 keeps it.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+#region -- Optional data-file encryption (.cdenc) -------------------------------
+# AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC), PBKDF2 via the 3-arg Rfc2898DeriveBytes SHA1 form -
+# byte-identical on .NET Framework (PS 5.1, here) and .NET Core (PS 7, the report engine), so a file
+# encrypted on a customer box decrypts in the report and the hosted app. Shared .cdenc format with
+# the other EUC collectors. The password is never written to the file or a log.
+$script:_cdEncMarker = '_cdenc'; $script:_cdEncVer = 1; $script:_cdEncIter = 200000
+
+function ConvertFrom-SecureStringPlain ([System.Security.SecureString]$Secure) {
+    if (-not $Secure) { return '' }
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Get-CdEncKeys ([string]$PwText, [byte[]]$Salt) {
+    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PwText, $Salt, $script:_cdEncIter)
+    try { $b = $kdf.GetBytes(64); @{ Aes = $b[0..31]; Mac = $b[32..63] } } finally { $kdf.Dispose() }
+}
+
+function Protect-ReportData ([string]$PlainJson, [System.Security.SecureString]$Password) {
+    if (-not $Password -or $Password.Length -eq 0) { throw 'Protect-ReportData: a password is required.' }
+    $pw = ConvertFrom-SecureStringPlain $Password
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $salt = New-Object byte[] 16; $rng.GetBytes($salt); $iv = New-Object byte[] 16; $rng.GetBytes($iv); $rng.Dispose()
+    $keys = Get-CdEncKeys $pw $salt
+    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
+    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() } finally { $aes.Dispose() }
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
+    try { $mac = $hmac.ComputeHash([byte[]](@([byte]$script:_cdEncVer) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
+    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVer; alg = 'AES-256-CBC+HMAC-SHA256'; kdf = 'PBKDF2-SHA1'; iter = $script:_cdEncIter
+        salt = [Convert]::ToBase64String($salt); iv = [Convert]::ToBase64String($iv); ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+}
+
+$script:_encryptPassword = $EncryptPassword   # set from -EncryptPassword or the launch dialog; $null = plaintext
+#endregion
 
 #region -- WPF / DWM setup ----------------------------------------------------
 
@@ -397,8 +440,9 @@ try { [NsDataCertBypass]::Install() } catch {}
 
 function Connect-Nitro {
     param([string]$ApplianceHost, [string]$Username, [System.Security.SecureString]$Password)
-    $plainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                    [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password))
+    # ConvertFrom-SecureStringPlain frees the BSTR; unwrapping inline here used to leak it, leaving
+    # the plaintext password in unmanaged memory for the life of the process.
+    $plainPwd = ConvertFrom-SecureStringPlain $Password
     $body = '{"login":{"username":"' + $Username + '","password":"' + ($plainPwd -replace '\\','\\' -replace '"','\"') + '"}}'
     $session = $null
     try {
@@ -738,6 +782,13 @@ function Show-CollectorDialog {
               Style="{StaticResource GreyBtn}"/>
     </Grid>
 
+    <!-- Optional data-file encryption -->
+    <TextBlock Text="Encrypt data file (optional)" FontSize="11" Foreground="#555" Margin="0,0,0,4"/>
+    <PasswordBox x:Name="PwdEncrypt" Padding="8,6" Margin="0,0,0,4"
+                 Background="White" BorderBrush="#CDD0D6" BorderThickness="1"/>
+    <TextBlock Text="Leave blank for a plain .json. With a password the file is written as .cdenc and the report asks for it."
+               FontSize="10" Foreground="#8a8f98" TextWrapping="Wrap" Margin="0,0,0,16"/>
+
     <!-- Error text -->
     <TextBlock x:Name="TxtError" Text="" Foreground="#D83B01" FontSize="11"
                Margin="0,0,0,10" Visibility="Collapsed" TextWrapping="Wrap"/>
@@ -864,12 +915,14 @@ function Show-CollectorDialog {
             return
         }
         $secPwd = $pwdPassword.SecurePassword
+        $encPwd = $win.FindName('PwdEncrypt').SecurePassword
         $script:_dialogResult = [ordered]@{
-            CustomerName = $txtCustomer.Text.Trim()
-            Appliances   = @($script:_applianceList | ForEach-Object { [ordered]@{ Name = $_['Name']; Host = $_['Host'] } })
-            Username     = $txtUsername.Text.Trim()
-            Password     = $secPwd
-            OutputPath   = $txtOutput.Text.Trim()
+            CustomerName    = $txtCustomer.Text.Trim()
+            Appliances      = @($script:_applianceList | ForEach-Object { [ordered]@{ Name = $_['Name']; Host = $_['Host'] } })
+            Username        = $txtUsername.Text.Trim()
+            Password        = $secPwd
+            OutputPath      = $txtOutput.Text.Trim()
+            EncryptPassword = $(if ($encPwd -and $encPwd.Length -gt 0) { $encPwd } else { $null })
         }
         $win.DialogResult = $true
         $win.Close()
@@ -903,6 +956,10 @@ $applianceDefs = @($dialogResult['Appliances'])
 $username      = $dialogResult['Username']
 $password      = $dialogResult['Password']
 $outPath       = $dialogResult['OutputPath']
+# -EncryptPassword wins when supplied; otherwise take whatever the dialog collected.
+if (-not ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)) {
+    $script:_encryptPassword = $dialogResult['EncryptPassword']
+}
 
 if (-not (Test-Path $outPath)) {
     New-Item -ItemType Directory -Path $outPath -Force | Out-Null
@@ -1377,10 +1434,14 @@ Set-CollectStatus 'Saving data...' -Progress 92
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $safeName  = if ($customerName) { ($customerName -replace '[^A-Za-z0-9\-_]', '_').Trim('_') } else { 'NetScaler' }
-$fileName  = "$safeName-NetScaler-Data-$timestamp.json"
+# With a password the payload is encrypted and written as .cdenc; without one it stays plain .json.
+$encrypting = [bool]($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
+$fileName  = "$safeName-NetScaler-Data-$timestamp." + $(if ($encrypting) { 'cdenc' } else { 'json' })
 $filePath  = Join-Path $outPath $fileName
 
-$report | ConvertTo-Json -Depth 20 | Set-Content -Path $filePath -Encoding UTF8
+$payload = $report | ConvertTo-Json -Depth 20
+if ($encrypting) { $payload = Protect-ReportData $payload $script:_encryptPassword }
+$payload | Set-Content -Path $filePath -Encoding UTF8
 
 Set-CollectStatus 'Complete' -Progress 100 -Sub $filePath
 Start-Sleep -Milliseconds 800

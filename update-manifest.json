@@ -24,9 +24,9 @@
     },
     {
       "name": "Get-NetScalerData.ps1",
-      "version": "2026-07-30",
-      "sha256": "2952828EB480547174BD76D523EBF811FD3540C01780384872881C41856868B7",
-      "size": 74498,
+      "version": "2026-07-30.1",
+      "sha256": "59AE30A7820350D4E09C4158BAC20A7242B9E7FEA684C229F1269C18BD7323E4",
+      "size": 77386,
       "signed": false
     },
     {
