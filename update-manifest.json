@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-27",
+  "generated": "2026-07-30",
   "files": [
     {
       "name": "Get-AVDData.ps1",
@@ -20,6 +20,13 @@
       "version": "2026-07-24.2",
       "sha256": "1B265B892BE070E3CC38D94E24D07211EC8EE6020016B6F5420486D011B5E2FB",
       "size": 202962,
+      "signed": false
+    },
+    {
+      "name": "Get-NetScalerData.ps1",
+      "version": "2026-07-30",
+      "sha256": "2952828EB480547174BD76D523EBF811FD3540C01780384872881C41856868B7",
+      "size": 74498,
       "signed": false
     },
     {
