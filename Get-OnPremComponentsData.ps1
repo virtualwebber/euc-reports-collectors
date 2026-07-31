@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# Version: 2026-07-23.2   (must match $script:_version below and the published .version file)
+﻿#Requires -Version 5.1
+# Version: 2026-07-31   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -30,9 +30,13 @@
 .PARAMETER OutputPath
     Override the output folder (default: .\Outputs).
 
+.PARAMETER Perf
+    Opt IN to performance sampling. OFF by default - sampling is the slowest part of a run
+    (it holds a monitoring window open per server) and is rarely needed for a health check.
+
 .PARAMETER NoPerf
-    Skip performance sampling entirely (collect spec, versions, event errors, FAS and
-    StoreFront config only). Useful for a quick config-only run with no monitoring window.
+    Skip performance sampling entirely. Retained for back-compat now that sampling is off by
+    default; if both -Perf and -NoPerf are given, -NoPerf wins.
 
 .PARAMETER NoSplash
     Run headless: suppress the WPF splash and the completion/warning message boxes (status
@@ -57,6 +61,10 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
     [string]$OutputPath,
     [string]$Customer,
+    # Performance sampling is OFF by default (it is the slowest part of a collection and is rarely
+    # needed for a health check). Pass -Perf to opt in. -NoPerf is retained for back-compat and still
+    # forces it off; if both are given, -NoPerf wins.
+    [switch]$Perf,
     [switch]$NoPerf,
     [switch]$NoSplash,
     [switch]$LiveView,
@@ -129,7 +137,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version      = '2026-07-23.2'
+$script:_version = '2026-07-31'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -945,7 +953,7 @@ function Show-OnPremDialog {
 
         <Border Background="#F0F6FC" BorderBrush="#CFE4F7" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,16">
             <StackPanel>
-                <CheckBox x:Name="PerfChk" Content="Capture live performance (per server)" IsChecked="True" Foreground="#1F2937" FontSize="12"/>
+                <CheckBox x:Name="PerfChk" Content="Capture live performance (per server)" IsChecked="False" Foreground="#1F2937" FontSize="12"/>
                 <StackPanel Orientation="Horizontal" Margin="22,8,0,0">
                     <TextBlock Text="Monitor for" FontSize="11" Foreground="#555" VerticalAlignment="Center" Margin="0,0,6,0"/>
                     <TextBox x:Name="DurationBox" Text="30" Width="46" Padding="6,3" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" VerticalAlignment="Center"/>
@@ -1776,12 +1784,20 @@ $script:_brokerBlock = {
         Applications       = @()
         ApplicationGroups  = @()
         Administrators     = @()
+        Sessions           = @()
+        Policies           = @()
+        SessionDetailCollected = $false
         Databases          = @()
         SqlExpressInstalled = $false
         SqlExpressInstances = @()
+        # Per-entity outcome, surfaced to the report so a check can tell "collected, genuinely empty"
+        # from "could not collect" and report Not checked instead of a vacuous Pass.
+        CollectionStatus   = [ordered]@{}
         Messages           = @()
     }
-    foreach ($sn in 'Citrix.Broker.Admin.V2', 'Citrix.Configuration.Admin.V2', 'Citrix.Host.Admin.V2', 'Citrix.MachineCreation.Admin.V2', 'Citrix.DelegatedAdmin.Admin.V1', 'Citrix.Monitor.Admin.V1', 'Citrix.ConfigurationLogging.Admin.V1') {
+    $collStatus = $site['CollectionStatus']
+    # ADIdentity is needed for tainted AD accounts (MC-002); AppLibrary for App-V/app packages.
+    foreach ($sn in 'Citrix.Broker.Admin.V2', 'Citrix.Configuration.Admin.V2', 'Citrix.Host.Admin.V2', 'Citrix.MachineCreation.Admin.V2', 'Citrix.DelegatedAdmin.Admin.V1', 'Citrix.Monitor.Admin.V1', 'Citrix.ConfigurationLogging.Admin.V1', 'Citrix.ADIdentity.Admin.V2', 'Citrix.AppLibrary.Admin.V1') {
         try { Add-PSSnapin $sn -ErrorAction Stop } catch { }
     }
     if (-not (Get-Command Get-BrokerSite -ErrorAction SilentlyContinue)) {
@@ -1806,7 +1822,14 @@ $script:_brokerBlock = {
     try {
         $bs = Get-BrokerSite -ErrorAction Stop
         $site['SiteName']       = "$($bs.Name)"
+        # Prefer the real site GUID from Get-ConfigSite; BrokerServiceGroupUid is a service-group id,
+        # not the site identity, and was only ever a stand-in.
         $site['SiteId']         = "$($bs.BrokerServiceGroupUid)"
+        try {
+            $cs = Get-ConfigSite -ErrorAction Stop
+            if ("$($cs.SiteGuid)") { $site['SiteId'] = "$($cs.SiteGuid)" }
+            if ("$($cs.SiteName)") { $site['SiteName'] = "$($cs.SiteName)" }
+        } catch { }
         $site['ProductEdition'] = "$($bs.LicenseEdition)"
         $s = [ordered]@{}
         foreach ($p in 'LocalHostCacheEnabled', 'ConnectionLeasingEnabled', 'SecureIcaRequired', 'LicenseModel', 'LicenseServerName', 'LicenseServerPort', 'LicenseEdition', 'LicensingGracePeriodActive', 'TrustRequestsSentToTheXmlServicePort', 'TrustManagedAnonymousXmlServiceRequests', 'DnsResolutionEnabled', 'ColorDepth', 'DefaultMinimumFunctionalLevel', 'ResourceLeasingEnabled', 'ReuseMachinesWithoutShutdownInOutageAllowed') {
@@ -1835,22 +1858,132 @@ $script:_brokerBlock = {
         if (-not "$($site['ProductVersion'])" -and @($site['Controllers']).Count) { $site['ProductVersion'] = "$(@($site['Controllers'])[0].ControllerVersion)" }
     } catch { $site['Messages'] += "Get-BrokerController: $($_.Exception.Message)" }
 
+    # Sessions. Collected before the delivery groups because the per-DG disconnected count is derived
+    # from them: the DG object has no disconnected-SESSION count, only DesktopsDisconnected, which is
+    # machines-with-a-disconnected-session. Those coincide on single-session VDI and diverge on
+    # multi-session, where one machine can hold many sessions.
+    $sessByDg = @{}; $discByDg = @{}
+    try {
+        $allSessions = @(Get-BrokerSession -MaxRecordCount 10000 -ErrorAction Stop)
+        $site['Sessions'] = @($allSessions | ForEach-Object {
+            $dgn = "$($_.DesktopGroupName)"
+            if ($dgn) {
+                $sessByDg[$dgn] = [int]$sessByDg[$dgn] + 1
+                if ("$($_.SessionState)" -eq 'Disconnected') { $discByDg[$dgn] = [int]$discByDg[$dgn] + 1 }
+            }
+            [ordered]@{
+                SessionId = "$($_.Uid)"; SessionType = "$($_.SessionType)"; State = "$($_.SessionState)"
+                MachineName = "$($_.MachineName)"; DeliveryGroupName = $dgn
+                UserName = "$($_.UserName)"; UPN = "$($_.UserUPN)"
+                StartTime = (& $iso $_.StartTime); ConnectionTime = (& $iso $_.BrokeringTime)
+                DisconnectTime = $(if ("$($_.SessionState)" -eq 'Disconnected') { (& $iso $_.SessionStateChangeTime) } else { '' })
+                IdleTime = "$($_.IdleDuration)"
+                ClientName = "$($_.ClientName)"; ClientAddress = "$($_.ClientAddress)"
+                ClientPlatform = "$($_.ClientPlatform)"; Protocol = "$($_.Protocol)"
+                Applications = @($_.ApplicationsInUse | ForEach-Object { "$_" })
+            }
+        })
+        $site['SessionDetailCollected'] = $true
+        $collStatus['Sessions'] = 'Collected'
+    } catch {
+        $site['Messages'] += "Get-BrokerSession: $($_.Exception.Message)"
+        $collStatus['Sessions'] = 'Failed'
+    }
+
     # Delivery Groups (build a Uid->Name map for applications).
     $dgName = @{}
     try {
         $site['DeliveryGroups'] = @(Get-BrokerDesktopGroup -ErrorAction Stop | ForEach-Object {
             $dgName["$($_.Uid)"] = "$($_.Name)"
+            $n = "$($_.Name)"
             [ordered]@{
-                Id = "$($_.Uid)"; Name = "$($_.Name)"; Description = (& $str $_.Description)
+                Id = "$($_.Uid)"; Name = $n; Description = (& $str $_.Description)
                 Enabled = [bool]$_.Enabled; InMaintenanceMode = [bool]$_.InMaintenanceMode
                 DeliveryType = "$($_.DeliveryType)"; SessionSupport = "$($_.SessionSupport)"
+                SecureIcaRequired = [bool]$_.SecureIcaRequired
+                ColorDepth = "$($_.ColorDepth)"; TimeZone = "$($_.TimeZone)"
+                MachineLogOnType = "$($_.MachineLogOnType)"
+                AppProtectionKeyLogging = [bool]$_.AppProtectionKeyLoggingRequired
+                AppProtectionScreenCapture = [bool]$_.AppProtectionScreenCaptureRequired
+                LicenseModel = (& $str $_.LicenseModel); ProductCode = (& $str $_.ProductCode)
                 TotalMachines = [int]$_.TotalDesktops; RegisteredMachines = [int]$_.DesktopsRegistered
-                SessionCount = [int]$_.Sessions; DisconnectedSessionCount = [int]$_.DesktopsDisconnected
+                TotalApplications = [int]$_.TotalApplications; TotalDesktops = [int]$_.TotalDesktops
+                # Real session counts - see the note above Get-BrokerSession.
+                SessionCount = $(if ($sessByDg.ContainsKey($n)) { [int]$sessByDg[$n] } else { [int]$_.Sessions })
+                DisconnectedSessionCount = [int]$discByDg[$n]
+                AutomaticPowerOnForAssigned = [bool]$_.AutomaticPowerOnForAssigned
+                ShutdownDesktopsAfterUse = [bool]$_.ShutdownDesktopsAfterUse
+                TurnOnAddedMachine = [bool]$_.TurnOnAddedMachine
+                ReuseMachines = [bool]$_.ReuseMachinesWithoutShutdownInOutage
                 MinimumFunctionalLevel = "$($_.MinimumFunctionalLevel)"
                 Scopes = @($_.Scopes | ForEach-Object { "$_" }); Tags = @($_.Tags | ForEach-Object { "$_" })
+                # Autoscale scalars live on the DG object itself - no extra call. Shaped to match the
+                # cloud collector's nested Autoscale block so the report renders it unchanged.
+                Autoscale = [ordered]@{
+                    Enabled = [bool]$_.AutoscalingEnabled; AutoscalingEnabled = [bool]$_.AutoscalingEnabled
+                    IsPowerManaged = (-not [bool]$_.IsRemotePC)
+                    PeakBufferSizePercent = [int]$_.PeakBufferSizePercent
+                    OffPeakBufferSizePercent = [int]$_.OffPeakBufferSizePercent
+                    PowerOffDelayMinutes = [int]$_.PowerOffDelay
+                    PeakDisconnectAction = "$($_.PeakDisconnectAction)"; PeakDisconnectTimeoutMinutes = [int]$_.PeakDisconnectTimeout
+                    OffPeakDisconnectAction = "$($_.OffPeakDisconnectAction)"; OffPeakDisconnectTimeoutMinutes = [int]$_.OffPeakDisconnectTimeout
+                    PeakLogOffAction = "$($_.PeakLogOffAction)"; PeakLogOffTimeoutMinutes = [int]$_.PeakLogOffTimeout
+                    OffPeakLogOffAction = "$($_.OffPeakLogOffAction)"; OffPeakLogOffTimeoutMinutes = [int]$_.OffPeakLogOffTimeout
+                    Schemes = @()
+                }
             }
         })
     } catch { $site['Messages'] += "Get-BrokerDesktopGroup: $($_.Exception.Message)" }
+
+    # Access policy rules -> per-DG AccessPolicies + IncludedUsers + HdxSslEnabled. One call closes
+    # the DG-005 "individual user assignment" check, which previously passed vacuously on-prem.
+    try {
+        $rulesByDg = @{}
+        foreach ($r in @(Get-BrokerAccessPolicyRule -ErrorAction Stop)) {
+            $dn = "$($r.DesktopGroupName)"; if (-not $dn) { continue }
+            if (-not $rulesByDg.ContainsKey($dn)) { $rulesByDg[$dn] = @() }
+            $rulesByDg[$dn] += $r
+        }
+        foreach ($dg in $site['DeliveryGroups']) {
+            $rs = @($rulesByDg["$($dg['Name'])"])
+            $dg['AccessPolicies'] = @($rs | ForEach-Object {
+                [ordered]@{
+                    Name = "$($_.Name)"; AllowedConnections = "$($_.AllowedConnections)"
+                    Enabled = [bool]$_.Enabled
+                    SmartAccessTags = @($_.IncludedSmartAccessTags | ForEach-Object { "$_" })
+                }
+            })
+            # A rule with the user filter OFF grants access to everyone, so it contributes no named
+            # users - that is a real state, not missing data, and the check must be able to tell.
+            $dg['IncludedUsers'] = @($rs | Where-Object { $_.IncludedUserFilterEnabled } | ForEach-Object { @($_.IncludedUsers) } | Where-Object { $_ } | ForEach-Object {
+                [ordered]@{ Name = "$($_.Name)"; Upn = "$($_.UPN)"; Account = "$($_.SamName)"; IsGroup = [bool]($_.GetType().Name -match 'Group') }
+            })
+            $dg['HdxSslEnabled'] = [bool](@($rs | Where-Object { $_.HdxSslEnabled }).Count -gt 0)
+        }
+        $collStatus['AccessPolicies'] = 'Collected'
+    } catch {
+        $site['Messages'] += "Get-BrokerAccessPolicyRule: $($_.Exception.Message)"
+        $collStatus['AccessPolicies'] = 'Failed'
+    }
+
+    # Restart schedules per DG.
+    try {
+        $schByDg = @{}
+        foreach ($rs in @(Get-BrokerRebootScheduleV2 -ErrorAction Stop)) {
+            $dn = "$($rs.DesktopGroupName)"; if (-not $dn) { continue }
+            if (-not $schByDg.ContainsKey($dn)) { $schByDg[$dn] = @() }
+            $schByDg[$dn] += [ordered]@{
+                Name = "$($rs.Name)"; Enabled = [bool]$rs.Enabled; Frequency = "$($rs.Frequency)"
+                Day = "$($rs.Day)"; StartTime = "$($rs.StartTime)"
+                WarningDuration = "$($rs.WarningDuration)"
+            }
+        }
+        foreach ($dg in $site['DeliveryGroups']) { $dg['RebootSchedules'] = @($schByDg["$($dg['Name'])"]) }
+        $collStatus['RebootSchedules'] = 'Collected'
+    } catch {
+        $site['Messages'] += "Get-BrokerRebootScheduleV2: $($_.Exception.Message)"
+        $collStatus['RebootSchedules'] = 'Failed'
+    }
 
     # Provisioning schemes -> catalog master image / hosting unit.
     $provByName = @{}
@@ -1890,7 +2023,9 @@ $script:_brokerBlock = {
                 MachineCatalog = "$($_.CatalogName)"; DeliveryGroup = "$($_.DesktopGroupName)"; ZoneName = "$($_.ZoneName)"
                 RegistrationState = "$($_.RegistrationState)"; PowerState = "$($_.PowerState)"; SummaryState = "$($_.SummaryState)"
                 InMaintenanceMode = [bool]$_.InMaintenanceMode; AgentVersion = "$($_.AgentVersion)"
-                OSType = "$($_.OSType)"; SessionCount = [int]$_.SessionCount
+                OSType = "$($_.OSType)"; OSVersionString = (& $str $_.OSVersion); SessionCount = [int]$_.SessionCount
+                FunctionalLevel = "$($_.FunctionalLevel)"
+                Tags = @($_.Tags | ForEach-Object { "$_" })
                 AssociatedUsers = @($_.AssociatedUserFullNames | ForEach-Object { "$_" })
                 HostedMachineName = "$($_.HostedMachineName)"; LastDeregisteredReason = "$($_.LastDeregistrationReason)"
             }
@@ -1937,6 +2072,71 @@ $script:_brokerBlock = {
             }
         })
     } catch { $site['Messages'] += "Get-AdminAdministrator: $($_.Exception.Message)" }
+
+    # Citrix policies. CVAD 2311+/2402 exposes the same policy model the cloud /gpo API returns, so the
+    # shape below is a 1:1 match for the cloud collector's Policies key and the report renders it
+    # unchanged. Older sites lack these cmdlets - recorded as Unavailable so the report says
+    # "not checked" rather than showing a site with zero policies.
+    if (Get-Command Get-BrokerGpoPolicySet -ErrorAction SilentlyContinue) {
+        try {
+            $pols = New-Object System.Collections.Generic.List[object]
+            foreach ($ps in @(Get-BrokerGpoPolicySet -ErrorAction Stop)) {
+                foreach ($p in @(Get-BrokerGpoPolicy -PolicySetGuid $ps.PolicySetGuid -ErrorAction SilentlyContinue)) {
+                    $settings = @(Get-BrokerGpoSetting -PolicyGuid $p.PolicyGuid -ErrorAction SilentlyContinue | ForEach-Object {
+                        [ordered]@{ Name = "$($_.SettingName)"; Value = (& $str $_.SettingValue); UseDefault = [bool]$_.UseDefault; Guid = "$($_.SettingGuid)" }
+                    })
+                    $filters = @(Get-BrokerGpoFilter -PolicyGuid $p.PolicyGuid -ErrorAction SilentlyContinue | ForEach-Object {
+                        [ordered]@{ Type = "$($_.FilterType)"; Data = (& $str $_.FilterData); IsAllowed = [bool]$_.IsAllowed; IsEnabled = [bool]$_.IsEnabled; Guid = "$($_.FilterGuid)" }
+                    })
+                    [void]$pols.Add([ordered]@{
+                        PolicySetName = "$($ps.Name)"; PolicySetGuid = "$($ps.PolicySetGuid)"
+                        PolicySetType = "$($ps.PolicySetType)"; IsTemplate = ("$($ps.PolicySetType)" -match 'Template')
+                        PolicyGuid = "$($p.PolicyGuid)"; PolicyName = "$($p.Name)"
+                        Description = (& $str $p.Description); IsEnabled = [bool]$p.IsEnabled; Priority = [int]$p.Priority
+                        Settings = $settings; Filters = $filters
+                    })
+                }
+            }
+            # .ToArray(), NOT @($pols): assigning @(<generic List>) into an [ordered] dictionary
+            # indexer throws "Argument types do not match" on PS 5.1. A plain array assigns fine.
+            $site['Policies'] = $pols.ToArray()
+            $collStatus['Policies'] = 'Collected'
+        } catch {
+            # Include the failing line: the try spans four cmdlets, so a bare message is not
+            # actionable when one of them rejects an argument.
+            $site['Messages'] += "Policies: $($_.Exception.Message) [line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())]"
+            $collStatus['Policies'] = 'Failed'
+        }
+    } else {
+        $collStatus['Policies'] = 'Unavailable'
+        $site['Messages'] += 'Citrix policy cmdlets (Get-BrokerGpoPolicySet) not available - policies not collected. Requires CVAD 2311 or later.'
+    }
+
+    # Tainted AD computer accounts per catalog (MC-002). Only MCS catalogs have a Citrix-managed
+    # identity pool; Manual / PVS / Remote PC have none, so there is genuinely nothing to check for
+    # them - the catalog simply carries no TaintedAccounts key and the report treats it as N/A.
+    if (Get-Command Get-AcctADAccount -ErrorAction SilentlyContinue) {
+        try {
+            $taintedByPool = @{}
+            foreach ($a in @(Get-AcctADAccount -State Tainted -ErrorAction SilentlyContinue)) {
+                $pool = "$($a.IdentityPoolName)"; if (-not $pool) { continue }
+                if (-not $taintedByPool.ContainsKey($pool)) { $taintedByPool[$pool] = @() }
+                $taintedByPool[$pool] += "$($a.ADAccountName)"
+            }
+            foreach ($mc in $site['MachineCatalogs']) {
+                $ps = $provByName["$($mc['Name'])"]
+                if ($ps -and "$($ps.IdentityPoolName)") {
+                    $mc['TaintedAccounts'] = @($taintedByPool["$($ps.IdentityPoolName)"])
+                }
+            }
+            $collStatus['TaintedAccounts'] = 'Collected'
+        } catch {
+            $site['Messages'] += "Get-AcctADAccount: $($_.Exception.Message)"
+            $collStatus['TaintedAccounts'] = 'Failed'
+        }
+    } else {
+        $collStatus['TaintedAccounts'] = 'Unavailable'
+    }
 
     # Databases + SQL Express. The three CVAD databases (Site / Monitoring / Configuration Logging) each
     # expose their connection string via the SDK. SQL Server Express (10 GB cap, no SQL Agent, no supported
@@ -2753,8 +2953,8 @@ function Write-OnPremSiteJson ($Site, $Files) {
         CustomerName           = "$($script:_customer)"
         CustomerId             = ''
         CollectionErrors       = @($Site.Messages).Count
-        CollectionStatus       = [ordered]@{}
-        SessionDetailCollected = $false
+        CollectionStatus       = $(if ($Site.CollectionStatus) { $Site.CollectionStatus } else { [ordered]@{} })
+        SessionDetailCollected = [bool]$Site.SessionDetailCollected
         Source                 = 'OnPremSite'
         # Cloud-platform collections with no on-prem equivalent - emitted empty so the report's cloud-only
         # sections/checks render as absent rather than vacuously passing.
@@ -2775,8 +2975,8 @@ function Write-OnPremSiteJson ($Site, $Files) {
         Machines           = @($Site.Machines)
         Applications       = @($Site.Applications)
         ApplicationGroups  = @($Site.ApplicationGroups)
-        Sessions           = @()
-        Policies           = @()
+        Sessions           = @($Site.Sessions)
+        Policies           = @($Site.Policies)
         HostingConnections = @($Site.HostingConnections)
         Administrators     = @($Site.Administrators)
         Controllers        = @($Site.Controllers)
@@ -2919,7 +3119,8 @@ $cred     = $Credential
 $customer = $Customer
 
 $liveView = [bool]$LiveView
-$noPerf   = [bool]$NoPerf
+# Perf is opt-in: off unless -Perf was given, and -NoPerf always wins.
+$noPerf   = if ($NoPerf) { $true } else { -not [bool]$Perf }
 $script:_encryptPassword = $EncryptPassword   # CLI param; the dialog can also set it below
 if (-not $targets) {
     $sel = Show-OnPremDialog

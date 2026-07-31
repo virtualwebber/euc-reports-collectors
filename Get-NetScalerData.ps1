@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-30.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-07-31.7   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -22,6 +22,24 @@
 .PARAMETER SkipUpdateCheck
     Skip the launch-time check for a newer published version of this collector.
 
+.PARAMETER ApplianceHost
+    Appliance hostname/IP. Supplying this together with -Username and -Password skips the WPF
+    dialog entirely (headless/scripted collection) - a single appliance only; use the dialog for
+    multi-appliance runs.
+
+.PARAMETER Username
+    NetScaler login username for headless collection. Requires -ApplianceHost and -Password.
+
+.PARAMETER Password
+    NetScaler login password (SecureString) for headless collection. Requires -ApplianceHost and
+    -Username.
+
+.PARAMETER CustomerName
+    Customer name recorded in the output file for headless collection. Defaults to 'Customer'.
+
+.PARAMETER ApplianceName
+    Display name for the appliance in headless collection. Defaults to -ApplianceHost.
+
 .EXAMPLE
     .\Get-NetScalerData.ps1
 
@@ -30,6 +48,11 @@
 
 .EXAMPLE
     .\Get-NetScalerData.ps1 -SkipUpdateCheck
+
+.EXAMPLE
+    # Headless/scripted collection - no WPF dialog
+    $pwd = Read-Host -AsSecureString
+    .\Get-NetScalerData.ps1 -ApplianceHost 192.168.100.151 -Username nsroot -Password $pwd -OutputPath "C:\NetScalerData"
 #>
 
 [CmdletBinding()]
@@ -41,10 +64,25 @@ param(
     [System.Security.SecureString]$EncryptPassword,
 
     [Parameter()]
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+
+    [Parameter()]
+    [string]$ApplianceHost,
+
+    [Parameter()]
+    [string]$Username,
+
+    [Parameter()]
+    [System.Security.SecureString]$Password,
+
+    [Parameter()]
+    [string]$CustomerName = 'Customer',
+
+    [Parameter()]
+    [string]$ApplianceName
 )
 
-$script:CollectorVersion = '2026-07-30.1'
+$script:CollectorVersion = '2026-07-31.7'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -481,23 +519,24 @@ function Invoke-NitroGet {
     $ns = if ($Stat) { 'stat' } else { 'config' }
     $url = "$BaseUri/nitro/v1/$ns/$Resource"
     if ($QueryArgs) { $url += "?$QueryArgs" }
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Method GET -WebSession $Session `
-            -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        $data = $resp.Content | ConvertFrom-Json
-        if ($data.errorcode -ne 0 -and $data.errorcode -ne $null) {
-            return @()
-        }
-        if ($data.PSObject.Properties.Name -contains $Resource) {
-            $raw = $data.$Resource
-            if ($raw -eq $null) { return @() }
-            if ($raw -is [array]) { return $raw }
-            return @($raw)
-        }
-        return @()
-    } catch {
-        return @()
+    $resp = Invoke-WebRequest -Uri $url -Method GET -WebSession $Session `
+        -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $data = $resp.Content | ConvertFrom-Json
+    # NITRO errorcode 258 is "No such resource exists" - the standard response when a resource type
+    # is genuinely configured with zero entries, not a failure. Every other non-zero errorcode is a
+    # real failure (auth/permission/malformed request/etc.) and must propagate so the caller's
+    # try/catch records it in CollectionErrors, instead of being indistinguishable from "none present".
+    if ($data.errorcode -eq 258) { return @() }
+    if ($data.errorcode -ne 0 -and $data.errorcode -ne $null) {
+        throw "NITRO error $($data.errorcode) for '$Resource': $($data.message)"
     }
+    if ($data.PSObject.Properties.Name -contains $Resource) {
+        $raw = $data.$Resource
+        if ($raw -eq $null) { return @() }
+        if ($raw -is [array]) { return $raw }
+        return @($raw)
+    }
+    return @()
 }
 
 function Invoke-NitroGetSingle {
@@ -507,16 +546,16 @@ function Invoke-NitroGetSingle {
         [string]$Resource
     )
     $url = "$BaseUri/nitro/v1/config/$Resource"
-    try {
-        $resp = Invoke-WebRequest -Uri $url -Method GET -WebSession $Session `
-            -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
-        $data = $resp.Content | ConvertFrom-Json
-        if ($data.errorcode -ne 0 -and $data.errorcode -ne $null) { return $null }
-        if ($data.PSObject.Properties.Name -contains $Resource) { return $data.$Resource }
-        return $null
-    } catch {
-        return $null
+    $resp = Invoke-WebRequest -Uri $url -Method GET -WebSession $Session `
+        -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $data = $resp.Content | ConvertFrom-Json
+    # See Invoke-NitroGet above - 258 is the normal "nothing configured" response, not a failure.
+    if ($data.errorcode -eq 258) { return $null }
+    if ($data.errorcode -ne 0 -and $data.errorcode -ne $null) {
+        throw "NITRO error $($data.errorcode) for '$Resource': $($data.message)"
     }
+    if ($data.PSObject.Properties.Name -contains $Resource) { return $data.$Resource }
+    return $null
 }
 
 function Get-NitroProp {
@@ -938,27 +977,43 @@ function Show-CollectorDialog {
 
 Set-CollectStatus 'Ready' -Progress 30
 
-# Hide splash while dialog is open so it doesn't sit on top (Topmost=True)
-$script:_splash.Dispatcher.Invoke([Action]{ $script:_splash.Hide() }, [System.Windows.Threading.DispatcherPriority]::Render)
+# Headless when host/username/password are all supplied - skips the WPF dialog entirely (scripted/
+# CI collection), mirroring the report script's -DataFile headless bypass. Multi-appliance runs still
+# need the dialog (Lab.config.json-style appliance list); this path is single-appliance only.
+$script:_headless = [bool]($ApplianceHost -and $Username -and $Password)
 
-$dialogResult = Show-CollectorDialog
-if (-not $dialogResult) {
-    $script:_splash.Close()
-    exit 0
-}
+if (-not $script:_headless) {
+    # Hide splash while dialog is open so it doesn't sit on top (Topmost=True)
+    $script:_splash.Dispatcher.Invoke([Action]{ $script:_splash.Hide() }, [System.Windows.Threading.DispatcherPriority]::Render)
 
-# Re-show splash for collection progress
-$script:_splash.Dispatcher.Invoke([Action]{ $script:_splash.Show() }, [System.Windows.Threading.DispatcherPriority]::Render)
-$script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+    $dialogResult = Show-CollectorDialog
+    if (-not $dialogResult) {
+        $script:_splash.Close()
+        exit 0
+    }
 
-$customerName  = $dialogResult['CustomerName']
-$applianceDefs = @($dialogResult['Appliances'])
-$username      = $dialogResult['Username']
-$password      = $dialogResult['Password']
-$outPath       = $dialogResult['OutputPath']
-# -EncryptPassword wins when supplied; otherwise take whatever the dialog collected.
-if (-not ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)) {
-    $script:_encryptPassword = $dialogResult['EncryptPassword']
+    # Re-show splash for collection progress
+    $script:_splash.Dispatcher.Invoke([Action]{ $script:_splash.Show() }, [System.Windows.Threading.DispatcherPriority]::Render)
+    $script:_splash.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Background)
+
+    $customerName  = $dialogResult['CustomerName']
+    $applianceDefs = @($dialogResult['Appliances'])
+    $username      = $dialogResult['Username']
+    $password      = $dialogResult['Password']
+    $outPath       = $dialogResult['OutputPath']
+    # -EncryptPassword wins when supplied; otherwise take whatever the dialog collected.
+    if (-not ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)) {
+        $script:_encryptPassword = $dialogResult['EncryptPassword']
+    }
+} else {
+    # Splash stays open (already shown earlier) and keeps receiving Set-CollectStatus progress
+    # updates exactly as in interactive mode - only the credential dialog itself is skipped. It's
+    # closed at the very end of the script either way.
+    $customerName  = $CustomerName
+    $applianceDefs = @(@{ Name = $(if ($ApplianceName) { $ApplianceName } else { $ApplianceHost }); Host = $ApplianceHost })
+    $username      = $Username
+    $password      = $Password
+    $outPath       = $OutputPath
 }
 
 if (-not (Test-Path $outPath)) {
@@ -1015,6 +1070,7 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         SslServiceGroups = @()
         SslCipherGroups  = @()
         VpnVservers      = @()
+        AuthVservers     = @()
         VpnSessionPolicies = @()
         VpnParameters    = $null
         AaaParameters    = $null
@@ -1243,11 +1299,43 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         }
     }
 
+    # Backend (service group) SSL/TLS parameters — NetScaler-to-server communication. Collected here,
+    # before the cipher-groups block below, because that block needs SslServiceGroups' sslprofile
+    # field already populated to know which profiles are actually in use (a profile referenced only by
+    # a service group, never a vserver, still counts as used) - it used to run after, which meant
+    # every service-group-only profile binding looked orphaned and its cipher group got dropped.
+    $appData['SslServiceGroups'] = @(Collect 'sslservicegroup' 'Backend SSL service groups')
+
     # Cipher groups — an unscoped GET also returns NetScaler's built-in groups (ALL, DEFAULT,
-    # HIGH, ...); only entries with this description are ones an admin actually configured
-    # (matches what 'add ssl cipher' lines in ns.conf would show).
-    $allCipherGroups = @(Collect 'sslcipher' 'SSL cipher groups')
-    $appData['SslCipherGroups'] = @($allCipherGroups | Where-Object { (Get-NitroProp $_ 'description') -eq 'User Defined Cipher Group' })
+    # HIGH, ...) and every user-defined group, whether or not it's actually in use. Only report a
+    # group that's actually bound to a vserver/service-group, OR bound to a profile that is itself
+    # attached to at least one vserver/service-group - confirmed live that several built-in profiles
+    # (ns_default_ssl_profile_quic_frontend/backend, ns_default_ssl_profile_secure_frontend[_cloud])
+    # have a cipher group bound in firmware defaults despite nothing on the appliance ever using the
+    # profile itself; a group only reachable through one of those is just as dead as an unbound one.
+    $allCipherGroups  = @(Collect 'sslcipher' 'SSL cipher groups')
+    $usedProfileNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sv in $appData['SslVservers'])      { if ($sv.sslprofile) { [void]$usedProfileNames.Add($sv.sslprofile) } }
+    foreach ($sg in $appData['SslServiceGroups']) { if ($sg.sslprofile) { [void]$usedProfileNames.Add($sg.sslprofile) } }
+    $boundCipherNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($sv in $appData['SslVservers']) {
+        # Snapshot of what was literally bound, before the recommended-cipher expansion below
+        # overwrites CipherBindings - the "Bound Vservers" column needs the real group name (an exact
+        # match), not a "do all of this group's members appear in the expanded list" guess, which
+        # gives false positives whenever one group's members happen to be a subset of another's (e.g.
+        # a 3-cipher TLS 1.3-only group vs. a 6-cipher group that includes those same 3 TLS 1.3 suites).
+        $sv | Add-Member -NotePropertyName 'BoundCipherNames' -NotePropertyValue @($sv.CipherBindings) -Force
+        foreach ($c in @($sv.CipherBindings)) { [void]$boundCipherNames.Add($c) }
+    }
+    foreach ($sp in $appData['SslProfiles']) {
+        $sp | Add-Member -NotePropertyName 'BoundCipherNames' -NotePropertyValue @($sp.CipherBindings) -Force
+        if ($usedProfileNames.Contains($sp.name)) {
+            foreach ($c in @($sp.CipherBindings)) { [void]$boundCipherNames.Add($c) }
+        }
+    }
+    $appData['SslCipherGroups'] = @($allCipherGroups | Where-Object {
+        $boundCipherNames.Contains((Get-NitroProp $_ 'ciphergroupname'))
+    })
     foreach ($cg in $appData['SslCipherGroups']) {
         $cgName = Get-NitroProp $cg 'ciphergroupname'
         try {
@@ -1264,12 +1352,35 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         }
     }
 
-    # Backend (service group) SSL/TLS parameters — NetScaler-to-server communication
-    $appData['SslServiceGroups'] = @(Collect 'sslservicegroup' 'Backend SSL service groups')
+    # A vserver/profile that binds a named cipher GROUP (rather than individual suites) gets that
+    # binding back from NITRO as one entry whose 'cipheraliasname' is the group's own name, not its
+    # member suites - so a health check comparing CipherBindings against a suite-name allow-list would
+    # flag the group's name itself as "not recommended" even when its members are exactly right.
+    # ConvertFrom-NsConfig already expands group bindings into their member suites when parsing a
+    # static ns.conf export (see its 'bind ssl vserver/profile' cases); mirror that here so both paths
+    # converge on the same CipherBindings semantics - always real suite names, never a group alias.
+    # Scoped to user-defined groups only (not the broader SslCipherGroups display list above) -
+    # expanding a built-in group's dozens of members into the SSL-013/014 recommended-cipher
+    # comparison would just be noise for every environment still on its default profile ciphers.
+    $cipherGroupMembers = [System.Collections.Generic.Dictionary[string,string[]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($cg in $appData['SslCipherGroups'] | Where-Object { (Get-NitroProp $_ 'description') -eq 'User Defined Cipher Group' }) {
+        $cipherGroupMembers[(Get-NitroProp $cg 'ciphergroupname')] = @($cg.MemberCiphers)
+    }
+    if ($cipherGroupMembers.Count -gt 0) {
+        foreach ($holder in (@($appData['SslVservers']) + @($appData['SslProfiles']))) {
+            $expanded = [System.Collections.Generic.List[string]]::new()
+            foreach ($c in @($holder.CipherBindings)) {
+                if ($cipherGroupMembers.ContainsKey($c)) { foreach ($m in $cipherGroupMembers[$c]) { [void]$expanded.Add($m) } }
+                else { [void]$expanded.Add($c) }
+            }
+            $holder.CipherBindings = @($expanded)
+        }
+    }
 
     # -- Citrix Gateway ---
     Set-CollectStatus "[$appName] Citrix Gateway..." -Progress ($appBase + 18) -Sub $appHost
     $appData['VpnVservers']       = @(Collect 'vpnvserver'               'VPN vservers')
+    $appData['AuthVservers']      = @(Collect 'authenticationvserver'    'Authentication (AAA) vservers')
     $appData['VpnSessionPolicies'] = @(Collect 'vpnsessionpolicy'         'VPN session policies')
     $appData['AuthLdapActions']   = @(Collect 'authenticationldapaction'  'LDAP actions')
     $appData['AuthSamlActions']   = @(Collect 'authenticationsamlaction'  'SAML actions')

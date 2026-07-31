@@ -1,5 +1,5 @@
 {
-  "generated": "2026-07-30",
+  "generated": "2026-07-31",
   "files": [
     {
       "name": "Get-AVDData.ps1",
@@ -24,16 +24,16 @@
     },
     {
       "name": "Get-NetScalerData.ps1",
-      "version": "2026-07-30.1",
-      "sha256": "59AE30A7820350D4E09C4158BAC20A7242B9E7FEA684C229F1269C18BD7323E4",
-      "size": 77386,
+      "version": "2026-07-31.7",
+      "sha256": "7018698A4679F390BE66C35358D651606F42EF682E39241B537E52ECDD581427",
+      "size": 86105,
       "signed": false
     },
     {
       "name": "Get-OnPremComponentsData.ps1",
-      "version": "2026-07-23.2",
-      "sha256": "CBD7BE5E23098360F113E5F3DD7A5D0DFC410F62BD751DF37994932B92FB4229",
-      "size": 199724,
+      "version": "2026-07-31",
+      "sha256": "2B6FDAF69AB8850BC362E75B99EA4C2528D48B1B7FF707D93B172D4AF3E3077B",
+      "size": 209457,
       "signed": false
     },
     {
