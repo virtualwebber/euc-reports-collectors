@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 2026-07-24.2   (keep in lock-step with $script:_version below)
+# Version: 2026-07-31   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -115,7 +115,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 }
 #endregion
 
-$script:_version      = '2026-07-24.2'
+$script:_version      = '2026-07-31'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -2112,8 +2112,16 @@ function Get-SessionHistory {
     if ($sample -and @($sample).Count -gt 0) {
         $props = @(@($sample)[0].PSObject.Properties.Name)
         Write-Log "Connection properties: $($props -join ', ')"
-        $startField = @('EstablishmentDate','LogOnStartDate','BrokeringDate','StartDate','ConnectionDate') | Where-Object { $props -contains $_ } | Select-Object -First 1
-        $endFields  = @('DisconnectDate','LogOffDate','LogOnEndDate','TerminationDate','EndDate','ExitDate') | Where-Object { $props -contains $_ }
+        # BrokeringDate first: it coincides with the session's own StartDate, so the connected
+        # interval lines up with the active interval. EstablishmentDate is ~17s later (HDX
+        # handshake), which would otherwise render a spurious "peak disconnected 1" for a day on
+        # which nothing ever disconnected.
+        $startField = @('BrokeringDate','EstablishmentDate','LogOnStartDate','StartDate','ConnectionDate') | Where-Object { $props -contains $_ } | Select-Object -First 1
+        # TERMINATION fields only. LogOnEndDate must NOT be here: it is a logon-phase milestone
+        # (equal to EstablishmentDate on a fast logon), so on a still-live connection - where
+        # DisconnectDate is legitimately null - it collapses the connection to a zero-length
+        # interval and the active session is charted as disconnected for its entire life.
+        $endFields  = @('DisconnectDate','LogOffDate','TerminationDate','EndDate','ExitDate') | Where-Object { $props -contains $_ }
         if ($startField) {
             $cFilter = [Uri]::EscapeDataString("$startField ge cast($since,Edm.DateTimeOffset)")
             $cRows   = Get-MonitorOData "Connections?`$filter=$cFilter"
@@ -2150,8 +2158,13 @@ function Get-SessionHistory {
         if ($rs -lt $dayEnd -and $effEnd -gt $dayStart) {
             $cs = if ($rs -gt $dayStart) { $rs } else { $dayStart }
             $ce = if ($effEnd -lt $dayEnd) { $effEnd } else { $dayEnd }
-            [void]$events.Add([pscustomobject]@{ T = $cs; D = 1;  K = $kind })
-            [void]$events.Add([pscustomobject]@{ T = $ce; D = -1; K = $kind })
+            # Skip zero-length / inverted intervals. The sort puts -1 before +1 at an equal
+            # timestamp, so a start==end pair would decrement first and drive the running count
+            # to -1, inflating the derived disconnected figure above the session count.
+            if ($ce -gt $cs) {
+                [void]$events.Add([pscustomobject]@{ T = $cs; D = 1;  K = $kind })
+                [void]$events.Add([pscustomobject]@{ T = $ce; D = -1; K = $kind })
+            }
         }
     }
 
@@ -2164,7 +2177,11 @@ function Get-SessionHistory {
     foreach ($name in ($sessByDg.Keys | Sort-Object)) {
         $dgSess = $sessByDg[$name]
         $dgConn = if ($connByDg.ContainsKey($name)) { $connByDg[$name] } else { @() }
-        $dgId   = "$((@($dgSess)[0])['DeliveryGroupId'])"
+        # Index the List directly - NO @() wrapper. @($listOfOneOrderedDict)[0] enumerates that lone
+        # [ordered] dict into its key/value pairs and hands back a DictionaryEntry, so
+        # ['DeliveryGroupId'] then throws "Argument types do not match". Only reproduces when a
+        # delivery group has exactly one session in the window.
+        $dgId   = "$($dgSess[0]['DeliveryGroupId'])"
 
         $points = [System.Collections.Generic.List[object]]::new()
         $peakC = 0; $peakD = 0
@@ -2176,13 +2193,27 @@ function Get-SessionHistory {
             foreach ($r in $dgConn) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'C' }
 
             $active = 0; $connected = 0; $dayC = 0; $dayD = 0
-            foreach ($ev in ($events | Sort-Object @{ E = { $_.T } }, @{ E = { $_.D } })) {
-                if ($ev.K -eq 'S') { $active += $ev.D } else { $connected += $ev.D }
+            # Apply EVERY event sharing a timestamp before sampling the peaks. A session and its own
+            # connection start at the same instant, so sampling between the two increments reports
+            # one disconnected session that never existed.
+            $sorted = @($events | Sort-Object @{ E = { $_.T } }, @{ E = { $_.D } })
+            $ei = 0
+            while ($ei -lt $sorted.Count) {
+                $t = $sorted[$ei].T
+                while ($ei -lt $sorted.Count -and $sorted[$ei].T -eq $t) {
+                    if ($sorted[$ei].K -eq 'S') { $active += $sorted[$ei].D } else { $connected += $sorted[$ei].D }
+                    $ei++
+                }
                 if ($active -gt $dayC) { $dayC = $active }
                 if ($discAvailable) {
+                    # Disconnected sessions are a SUBSET of active ones, so the derived figure can
+                    # never exceed $active - clamp to that invariant rather than trusting the
+                    # arithmetic. Without it, any connection-pairing anomaly silently renders as
+                    # "more disconnected than there are sessions".
                     $disc = $active - $connected
-                    if ($disc -lt 0) { $disc = 0 }
-                    if ($disc -gt $dayD) { $dayD = $disc }
+                    if ($disc -lt 0)       { $disc = 0 }
+                    if ($disc -gt $active) { $disc = $active }
+                    if ($disc -gt $dayD)   { $dayD = $disc }
                 }
             }
             if ($dayC -gt $peakC) { $peakC = $dayC }
@@ -2194,7 +2225,7 @@ function Get-SessionHistory {
             DeliveryGroup   = $name
             DeliveryGroupId = $dgId
             WindowDays      = $days
-            Total           = @($dgSess).Count
+            Total           = $dgSess.Count   # not @($dgSess).Count - same lone-ordered-dict trap
             PeakC           = $peakC
             PeakD           = $peakD
             DiscAvailable   = $discAvailable

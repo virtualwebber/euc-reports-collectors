@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-31   (must match $script:_version below and the published .version file)
+# Version: 2026-07-31.1   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -137,7 +137,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version = '2026-07-31'
+$script:_version = '2026-07-31.1'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -1786,6 +1786,8 @@ $script:_brokerBlock = {
         Administrators     = @()
         Sessions           = @()
         Policies           = @()
+        LogonPerformance   = @()
+        SessionHistory     = @()
         SessionDetailCollected = $false
         Databases          = @()
         SqlExpressInstalled = $false
@@ -1807,6 +1809,52 @@ $script:_brokerBlock = {
     $site['SdkAvailable'] = $true
     $str = { param($v) if ($null -eq $v) { '' } else { "$v" } }
     $iso = { param($v) if ($v) { try { ([datetime]$v).ToString('o') } catch { "$v" } } else { '' } }
+    $utc = { param($v) if ($v) { try { ([datetime]$v).ToUniversalTime() } catch { $null } } else { $null } }
+
+    # Monitor OData (Director data) helpers. Gated on the Monitor snap-in, which is what exposes
+    # Get-MonitorServiceInstance for endpoint discovery.
+    $monitorWanted = [bool](Get-Command Get-MonitorServiceInstance -ErrorAction SilentlyContinue)
+
+    # A single OData GET. Both checks matter: /Director/OData/... answers HTTP 200 with Director's
+    # HTML login page, so a status-only check would happily parse a login form as monitoring data.
+    function Get-MonJson ([string]$Url, [int]$TimeoutSec = 300) {
+        $r = Invoke-WebRequest -Uri $Url -UseDefaultCredentials -UseBasicParsing -TimeoutSec $TimeoutSec
+        if ([int]$r.StatusCode -ne 200) { throw "HTTP $($r.StatusCode)" }
+        if ("$($r.Headers['Content-Type'])" -notmatch 'json') { throw "non-JSON response ($($r.Headers['Content-Type']))" }
+        return ($r.Content | ConvertFrom-Json)
+    }
+
+    # Pages an OData query by following @odata.nextLink (which may be absolute OR relative - a
+    # relative link passed back as a full URL would fail and silently stop after page one).
+    function Get-MonOData ([string]$Base, [string]$Rel, [int]$MaxPages = 500) {
+        $all = New-Object System.Collections.Generic.List[object]
+        $url = "$Base/$Rel"
+        $page = 0
+        while ($url -and $page -lt $MaxPages) {
+            $resp = Get-MonJson $url
+            if (-not $resp) { break }
+            $val = if ($resp.PSObject.Properties['value']) { $resp.value } else { @($resp) }
+            foreach ($it in @($val)) { if ($null -ne $it) { [void]$all.Add($it) } }
+            $next = if ($resp.PSObject.Properties['@odata.nextLink']) { "$($resp.'@odata.nextLink')" } else { '' }
+            if ($next) { try { $url = [Uri]::new([Uri]$url, $next).AbsoluteUri } catch { $url = $next } } else { $url = '' }
+            $page++
+        }
+        return ,$all.ToArray()
+    }
+
+    # MachineId -> delivery group, for when $expand is accepted but not honoured.
+    function Get-MonDgMap ([string]$Base) {
+        $map = @{}
+        $dgName = @{}
+        foreach ($d in @(Get-MonOData $Base 'DesktopGroups?$select=Id,Name')) {
+            if ($null -ne $d) { $dgName["$($d.Id)"] = "$($d.Name)" }
+        }
+        foreach ($m in @(Get-MonOData $Base 'Machines?$select=Id,DesktopGroupId')) {
+            if ($null -eq $m -or -not "$($m.DesktopGroupId)") { continue }
+            $map["$($m.Id)"] = [pscustomobject]@{ Id = "$($m.DesktopGroupId)"; Name = "$($dgName["$($m.DesktopGroupId)"])" }
+        }
+        return $map
+    }
 
     # Zones (also build a Uid->Name map for catalogs/machines/hosting).
     $zoneName = @{}
@@ -2136,6 +2184,275 @@ $script:_brokerBlock = {
         }
     } else {
         $collStatus['TaintedAccounts'] = 'Unavailable'
+    }
+
+    # ── Director data (Monitor OData): logon performance + session history ────────────────────
+    # The source is the Citrix MONITOR SERVICE, which is a core service installed on EVERY
+    # Delivery Controller. Citrix Director is only a web UI over this same endpoint and does not
+    # need to be installed anywhere - verified against a DDC with no Director, where the endpoint
+    # still answers. So this is collected from the controller we are already connected to, and a
+    # Director server is never a collection target. (Note /Director/OData/... also returns HTTP
+    # 200 but serves Director's HTML LOGIN PAGE, not OData - hence the content-type check below.)
+    #
+    # The endpoint is discovered from the site via Get-MonitorServiceInstance rather than guessed,
+    # but only the HOST is taken from the registration: the registered instances advertise OData
+    # v1/v2/v3 and NOT v4, even though v4 is the JSON endpoint. v3 serves Atom XML and is not
+    # parsed here - a site too old to expose v4 records 'Unavailable' rather than a vacuous empty.
+    if ($monitorWanted) {
+        $monBase = ''
+        $monHosts = New-Object System.Collections.Generic.List[string]
+        try {
+            foreach ($si in @(Get-MonitorServiceInstance -ErrorAction Stop)) {
+                if ("$($si.Address)" -match '^https?://([^/:]+)') {
+                    $h = $matches[1]
+                    if (-not $monHosts.Contains($h)) { [void]$monHosts.Add($h) }
+                }
+            }
+        } catch { $site['Messages'] += "Get-MonitorServiceInstance: $($_.Exception.Message)" }
+        # Fall back to this controller itself when the registration can't be read - we are already
+        # running on a DDC, so the Monitor service is local by definition.
+        if ($monHosts.Count -eq 0) { [void]$monHosts.Add("$env:COMPUTERNAME") }
+
+        $savedCb = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+        try {
+            # A DDC's HTTPS binding is usually an internal or self-signed cert. This is a single hop
+            # to our own site's monitoring data, so cert trust is not the control that matters here.
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+            try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12 } catch { }
+
+            # HTTPS first, then HTTP - but validated on the RESPONSE, not on the absence of an
+            # exception. A DDC with a 443 binding but no OData mapping returns HTTP 404 (observed on
+            # the lab), which a plain try/catch would happily accept as a working endpoint.
+            foreach ($mh in $monHosts) {
+                foreach ($scheme in 'https', 'http') {
+                    if ($monBase) { break }
+                    # ${scheme} braces are required: "$scheme://..." parses $scheme: as a namespace
+                    # qualifier (like $env:) and silently yields a malformed URL.
+                    $cand = "${scheme}://${mh}/Citrix/Monitor/OData/v4/Data"
+                    try { $null = Get-MonJson $cand 30; $monBase = $cand } catch { }
+                }
+                if ($monBase) { break }
+            }
+
+            if (-not $monBase) {
+                $collStatus['LogonPerformance'] = 'Unavailable'
+                $collStatus['SessionHistory']   = 'Unavailable'
+                $site['Messages'] += "Monitor OData v4 endpoint not reachable on: $($monHosts -join ', ')"
+            } else {
+                $site['Messages'] += "Monitor OData endpoint: $monBase"
+
+                # Machine -> delivery group fallback map. $expand IS accepted on-prem, but an older
+                # Monitor build can accept the parameter and ignore it; without this every row would
+                # be silently dropped for having no delivery group. Built once, lazily.
+                $dgMap = $null
+
+                # --- Logon performance (14 days) ---------------------------------------------
+                # Same window, filter and output shape as the cloud collector so the report renders
+                # CVAD and DaaS identically. RAW rows only - the report does the aggregation.
+                try {
+                    $since  = (Get-Date).ToUniversalTime().AddDays(-14).ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    $filter = [Uri]::EscapeDataString("StartDate gt cast($since,Edm.DateTimeOffset) and LogOnDuration ne null")
+                    $expand = [Uri]::EscapeDataString('Machine($expand=DesktopGroup($select=Id,Name))')
+                    # MachineId is selected purely so the fallback join can work when $expand is ignored.
+                    $select = [Uri]::EscapeDataString('SessionKey,StartDate,LogOnDuration,MachineId')
+                    $rows   = Get-MonOData $monBase "Sessions?`$select=$select&`$expand=$expand&`$filter=$filter"
+                    $lp     = New-Object System.Collections.Generic.List[object]
+                    $noDg   = 0
+                    foreach ($s in @($rows)) {
+                        if ($null -eq $s) { continue }
+                        $dg = if ($s.Machine -and $s.Machine.DesktopGroup -and "$($s.Machine.DesktopGroup.Name)") { $s.Machine.DesktopGroup } else {
+                            if ($null -eq $dgMap) { $dgMap = Get-MonDgMap $monBase }
+                            $dgMap["$($s.MachineId)"]
+                        }
+                        if (-not $dg -or -not "$($dg.Name)") { $noDg++; continue }
+                        [void]$lp.Add([ordered]@{
+                            DeliveryGroup   = "$($dg.Name)"
+                            DeliveryGroupId = "$($dg.Id)"
+                            StartDate       = (& $iso $s.StartDate)
+                            LogOnDurationMs = $(if ($null -eq $s.LogOnDuration) { $null } else { [int]$s.LogOnDuration })
+                        })
+                    }
+                    $site['LogonPerformance'] = $lp.ToArray()
+                    $collStatus['LogonPerformance'] = 'Collected'
+                    $site['Messages'] += "Logon performance: $($lp.Count) measured logon(s) over 14 days$(if ($noDg) { ", $noDg without a delivery group" })"
+                } catch {
+                    $collStatus['LogonPerformance'] = 'Failed'
+                    $site['Messages'] += "LogonPerformance: $($_.Exception.Message) [line $($_.InvocationInfo.ScriptLineNumber)]"
+                }
+
+                # --- Session history (30 days, bucketed here) --------------------------------
+                # Per-DG daily peak concurrent + peak disconnected. Bucketed in the collector (not
+                # the report) so the JSON stays small on large estates and the report is a pure
+                # renderer - identical to the cloud collector's contract.
+                try {
+                    $days    = 30
+                    $sinceDt = [datetime]::UtcNow.Date.AddDays(-($days - 1))
+                    $since   = $sinceDt.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    $sFilter = [Uri]::EscapeDataString("EndDate eq null or EndDate ge cast($since,Edm.DateTimeOffset)")
+                    $sExpand = [Uri]::EscapeDataString('Machine($expand=DesktopGroup($select=Id,Name))')
+                    $sSelect = [Uri]::EscapeDataString('SessionKey,StartDate,EndDate,MachineId')
+                    $sRows   = Get-MonOData $monBase "Sessions?`$select=$sSelect&`$expand=$sExpand&`$filter=$sFilter"
+
+                    $sessions = New-Object System.Collections.Generic.List[object]
+                    $skipped  = 0
+                    foreach ($s in @($sRows)) {
+                        if ($null -eq $s) { continue }
+                        $dg = if ($s.Machine -and $s.Machine.DesktopGroup -and "$($s.Machine.DesktopGroup.Name)") { $s.Machine.DesktopGroup } else {
+                            if ($null -eq $dgMap) { $dgMap = Get-MonDgMap $monBase }
+                            $dgMap["$($s.MachineId)"]
+                        }
+                        if (-not $dg -or -not "$($dg.Name)") { $skipped++; continue }
+                        $st = & $utc $s.StartDate
+                        if ($null -eq $st) { continue }
+                        [void]$sessions.Add([ordered]@{
+                            SessionKey      = "$($s.SessionKey)"
+                            DeliveryGroupId = "$($dg.Id)"
+                            DeliveryGroup   = "$($dg.Name)"
+                            Start           = $st
+                            End             = (& $utc $s.EndDate)   # $null = still active
+                        })
+                    }
+
+                    if ($sessions.Count -eq 0) {
+                        # Genuinely no sessions in the window is a real, collected answer - not a failure.
+                        $collStatus['SessionHistory'] = 'Collected'
+                        $site['Messages'] += "Session history: no sessions in the last $days days"
+                    } else {
+                        # Connections give the CONNECTED concurrency; disconnected = active - connected.
+                        # The Connection schema varies by version, so discover the date fields from a
+                        # sample row first - a blind $filter on a missing column 400s the whole query.
+                        $conns = New-Object System.Collections.Generic.List[object]
+                        $discAvailable = $false
+                        $keyToDg = @{}
+                        foreach ($s in $sessions) { $k = "$($s['SessionKey'])"; if ($k -and -not $keyToDg.ContainsKey($k)) { $keyToDg[$k] = $s } }
+                        $sample = Get-MonOData $monBase 'Connections?$top=1'
+                        if ($sample -and @($sample).Count -gt 0) {
+                            $props = @(@($sample)[0].PSObject.Properties.Name)
+                            # BrokeringDate first: it coincides with the session's own StartDate, so the
+                            # connected interval lines up with the active interval. EstablishmentDate is
+                            # ~17s later (HDX handshake), which would otherwise render a spurious
+                            # "peak disconnected 1" for a day on which nothing ever disconnected.
+                            $startField = @('BrokeringDate','EstablishmentDate','LogOnStartDate','StartDate','ConnectionDate') | Where-Object { $props -contains $_ } | Select-Object -First 1
+                            # TERMINATION fields only. LogOnEndDate must NOT be here: it is a logon-phase
+                            # milestone (equal to EstablishmentDate on a fast logon), so on a still-live
+                            # connection - where DisconnectDate is legitimately null - it collapses the
+                            # connection to a zero-length interval and the active session is charted as
+                            # disconnected for its entire life.
+                            $endFields  = @('DisconnectDate','LogOffDate','TerminationDate','EndDate','ExitDate') | Where-Object { $props -contains $_ }
+                            if ($startField) {
+                                $cFilter = [Uri]::EscapeDataString("$startField ge cast($since,Edm.DateTimeOffset)")
+                                $cRows   = Get-MonOData $monBase "Connections?`$filter=$cFilter"
+                                foreach ($c in @($cRows)) {
+                                    if ($null -eq $c) { continue }
+                                    $ms = $keyToDg["$($c.SessionKey)"]
+                                    if (-not $ms) { continue }
+                                    $cStart = & $utc $c.$startField
+                                    if ($null -eq $cStart) { continue }
+                                    $cEnd = $null
+                                    foreach ($f in $endFields) { $v = & $utc $c.$f; if ($null -ne $v) { $cEnd = $v; break } }
+                                    [void]$conns.Add([ordered]@{ DeliveryGroup = $ms['DeliveryGroup']; Start = $cStart; End = $cEnd })
+                                }
+                                $discAvailable = ($conns.Count -gt 0)
+                            } else {
+                                $site['Messages'] += "Connections: no recognised start-date field among [$($props -join ', ')]; disconnected series unavailable"
+                            }
+                        }
+
+                        # Clamp each interval to a UTC day and sweep +1/-1 events (ends before starts
+                        # at equal timestamps) to find that day's peak active and peak disconnected.
+                        $addEvents = {
+                            param($events, $rs, $re, $dayStart, $dayEnd, $kind)
+                            $effEnd = if ($null -eq $re) { $dayEnd } else { $re }
+                            if ($rs -lt $dayEnd -and $effEnd -gt $dayStart) {
+                                $cs = if ($rs -gt $dayStart) { $rs } else { $dayStart }
+                                $ce = if ($effEnd -lt $dayEnd) { $effEnd } else { $dayEnd }
+                                # Skip zero-length / inverted intervals. The sort puts -1 before +1 at an
+                                # equal timestamp, so a start==end pair would decrement first and drive the
+                                # running count to -1, inflating the derived disconnected figure.
+                                if ($ce -gt $cs) {
+                                    [void]$events.Add([pscustomobject]@{ T = $cs; D = 1;  K = $kind })
+                                    [void]$events.Add([pscustomobject]@{ T = $ce; D = -1; K = $kind })
+                                }
+                            }
+                        }
+                        $sessByDgM = @{}
+                        foreach ($s in $sessions) { $n = "$($s['DeliveryGroup'])"; if (-not $sessByDgM.ContainsKey($n)) { $sessByDgM[$n] = New-Object System.Collections.Generic.List[object] }; [void]$sessByDgM[$n].Add($s) }
+                        $connByDgM = @{}
+                        foreach ($c in $conns)    { $n = "$($c['DeliveryGroup'])"; if (-not $connByDgM.ContainsKey($n)) { $connByDgM[$n] = New-Object System.Collections.Generic.List[object] }; [void]$connByDgM[$n].Add($c) }
+
+                        $shOut = New-Object System.Collections.Generic.List[object]
+                        foreach ($name in ($sessByDgM.Keys | Sort-Object)) {
+                            $dgSess = $sessByDgM[$name]
+                            $dgConn = if ($connByDgM.ContainsKey($name)) { $connByDgM[$name] } else { @() }
+                            # Index the List directly - NO @() wrapper. @($listOfOneOrderedDict)[0]
+                            # enumerates that lone [ordered] dict into its key/value pairs and hands
+                            # back a DictionaryEntry, so ['DeliveryGroupId'] then throws "Argument
+                            # types do not match". Only reproduces when a DG has exactly one session.
+                            $dgId   = "$($dgSess[0]['DeliveryGroupId'])"
+                            $points = New-Object System.Collections.Generic.List[object]
+                            $peakC = 0; $peakD = 0
+                            for ($i = 0; $i -lt $days; $i++) {
+                                $dayStart = $sinceDt.AddDays($i)
+                                $dayEnd   = $dayStart.AddDays(1)
+                                $events   = New-Object System.Collections.Generic.List[object]
+                                foreach ($r in $dgSess) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'S' }
+                                foreach ($r in $dgConn) { & $addEvents $events $r['Start'] $r['End'] $dayStart $dayEnd 'C' }
+                                $active = 0; $connected = 0; $dayC = 0; $dayD = 0
+                                # Apply EVERY event sharing a timestamp before sampling the peaks. A session
+                                # and its own connection start at the same instant, so sampling between the
+                                # two increments reports one disconnected session that never existed.
+                                $sorted = @($events | Sort-Object @{ E = { $_.T } }, @{ E = { $_.D } })
+                                $ei = 0
+                                while ($ei -lt $sorted.Count) {
+                                    $t = $sorted[$ei].T
+                                    while ($ei -lt $sorted.Count -and $sorted[$ei].T -eq $t) {
+                                        if ($sorted[$ei].K -eq 'S') { $active += $sorted[$ei].D } else { $connected += $sorted[$ei].D }
+                                        $ei++
+                                    }
+                                    if ($active -gt $dayC) { $dayC = $active }
+                                    if ($discAvailable) {
+                                        # Disconnected sessions are a SUBSET of active ones, so the derived
+                                        # figure can never exceed $active - clamp to that invariant rather
+                                        # than trusting the arithmetic. Without it, any connection-pairing
+                                        # anomaly silently renders as "more disconnected than there are
+                                        # sessions", which is the shape of a real bug this caught.
+                                        $disc = $active - $connected
+                                        if ($disc -lt 0)       { $disc = 0 }
+                                        if ($disc -gt $active) { $disc = $active }
+                                        if ($disc -gt $dayD)   { $dayD = $disc }
+                                    }
+                                }
+                                if ($dayC -gt $peakC) { $peakC = $dayC }
+                                if ($dayD -gt $peakD) { $peakD = $dayD }
+                                [void]$points.Add([ordered]@{ Date = $dayStart.ToString('yyyy-MM-ddTHH:mm:ssZ'); Conc = $dayC; Disc = $dayD })
+                            }
+                            [void]$shOut.Add([ordered]@{
+                                DeliveryGroup   = $name
+                                DeliveryGroupId = $dgId
+                                WindowDays      = $days
+                                Total           = $dgSess.Count   # not @($dgSess).Count - same lone-ordered-dict trap
+                                PeakC           = $peakC
+                                PeakD           = $peakD
+                                DiscAvailable   = $discAvailable
+                                Points          = $points.ToArray()
+                            })
+                        }
+                        # .ToArray() not @(...) - see the Policies note above.
+                        $site['SessionHistory'] = $shOut.ToArray()
+                        $collStatus['SessionHistory'] = 'Collected'
+                        $site['Messages'] += "Session history: $($sessions.Count) session(s) over $days days, bucketed into $($shOut.Count) delivery group(s) (disconnected: $(if ($discAvailable) { 'available' } else { 'unavailable' }))$(if ($skipped) { ", $skipped without a delivery group" })"
+                    }
+                } catch {
+                    $collStatus['SessionHistory'] = 'Failed'
+                    $site['Messages'] += "SessionHistory: $($_.Exception.Message) [line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())]"
+                }
+            }
+        } finally {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $savedCb
+        }
+    } else {
+        $collStatus['LogonPerformance'] = 'Unavailable'
+        $collStatus['SessionHistory']   = 'Unavailable'
     }
 
     # Databases + SQL Express. The three CVAD databases (Site / Monitoring / Configuration Logging) each
@@ -2983,7 +3300,10 @@ function Write-OnPremSiteJson ($Site, $Files) {
         Databases          = @($Site.Databases)
         SqlExpressInstalled = [bool]$Site.SqlExpressInstalled
         SqlExpressInstances = @($Site.SqlExpressInstances)
-        LogonPerformance   = @()
+        # Director data from the Monitor service on the DDC (empty when Monitor is unreachable or
+        # the window holds no sessions - CollectionStatus distinguishes the two).
+        LogonPerformance   = @($Site.LogonPerformance)
+        SessionHistory     = @($Site.SessionHistory)
     }
     $safe = ("$($script:_customer)" -replace '[^\w\-]', '_').Trim('_'); if (-not $safe) { $safe = 'OnPrem' }
     $outFile = Join-Path $script:_outputDir "$safe-CVAD-Site-$($now.ToString('yyyyMMdd-HHmmss')).json"

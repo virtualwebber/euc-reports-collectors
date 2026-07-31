@@ -17,9 +17,9 @@
     },
     {
       "name": "Get-CitrixCloudData.ps1",
-      "version": "2026-07-24.2",
-      "sha256": "1B265B892BE070E3CC38D94E24D07211EC8EE6020016B6F5420486D011B5E2FB",
-      "size": 202962,
+      "version": "2026-07-31",
+      "sha256": "EEF6DEB77378E2E462131E75019849BC9885E63632013EA70131815F4FF9AA54",
+      "size": 205326,
       "signed": false
     },
     {
@@ -31,9 +31,9 @@
     },
     {
       "name": "Get-OnPremComponentsData.ps1",
-      "version": "2026-07-31",
-      "sha256": "2B6FDAF69AB8850BC362E75B99EA4C2528D48B1B7FF707D93B172D4AF3E3077B",
-      "size": 209457,
+      "version": "2026-07-31.1",
+      "sha256": "15A4F6C84E6FB5027E7CA1CCA1686ABC9B3EBD9BCB8E6A074FD93EFBD0278E61",
+      "size": 232244,
       "signed": false
     },
     {
