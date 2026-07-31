@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-31.2   (must match $script:_version below and the published .version file)
+# Version: 2026-07-31.3   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -137,7 +137,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version = '2026-07-31.2'
+$script:_version = '2026-07-31.3'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -3272,10 +3272,16 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
 # vacuous pass. Written ONCE (not per perf tick). Honours -EncryptPassword via Protect-CitrixData.
 function Write-OnPremSiteJson ($Site, $Files) {
     $now = Get-Date
+    # Label for the file name AND CustomerName. When -Customer was not supplied, fall back to the SITE
+    # name rather than the literal 'OnPrem'. By the time this runs the site name is known (it came from
+    # the DDC), and it is the far better label: the file stays identifiable, and - more importantly - an
+    # empty CustomerName makes the report fall back to a "Citrix DaaS" heading on an ON-PREM report.
+    $custName = "$($script:_customer)".Trim()
+    if (-not $custName) { $custName = "$($Site.SiteName)".Trim() }
     $output = [ordered]@{
         GeneratedAt            = $now.ToString('o')
         CollectorVersion       = $script:_version
-        CustomerName           = "$($script:_customer)"
+        CustomerName           = $custName
         CustomerId             = ''
         CollectionErrors       = @($Site.Messages).Count
         CollectionStatus       = $(if ($Site.CollectionStatus) { $Site.CollectionStatus } else { [ordered]@{} })
@@ -3313,7 +3319,8 @@ function Write-OnPremSiteJson ($Site, $Files) {
         LogonPerformance   = @($Site.LogonPerformance)
         SessionHistory     = @($Site.SessionHistory)
     }
-    $safe = ("$($script:_customer)" -replace '[^\w\-]', '_').Trim('_'); if (-not $safe) { $safe = 'OnPrem' }
+    # 'OnPrem' remains the last resort for the pathological case of no customer AND no site name.
+    $safe = ("$custName" -replace '[^\w\-]', '_').Trim('_'); if (-not $safe) { $safe = 'OnPrem' }
     $outFile = Join-Path $script:_outputDir "$safe-CVAD-Site-$($now.ToString('yyyyMMdd-HHmmss')).json"
     $encrypt = ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
     if ($encrypt) { $outFile = [System.IO.Path]::ChangeExtension($outFile, 'cdenc') }
