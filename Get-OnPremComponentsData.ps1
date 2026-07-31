@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-31.1   (must match $script:_version below and the published .version file)
+# Version: 2026-07-31.2   (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -137,7 +137,7 @@ function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Pass
 # Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version = '2026-07-31.1'
+$script:_version = '2026-07-31.2'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -997,9 +997,17 @@ function Show-OnPremDialog {
         $on = [bool]$perfChk.IsChecked
         $durationBox.IsEnabled = $on
         $liveViewChk.IsEnabled = $on
-        if (-not $on) { $liveViewChk.IsChecked = $false }
+        # Live view follows the perf tick. Off: untick as well as disable, so a greyed-out tick can't
+        # imply monitoring is still coming. On: restore the live-view default the dialog shipped with
+        # back when performance sampling was itself the default - otherwise enabling perf would
+        # silently give you no live view.
+        $liveViewChk.IsChecked = $on
     }
     $perfChk.Add_Checked($syncPerf); $perfChk.Add_Unchecked($syncPerf)
+    # Apply it once for the INITIAL state too - the events only fire on a change, so with performance
+    # sampling now off by default the dialog would otherwise open with the duration box and live-view
+    # tick still enabled (and live view ticked) under an unticked "Capture live performance".
+    & $syncPerf
 
     $result = [ordered]@{ Action = 'Cancel'; Servers = @(); DurationMinutes = 30; Credential = $null; Customer = ''; LiveView = $false; NoPerf = $false; EncryptPassword = $null }
 

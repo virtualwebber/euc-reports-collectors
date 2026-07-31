@@ -31,9 +31,9 @@
     },
     {
       "name": "Get-OnPremComponentsData.ps1",
-      "version": "2026-07-31.1",
-      "sha256": "15A4F6C84E6FB5027E7CA1CCA1686ABC9B3EBD9BCB8E6A074FD93EFBD0278E61",
-      "size": 232244,
+      "version": "2026-07-31.2",
+      "sha256": "0D667310177ED2E45D429DEEA51E6363E3063ED4DF0F2CF763F7B5251B9E19BB",
+      "size": 232879,
       "signed": false
     },
     {
