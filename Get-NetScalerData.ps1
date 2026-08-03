@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-08-03.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -57,7 +57,6 @@ param(
     [string]$OutputPath = (Get-Location).Path,
 
     [Parameter()]
-    [Parameter()]
     [switch]$SkipUpdateCheck,
 
     [Parameter()]
@@ -84,7 +83,7 @@ param(
     [switch]$NoProtect
 )
 
-$script:CollectorVersion = '2026-08-03'
+$script:CollectorVersion = '2026-08-03.1'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -895,9 +894,8 @@ function Show-CollectorDialog {
               Style="{StaticResource GreyBtn}"/>
     </Grid>
 
-    <!-- Optional data-file encryption -->
-                 Background="White" BorderBrush="#CDD0D6" BorderThickness="1"/>
-    <TextBlock Text="Leave blank for a plain .json. With a password the file is written as .cdenc and the report asks for it."
+    <!-- Data-file protection is automatic (certificate) - there is nothing to ask the operator. -->
+    <TextBlock Text="The collected data file is encrypted automatically with the EUC Reports data-protection certificate (.cdenc)."
                FontSize="10" Foreground="#8a8f98" TextWrapping="Wrap" Margin="0,0,0,16"/>
 
     <!-- Error text -->

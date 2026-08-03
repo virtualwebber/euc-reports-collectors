@@ -3,9 +3,9 @@
     "files":  [
                   {
                       "name":  "Get-AVDData.ps1",
-                      "version":  "2026-08-03",
-                      "sha256":  "A9088932AFFD786B4B7178F2CC193742DD9E090BCE0023C03001A8FD271E41A5",
-                      "size":  193439,
+                      "version":  "2026-08-03.1",
+                      "sha256":  "624450FD74A3D03FFA9464F1ED4F425375E05735A6263256E3EE30542AA2F7B5",
+                      "size":  193232,
                       "signed":  false
                   },
                   {
@@ -17,9 +17,9 @@
                   },
                   {
                       "name":  "Get-NetScalerData.ps1",
-                      "version":  "2026-08-03",
-                      "sha256":  "7A8449D1B932E02291B5DC4E779C2E84FEB8ECC9B8A043C6336CBE6A471F3DFF",
-                      "size":  92029,
+                      "version":  "2026-08-03.1",
+                      "sha256":  "7055013AA53F30B360488ACAD17D34FF8F5C1F993626D559FA2BC191C112FBDF",
+                      "size":  91996,
                       "signed":  false
                   },
                   {
@@ -38,9 +38,9 @@
                   },
                   {
                       "name":  "Get-VsphereData.ps1",
-                      "version":  "2026-08-03",
-                      "sha256":  "A97BD025EDB3E5DE97588EA169C2A46964709ED2A22C77042FED0D90D61D3F34",
-                      "size":  100640,
+                      "version":  "2026-08-03.1",
+                      "sha256":  "E9B8E1A52C8584C387557B2637BCC15E530F800888C1690069E557BE70357DA4",
+                      "size":  101079,
                       "signed":  false
                   }
               ]

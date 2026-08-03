@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03   (keep in lock-step with $script:_version below and the published .version file)
+# Version: 2026-08-03.1   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -62,7 +62,7 @@ param(
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-08-03'
+$script:_version = '2026-08-03.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -1231,13 +1231,20 @@ $outDir = if ($safeCustomer) { Join-Path $script:_outputDir $safeCustomer } else
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $base = if ($safeCustomer) { "$safeCustomer-Vsphere-Data-$stamp" } else { "Vsphere-Data-$stamp" }
-$prot = $null   # set at write time; decides content and extension together
-$outFile = Join-Path $outDir "$base$ext"
+# The extension is not known until write time - protected output is .cdenc, -NoProtect is .json - so only
+# the stem is computed here. The writer completes the path and records it at SCRIPT scope: it is invoked
+# with & (a child scope), so anything it assigned to a plain variable would be discarded, leaving the
+# completion message naming a file that was never written.
+$outBase  = Join-Path $outDir $base
+$outFile  = $null   # set by $writer on the first write
+$script:_lastProt = $null
 $writer = {
     param($d)
     $j = $d | ConvertTo-Json -Depth 12
-    $prot = Protect-CollectorOutput $j; $j = $prot.Json; $ext = '.' + $prot.Ext
-    else { Set-Content -Path $outFile -Value $j -Encoding UTF8 }
+    $prot = Protect-CollectorOutput $j
+    $script:_lastProt = $prot
+    $script:outFile   = "$outBase.$($prot.Ext)"
+    Set-Content -Path $script:outFile -Value $prot.Json -Encoding UTF8
 }
 
 Show-Splash
@@ -1266,7 +1273,7 @@ Disconnect-Vsphere
 # Final write (idempotent - the monitoring loop already wrote each tick).
 try {
     & $writer $data
-    Write-Log "Output written: $outFile ($([math]::Round((Get-Item $outFile).Length/1KB,1)) KB)$(if ($prot.Ext -eq 'cdenc') { ' [certificate-protected]' })"
+    Write-Log "Output written: $outFile ($([math]::Round((Get-Item $outFile).Length/1KB,1)) KB)$(if ($script:_lastProt.Ext -eq 'cdenc') { ' [certificate-protected]' })"
 } catch { Write-Log "Failed to write output: $_" 'ERROR'; Show-MsgBox "Failed to write output:`n$($_.Exception.Message)" -Icon Error; exit 1 }
 
 Close-Splash

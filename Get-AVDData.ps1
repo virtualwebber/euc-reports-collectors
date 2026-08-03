@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-08-03.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Azure Virtual Desktop data across subscriptions and saves it as JSON.
@@ -26,9 +26,6 @@
 param(
     [Parameter()]
     [string]$OutputPath = (Get-Location).Path,
-    # Optional: encrypt the collected data file with this password (writes <name>.cdenc instead of
-    # .json). OFF by default - omit it and output stays plaintext .json exactly as before.
-    [Parameter()]
     # Skip the launch-time GitHub self-update check.
     [Parameter()]
     [switch]$SkipUpdateCheck,
@@ -42,7 +39,7 @@ param(
     [switch]$NoProtect
 )
 
-$script:CollectorVersion = '2026-08-03'
+$script:CollectorVersion = '2026-08-03.1'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:CollectorVersion, and the published .version file in lock-step.
