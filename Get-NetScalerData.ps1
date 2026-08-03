@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03.1   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-08-03.2   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -83,7 +83,7 @@ param(
     [switch]$NoProtect
 )
 
-$script:CollectorVersion = '2026-08-03.1'
+$script:CollectorVersion = '2026-08-03.2'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -1611,14 +1611,17 @@ Set-CollectStatus 'Saving data...' -Progress 92
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $safeName  = if ($customerName) { ($customerName -replace '[^A-Za-z0-9\-_]', '_').Trim('_') } else { 'NetScaler' }
-# With a password the payload is encrypted and written as .cdenc; without one it stays plain .json.
-$fileName  = "$safeName-NetScaler-Data-$timestamp.json"   # extension set by Protect-CollectorOutput below
-$filePath  = Join-Path $outPath $fileName
+# Protected output is .cdenc, -NoProtect is .json - so only the stem is known here. The full path is
+# built AFTER Protect-CollectorOutput reports the extension: it used to be built up front and only
+# $fileName was corrected afterwards, so the write still went to the stale .json path and every
+# encrypted file shipped with a .json extension.
+$fileStem = "$safeName-NetScaler-Data-$timestamp"
 
-$payload = $report | ConvertTo-Json -Depth 20
+$payload  = $report | ConvertTo-Json -Depth 20
 $prot     = Protect-CollectorOutput $payload
 $payload  = $prot.Json
-$fileName = [System.IO.Path]::ChangeExtension($fileName, $prot.Ext)
+$fileName = "$fileStem.$($prot.Ext)"
+$filePath = Join-Path $outPath $fileName
 $payload | Set-Content -Path $filePath -Encoding UTF8
 
 Set-CollectStatus 'Complete' -Progress 100 -Sub $filePath
