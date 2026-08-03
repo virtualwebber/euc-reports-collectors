@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03     (must match $script:_version below and the published .version file)
+# Version: 2026-08-03.2     (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -182,7 +182,7 @@ function Protect-CollectorOutput ([string]$PlainJson) {
 # Version: 2026-08-03 or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version = '2026-08-03'
+$script:_version = '2026-08-03.2'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -1163,7 +1163,12 @@ $script:_versionBlock = {
         # License Server - uninstall DisplayName "Citrix Licensing"; version is the Flexera scheme
         # (e.g. "11.17.2.0 build 47000"), not a CVAD YYMM release, so CvadLabel stays $null. Detecting
         # it here both lists its version and adds the 'License Server' role (drives the licensing block).
-        @{ Name = 'License Server'; Match = 'Citrix Licensing'; CvadLabel = $null }
+        # ExcludeRegex is REQUIRED, for the same reason StoreFront and PVS carry one: without it the
+        # -like "*Citrix Licensing*" fallback below matches "Citrix Licensing PowerShell Snap-In", which
+        # is installed on every Delivery Controller. That marked four DDCs as License Servers, so the
+        # report collected a licensing block for them and LS-001 reported the services as not running
+        # when they were simply never installed - a Red finding, in front of a customer, that was untrue.
+        @{ Name = 'License Server'; Match = 'Citrix Licensing'; ExcludeRegex = '(?i)Snap-?In|PowerShell|SDK|Config(uration)? Service|Service$'; CvadLabel = $null }
         # Delivery Controller - "Citrix Broker Service" is the tightest "this box is a Controller" signal;
         # CvadLabel also catches the CVAD bundle entry + YYMM release. Drives the site (Broker SDK) block.
         @{ Name = 'Delivery Controller'; Match = 'Citrix Broker Service'; CvadLabel = 'Delivery Controller' }
@@ -1890,7 +1895,9 @@ $script:_brokerBlock = {
     }
     $collStatus = $site['CollectionStatus']
     # ADIdentity is needed for tainted AD accounts (MC-002); AppLibrary for App-V/app packages.
-    foreach ($sn in 'Citrix.Broker.Admin.V2', 'Citrix.Configuration.Admin.V2', 'Citrix.Host.Admin.V2', 'Citrix.MachineCreation.Admin.V2', 'Citrix.DelegatedAdmin.Admin.V1', 'Citrix.Monitor.Admin.V1', 'Citrix.ConfigurationLogging.Admin.V1', 'Citrix.ADIdentity.Admin.V2', 'Citrix.AppLibrary.Admin.V1') {
+    # Citrix.Licensing.Admin.V1 is loaded here so the CONTROLLER can describe the licence position
+    # without the License Server being one of the collected servers - which it frequently is not.
+    foreach ($sn in 'Citrix.Broker.Admin.V2', 'Citrix.Configuration.Admin.V2', 'Citrix.Host.Admin.V2', 'Citrix.MachineCreation.Admin.V2', 'Citrix.DelegatedAdmin.Admin.V1', 'Citrix.Monitor.Admin.V1', 'Citrix.ConfigurationLogging.Admin.V1', 'Citrix.ADIdentity.Admin.V2', 'Citrix.AppLibrary.Admin.V1', 'Citrix.Licensing.Admin.V1') {
         try { Add-PSSnapin $sn -ErrorAction Stop } catch { }
     }
     if (-not (Get-Command Get-BrokerSite -ErrorAction SilentlyContinue)) {
@@ -1986,10 +1993,68 @@ $script:_brokerBlock = {
             $cs = Get-ConfigSite -ErrorAction Stop
             if ("$($cs.SiteGuid)") { $site['SiteId'] = "$($cs.SiteGuid)" }
             if ("$($cs.SiteName)") { $site['SiteName'] = "$($cs.SiteName)" }
+            # Licensing config the Broker SDK does not carry. LicenseServerUri is the :8083 admin URL
+            # Studio shows (LicenseServerPort on Get-BrokerSite is 27000, the check-out port - a
+            # different thing). LicensingBurnInDate is Studio's "Required CSS date": the Subscription
+            # Advantage / Customer Success Services date this RELEASE demands, so a licence whose CSS
+            # date is older is not entitled to run it.
+            $site['LicenseServerUri']           = "$($cs.LicenseServerUri)"
+            $site['LicensingBurnIn']            = "$($cs.LicensingBurnIn)"
+            $site['LicensingBurnInDate']        = (& $iso $cs.LicensingBurnInDate)
+            $site['UseLicenseActivationService'] = "$($cs.UseLicenseActivationService)"
         } catch { }
+
+        # ── Licence position, asked of the CONTROLLER ────────────────────────────────────────────
+        # Site-wide configuration, so this runs ONCE - on the controller the site was read from - not
+        # per server. It exists because the License Server is often not one of the collected servers,
+        # and without it the report can say nothing about licences at all.
+        #
+        # Every call is individually guarded: a controller without the Licensing SDK, an unreachable
+        # License Server, or a refused certificate must record a message and move on. Licensing being
+        # unreachable is exactly the condition worth reporting, so it must not abort the collection.
+        $lic = [ordered]@{ SdkAvailable = $false; AdminAddress = ''; ServerVersion = ''; ServerHost = ''
+                           ServerIp = ''; Editions = @(); Messages = @() }
+        if (Get-Command Get-LicLocation -ErrorAction SilentlyContinue) {
+            $lic['SdkAvailable'] = $true
+            try {
+                $addr = "$(Get-LicLocation -ErrorAction Stop)"
+                # Prefer the site's own LicenseServerUri: Get-LicLocation returns localhost when the
+                # License Server is co-located, which is useless in a report read by someone else.
+                $lic['AdminAddress'] = if ("$($cs.LicenseServerUri)") { "$($cs.LicenseServerUri)" } else { $addr }
+                $cert = Get-LicCertificate -AdminAddress $addr -ErrorAction Stop
+                try {
+                    $si = Get-LicServerInfo -AdminAddress $addr -ErrorAction Stop
+                    $lic['ServerVersion'] = "$($si.LSVersion)"; $lic['ServerHost'] = "$($si.HostName)"; $lic['ServerIp'] = "$($si.HostIP)"
+                } catch { $lic['Messages'] += "Get-LicServerInfo: $($_.Exception.Message)" }
+                # The friendly edition ("Premium") that Studio calls the Feature Group, plus the SA/CSS
+                # date per product. Deduplicated - several SKUs report the same edition.
+                try {
+                    $seen = @{}
+                    foreach ($e in @(Get-LicLasInventory -AdminAddress $addr -CertHash $cert.CertHash -ErrorAction Stop)) {
+                        $k = "$($e.LicenseProductName)|$($e.LicenseEdition)"
+                        if ($seen.ContainsKey($k)) { continue }
+                        $seen[$k] = $true
+                        $lic['Editions'] += [ordered]@{
+                            Product = "$($e.LocalizedLicenseProductName)"; Code = "$($e.LicenseProductName)"
+                            Edition = "$($e.LicenseLocalizedEdition)"; Model = "$($e.LocalizedLicenseModel)"
+                            Type = "$($e.LocalizedLicenseType)"; SaDate = "$($e.LicenseSubscriptionAdvantageDate)"
+                            Expires = (& $iso $e.LicenseExpirationDate)
+                            InUse = [int]$e.LicensesInUse; Available = [int]$e.LicensesAvailable
+                        }
+                    }
+                } catch { $lic['Messages'] += "Get-LicLasInventory: $($_.Exception.Message)" }
+            } catch { $lic['Messages'] += "Licensing SDK: $($_.Exception.Message)" }
+        } else {
+            $lic['Messages'] += 'Citrix Licensing SDK (Citrix.Licensing.Admin.V1) not available on this controller.'
+        }
+        $site['Licensing'] = $lic
+
         $site['ProductEdition'] = "$($bs.LicenseEdition)"
         $s = [ordered]@{}
-        foreach ($p in 'LocalHostCacheEnabled', 'ConnectionLeasingEnabled', 'SecureIcaRequired', 'LicenseModel', 'LicenseServerName', 'LicenseServerPort', 'LicenseEdition', 'LicensingGracePeriodActive', 'TrustRequestsSentToTheXmlServicePort', 'TrustManagedAnonymousXmlServiceRequests', 'DnsResolutionEnabled', 'ColorDepth', 'DefaultMinimumFunctionalLevel', 'ResourceLeasingEnabled', 'ReuseMachinesWithoutShutdownInOutageAllowed') {
+        # LicensingGraceHoursLeft says how long the grace period has left - the difference between
+        # "licensing is degraded" and "sessions stop in N hours". LicensesWithExpiredSwm names the SKUs
+        # whose Software Maintenance has lapsed, which is what actually blocks upgrading.
+        foreach ($p in 'LocalHostCacheEnabled', 'ConnectionLeasingEnabled', 'SecureIcaRequired', 'LicenseModel', 'LicenseServerName', 'LicenseServerPort', 'LicenseEdition', 'LicensingGracePeriodActive', 'LicensingGraceHoursLeft', 'LicensingOutOfBoxGracePeriodActive', 'LicenseGraceSessionsRemaining', 'LicensesWithExpiredSwm', 'PeakConcurrentLicenseUsers', 'TrustRequestsSentToTheXmlServicePort', 'TrustManagedAnonymousXmlServiceRequests', 'DnsResolutionEnabled', 'ColorDepth', 'DefaultMinimumFunctionalLevel', 'ResourceLeasingEnabled', 'ReuseMachinesWithoutShutdownInOutageAllowed') {
             $v = $bs.$p
             if ($null -eq $v) { continue }
             # Enums serialize as {value,Value} objects (case-colliding under PS7 ConvertFrom-Json) - stringify
@@ -2010,6 +2075,17 @@ $script:_brokerBlock = {
                 ControllerVersion  = "$($_.ControllerVersion)"
                 LastActivityTime   = (& $iso $_.LastActivityTime)
                 ActiveSiteServices = @($_.ActiveSiteServices | ForEach-Object { "$_" })
+                # Licensing state is PER CONTROLLER - this is the "Activation details" table Studio
+                # shows on its Licensing page, and the only place the activation data exists (there is
+                # no Get-LicLasActivation cmdlet). LastLicensingServerEvent carrying 'LasConnectionLost'
+                # is what Studio surfaces as "License Activation Service (LAS) cannot be reached".
+                LasActivationStatus             = "$($_.LasActivationStatus)"
+                LasActivationExpiry             = (& $iso $_.LasActivationExpiry)
+                LicensingServerState            = "$($_.LicensingServerState)"
+                LicensingGraceState             = "$($_.LicensingGraceState)"
+                LastLicensingServerEvent        = "$($_.LastLicensingServerEvent)"
+                LastLicensingServerEventTime    = (& $iso $_.LastLicensingServerEventTime)
+                LastLicensingServerEventDetails = @($_.LastLicensingServerEventDetails | ForEach-Object { "$_" })
             }
         })
         if (-not "$($site['ProductVersion'])" -and @($site['Controllers']).Count) { $site['ProductVersion'] = "$(@($site['Controllers'])[0].ControllerVersion)" }
@@ -3400,7 +3476,13 @@ function Write-OnPremSiteJson ($Site, $Files) {
         ProductRegistrations    = @()
         IdentityDomains         = @()
         # Site collections from the Delivery Controller.
-        Sites = @([ordered]@{ SiteId = "$($Site.SiteId)"; SiteName = "$($Site.SiteName)"; ProductCode = 'XDT'; ProductEdition = "$($Site.ProductEdition)"; ProductVersion = "$($Site.ProductVersion)"; CvadRelease = "$($Site.CvadRelease)"; CvadVersion = "$($Site.CvadVersion)"; CvadProduct = "$($Site.CvadProduct)"; Settings = $Site.Settings })
+        Sites = @([ordered]@{ SiteId = "$($Site.SiteId)"; SiteName = "$($Site.SiteName)"; ProductCode = 'XDT'; ProductEdition = "$($Site.ProductEdition)"; ProductVersion = "$($Site.ProductVersion)"; CvadRelease = "$($Site.CvadRelease)"; CvadVersion = "$($Site.CvadVersion)"; CvadProduct = "$($Site.CvadProduct)"; Settings = $Site.Settings
+                              # The controller's view of licensing (see the collection block). Separate
+                              # from, and no replacement for, the per-server Licensing block a real
+                              # License Server emits - both can be present in one report.
+                              LicenseServerUri = "$($Site.LicenseServerUri)"; LicensingBurnIn = "$($Site.LicensingBurnIn)"
+                              LicensingBurnInDate = "$($Site.LicensingBurnInDate)"; UseLicenseActivationService = "$($Site.UseLicenseActivationService)"
+                              Licensing = $Site.Licensing })
         Zones              = @($Site.Zones)
         DeliveryGroups     = @($Site.DeliveryGroups)
         MachineCatalogs    = @($Site.MachineCatalogs)
