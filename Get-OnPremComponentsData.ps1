@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-07-31.3   (must match $script:_version below and the published .version file)
+# Version: 2026-08-03     (must match $script:_version below and the published .version file)
 
 <#
 .SYNOPSIS
@@ -68,11 +68,19 @@ param(
     [switch]$NoPerf,
     [switch]$NoSplash,
     [switch]$LiveView,
-    # Optional: encrypt each server's output file with this password (writes OnPrem-*.cdenc instead
-    # of .json). OFF by default - omit it and output stays plaintext .json exactly as before.
-    [System.Security.SecureString]$EncryptPassword,
+    # Write plain, unencrypted .json - the escape hatch while certificate protection beds in (lab runs,
+    # support cases, anything that has to be inspected locally).
+    #
+    # TODO (agreed 2026-08-01): REMOVE -NoProtect once certificate protection has been tested on a real
+    # engagement. Leaving a documented way to turn protection off defeats the point of defaulting it on -
+    # it is here only so the rollout can be backed out without rebuilding the collector.
+    [switch]$NoProtect,
     # Skip the "newer version available?" check against GitHub on launch (also skipped with -NoSplash).
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    # Directory this script should treat as its own location. Only needed when the collector is run from
+    # inside an EXE wrapper (PS2EXE and similar), where PowerShell cannot work out where the script is.
+    # Must be WRITABLE - the Outputs\ folder, the debug log and configs\ are all created under it.
+    [string]$ScriptDir
 )
 
 Set-StrictMode -Off
@@ -82,62 +90,99 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-#region ── Data-file encryption (opt-in, self-contained) ──────────────────────
-# Portable password-based encryption for the output data files. OFF unless -EncryptPassword is given.
-# AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC); PBKDF2 key derivation (Rfc2898DeriveBytes 3-arg SHA1
-# form - identical output on .NET Framework 5.1 and .NET Core 7, so a file encrypted here decrypts on
-# the report/app service). No AesGcm (PS7-only). The password is never written to the file or a log.
-$script:_cdEncMarker = '_cdenc'; $script:_cdEncVer = 1; $script:_cdEncIter = 200000
-function ConvertFrom-SecureStringPlain ([System.Security.SecureString]$Secure) {
-    if (-not $Secure) { return '' }
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
-    try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+#region ── Data-file protection (certificate, self-contained) ─────────────────
+# Collected data is locked to OUR certificate: a random AES key encrypts the JSON, and that key is
+# RSA-wrapped to the embedded PUBLIC key. Only the holder of the private key can open the result - the
+# customer who ran this collector cannot, which is the entire point. There is deliberately NO password
+# option: a second, weaker way to protect a file is one that eventually gets used by accident.
+# AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC), no AesGcm (PowerShell 7 only, and this runs on 5.1).
+
+$script:_cdEncMarker = '_cdenc'
+
+$script:_cdEncVerCert = 2; $script:_cdEncAlg = 'AES-256-CBC+HMAC-SHA256'
+# PUBLIC certificate (base64 DER), written here by encryption\New-DataProtectionCert.ps1. Public-only:
+# it can lock a file and nothing more, so shipping it inside this script gives an attacker nothing.
+$script:_dpCertB64 = 'MIIEHTCCAoWgAwIBAgIQERPpywxj96FC80CeAsKOSzANBgkqhkiG9w0BAQsFADAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wHhcNMjYwODAzMDYyMjA0WhcNMzEwODAzMDYzMTU5WjAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDHxMuRIxWSyzTF6CEXXBtzPxgesxcdThK/PORvQ+CWar/b/gIaB63DDqGz0OvUsWyAAVPGiaaElmxQxux62x0J5ZpbVfRSwLbFbksrXq+fUMJI/fYDG49Klj/PKeTYX0lOCwr5rDI1JPSWuunp+3KK0Flvt8kx8HLVwGaHIbYCjxZ2k3d9yyHueSkGfDDoou28rVRVMH+3BZYNM7vD/fLk2AbkD7utM+D2eSvzNs/x1B8fzSTlOFCT5lDiY9N51GIR1tf2wxt/ft6gpz/YS7G5ECqKwMGcGDe1aNwSdnDjmZuA7e+AXIr0An0/xRGgwjY2ScjCpwhXdQwARBkGWcsTZG4VN9m4GM5iCDo+R95h9PG39jbRVdHPUqlSN+FF/rIwqYdzS//MG2xF7J8zg/ApygxKBEUSNT37eV/bgRAclEJqnR/SvHEXVZJI/J4/DmO/vhSZr/qV1szaZJU2Z2J+xlyML3f9+9O77sEE/hhOEgOQw5c+z4YYFtpyndIlJt0CAwEAAaNHMEUwDgYDVR0PAQH/BAQDAgQwMBQGA1UdJQQNMAsGCSsGAQQBgjdQATAdBgNVHQ4EFgQUrcDSJBxwg9rxEU/tavdbA4ZcByAwDQYJKoZIhvcNAQELBQADggGBABMmhGsPDt5zr4Lw5E7dZFrqoM2wvT+wXGjFSNc80cir6Mc/79fmxZrP5Ll0ws44m15UmybwOvm2JXTvXBeVWc5pBSiLVNQCMe+vWl1PUGSiQgQLt9lu+/lai6aDBhcAeV7ZoaPEVvN/PX+FQuvqiHD3muO29RKAwOuvSaYupftqPQ42qn1cSN8NQt1dXdyMV2uAdNVORmUKlobB9kP5F3Dd7Z8vqxlSlJcDBbGF+nAwr0ZRGP3Tz0ngCum/Lm23R4ilktvblGOxEzLaZRVtYnAKgq7UfefSo6lIf1gBhIvEiJH8dm2BIzCDWTDUYVH3lqLHNAtOJc24jGNH4Sc45aS1geY0smapvBopLKUbLJ/HruSeNiClhBPmdpDExvQMD+DJgFm44rBKZvHU+BymTNxn3XzsTEd9ePlBzGv/dLHq8s6zWlsITSu21bnFiorS1+EWKRIEJaA7FSte5sRNn66XD1c3uWAGHq9ytuoM2WLBFsJHrJJ+4Cl7Yy774etZPQ=='
+# ── v2 certificate mode ───────────────────────────────────────────────────────
+# Length-prefixed fields, so the MAC input cannot be made ambiguous by shifting bytes between fields.
+function Add-CdEncMacField ([System.IO.MemoryStream]$Stream, [byte[]]$Bytes) {
+    $len = [BitConverter]::GetBytes([int]$Bytes.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+    $Stream.Write($len, 0, 4)
+    if ($Bytes.Length) { $Stream.Write($Bytes, 0, $Bytes.Length) }
 }
-function Get-CdEncKeys ([string]$PwText, [byte[]]$Salt) {
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PwText, $Salt, $script:_cdEncIter)
-    try { $b = $kdf.GetBytes(64); @{ Aes = $b[0..31]; Mac = $b[32..63] } } finally { $kdf.Dispose() }
+# Authenticates the WHOLE header - ver, alg, kid, wkey, iv, ct - so no metadata can be altered undetected.
+function Get-CdEncMacInput ([int]$Ver, [string]$Alg, [string]$Kid, [byte[]]$WKey, [byte[]]$Iv, [byte[]]$Ct) {
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        Add-CdEncMacField $ms ([byte[]]@([byte]$Ver))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Alg))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Kid))
+        Add-CdEncMacField $ms $WKey; Add-CdEncMacField $ms $Iv; Add-CdEncMacField $ms $Ct
+        $ms.ToArray()
+    } finally { $ms.Dispose() }
 }
-function Test-CitrixDataEncrypted ([string]$Raw) {
-    if (-not $Raw) { return $false }
-    $t = $Raw.TrimStart([char]0xFEFF, ' ', "`t", "`r", "`n")
-    if (-not $t.StartsWith('{')) { return $false }
-    try { [bool]((($t | ConvertFrom-Json) | Get-Member -Name $script:_cdEncMarker -ErrorAction SilentlyContinue)) } catch { $false }
-}
-function Protect-CitrixData ([string]$PlainJson, [System.Security.SecureString]$Password) {
-    if (-not $Password -or $Password.Length -eq 0) { throw 'Protect-CitrixData: a password is required.' }
-    $pw = ConvertFrom-SecureStringPlain $Password
+function Clear-CdEncBytes ([byte[]]$B) { if ($B) { [Array]::Clear($B, 0, $B.Length) } }
+
+function Protect-CitrixDataCert ([string]$PlainJson) {
+    if (-not $script:_dpCertB64) {
+        throw 'No data-protection certificate is embedded in this collector, so the output cannot be protected. Re-run with -NoProtect to write plain JSON, or use a collector built after the certificate was issued.'
+    }
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, [byte[]][Convert]::FromBase64String($script:_dpCertB64))
+    # Belt and braces: if a PFX were ever embedded by mistake, the whole scheme would be defeated.
+    if ($cert.HasPrivateKey) { throw 'The embedded data-protection certificate contains a private key - it must be public-only.' }
+
+    # Expiry is a PROMPT TO ROTATE, never a reason to stop. The certificate is not proving identity here
+    # and nothing validates a chain or a date, so an expired key encrypts and decrypts exactly as before -
+    # verified. Refusing to collect on an arbitrary future date would break customer engagements for no
+    # security gain, and files already written stay readable regardless.
+    $daysLeft = [int]([math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays))
+    if ($daysLeft -lt 0)      { Write-Log "Data-protection certificate EXPIRED on $($cert.NotAfter.ToString('yyyy-MM-dd')) - output is still protected and still readable, but the certificate should be rotated." 'WARN' }
+    elseif ($daysLeft -lt 90) { Write-Log "Data-protection certificate expires in $daysLeft day(s) ($($cert.NotAfter.ToString('yyyy-MM-dd'))) - plan a rotation." 'WARN' }
+
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $salt = New-Object byte[] 16; $rng.GetBytes($salt); $iv = New-Object byte[] 16; $rng.GetBytes($iv); $rng.Dispose()
-    $keys = Get-CdEncKeys $pw $salt
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() } finally { $aes.Dispose() }
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $mac = $hmac.ComputeHash([byte[]](@([byte]$script:_cdEncVer) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVer; alg = 'AES-256-CBC+HMAC-SHA256'; kdf = 'PBKDF2-SHA1'; iter = $script:_cdEncIter
-        salt = [Convert]::ToBase64String($salt); iv = [Convert]::ToBase64String($iv); ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+    try {
+        $km = New-Object byte[] 64   # 32 bytes AES + 32 bytes HMAC: one key never does two jobs
+        $rng.GetBytes($km)
+        $iv = New-Object byte[] 16; $rng.GetBytes($iv)
+    } finally { $rng.Dispose() }
+    $aesKey = $km[0..31]; $macKey = $km[32..63]
+
+    # GetRSAPublicKey, NOT $cert.PublicKey.Key: on PS 5.1 the latter returns the legacy
+    # RSACryptoServiceProvider, which rejects OaepSHA256 - and that fails only on the customer's machine.
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert)
+    try { $wkey = $rsa.Encrypt($km, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256) }
+    finally { if ($rsa) { $rsa.Dispose() } }
+
+    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $aesKey; $aes.IV = $iv
+    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() }
+    finally { $aes.Dispose() }
+
+    $kid = $cert.Thumbprint
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$macKey)
+    try { $mac = $hmac.ComputeHash((Get-CdEncMacInput $script:_cdEncVerCert $script:_cdEncAlg $kid $wkey $iv $ct)) } finally { $hmac.Dispose() }
+
+    # Drop the key material: after this point it exists only inside wkey, which needs the private key.
+    Clear-CdEncBytes $km; Clear-CdEncBytes $aesKey; Clear-CdEncBytes $macKey
+
+    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVerCert; alg = $script:_cdEncAlg; kid = $kid
+        wkey = [Convert]::ToBase64String($wkey); iv = [Convert]::ToBase64String($iv)
+        ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
 }
-function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Password) {
-    if (-not (Test-CitrixDataEncrypted $Raw)) { return $Raw }
-    if (-not $Password -or $Password.Length -eq 0) { throw 'This data file is encrypted - a password is required to open it.' }
-    $env = $Raw | ConvertFrom-Json; $pw = ConvertFrom-SecureStringPlain $Password
-    $salt = [Convert]::FromBase64String($env.salt); $iv = [Convert]::FromBase64String($env.iv)
-    $ct = [Convert]::FromBase64String($env.ct); $mac = [Convert]::FromBase64String($env.mac); $ver = [byte][int]$env.$($script:_cdEncMarker)
-    $keys = Get-CdEncKeys $pw $salt
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $expected = $hmac.ComputeHash([byte[]](@($ver) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    $ok = $mac.Length -eq $expected.Length; for ($i = 0; $i -lt $expected.Length; $i++) { if ($i -lt $mac.Length) { $ok = $ok -and ($mac[$i] -eq $expected[$i]) } }
-    if (-not $ok) { throw 'Could not decrypt the data file - the password is incorrect (or the file has been altered).' }
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $d = $aes.CreateDecryptor(); $pb = $d.TransformFinalBlock($ct, 0, $ct.Length); $d.Dispose() } finally { $aes.Dispose() }
-    [System.Text.Encoding]::UTF8.GetString($pb)
+
+# One decision point used by BOTH output paths (the per-server file and the CVAD site file), so the two
+# can never drift apart. Returns the JSON to write and the extension it should carry.
+function Protect-CollectorOutput ([string]$PlainJson) {
+    if ($script:_noProtect) { return @{ Json = $PlainJson; Ext = 'json' } }
+    return @{ Json = (Protect-CitrixDataCert $PlainJson); Ext = 'cdenc' }
 }
+
 #endregion
 
-# Version: 'YYYY-MM-DD' or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
+# Version: 2026-08-03 or 'YYYY-MM-DD.rev' (rev distinguishes multiple releases in a day).
 # IMPORTANT on every release, keep these three in sync: the '# Version:' header comment at the top of
 # the file, this $script:_version, and the published Get-OnPremComponentsData.version file.
-$script:_version = '2026-07-31.3'
+$script:_version = '2026-08-03'
 # Self-update: the launch check reads a TINY version file (a few bytes) - efficient - and only
 # downloads the full script if a newer version is actually available.
 # Self-update: fetch update-manifest.json from euc-reports-collectors, compare this file's SHA-256 to its
@@ -146,8 +191,20 @@ $script:_version = '2026-07-31.3'
 $script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
 $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
 $script:_selfName       = 'Get-OnPremComponentsData.ps1'
-$script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
-$script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:_noProtect       = $false  # -NoProtect: write plain .json instead of a protected .cdenc
+# Where this script lives. Inside an EXE wrapper none of the automatic variables that normally reveal it
+# are populated, which is why -ScriptDir exists: the EXE tells us. Most reliable source first.
+# This only RESOLVES the path - deliberately no Set-Location, because changing the process working
+# directory would alter how a relative -OutputPath resolves and would persist after the script exits.
+$script:_scriptDir =
+    if ($ScriptDir) {
+        if (-not (Test-Path -LiteralPath $ScriptDir)) { throw "-ScriptDir '$ScriptDir' does not exist." }
+        (Resolve-Path -LiteralPath $ScriptDir).Path
+    }
+    elseif ($PSScriptRoot)                { $PSScriptRoot }
+    elseif ($PSCommandPath)               { Split-Path -Parent $PSCommandPath }
+    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { throw 'Cannot determine the script directory (running from an EXE?). Pass -ScriptDir <path>.' }
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
 $script:_debugLogPath = Join-Path $script:_scriptDir "OnPremComponentsData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
@@ -948,9 +1005,6 @@ function Show-OnPremDialog {
             <PasswordBox x:Name="PassBox" Grid.Column="2" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12"/>
         </Grid>
 
-        <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
-        <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
-
         <Border Background="#F0F6FC" BorderBrush="#CFE4F7" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,16">
             <StackPanel>
                 <CheckBox x:Name="PerfChk" Content="Capture live performance (per server)" IsChecked="False" Foreground="#1F2937" FontSize="12"/>
@@ -982,7 +1036,6 @@ function Show-OnPremDialog {
     $cancel = $win.FindName('CancelBtn')
     $liveViewChk = $win.FindName('LiveViewChk')
     $perfChk = $win.FindName('PerfChk')
-    $encryptBox = $win.FindName('EncryptBox')
 
     # Show the "not running as administrator" banner when this process lacks a local-admin token -
     # local collection (IIS/cert/StoreFront/FAS/PVS admin) would come back incomplete.
@@ -1009,7 +1062,7 @@ function Show-OnPremDialog {
     # tick still enabled (and live view ticked) under an unticked "Capture live performance".
     & $syncPerf
 
-    $result = [ordered]@{ Action = 'Cancel'; Servers = @(); DurationMinutes = 30; Credential = $null; Customer = ''; LiveView = $false; NoPerf = $false; EncryptPassword = $null }
+    $result = [ordered]@{ Action = 'Cancel'; Servers = @(); DurationMinutes = 30; Credential = $null; Customer = ''; LiveView = $false; NoPerf = $false }
 
     $okBtn.Add_Click({
         $lines = @($serversBox.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1028,8 +1081,7 @@ function Show-OnPremDialog {
         $result['Customer'] = $customerBox.Text.Trim()
         $result['NoPerf'] = -not [bool]$perfChk.IsChecked
         $result['LiveView'] = [bool]$liveViewChk.IsChecked -and -not $result['NoPerf']
-        if ($encryptBox.Password) { $result['EncryptPassword'] = ConvertTo-SecureString $encryptBox.Password -AsPlainText -Force }
-        $win.Close()
+                $win.Close()
     })
     $cancel.Add_Click({ $result['Action'] = 'Cancel'; $win.Close() })
     $null = $win.ShowDialog()
@@ -1124,14 +1176,36 @@ $script:_versionBlock = {
             $m = $apps | Where-Object { "$($_.DisplayName)" -eq $t.Match } | Select-Object -First 1
             if (-not $m) { $m = $apps | Where-Object { "$($_.DisplayName)" -like "*$($t.Match)*" -and ($null -eq $t.ExcludeRegex -or "$($_.DisplayName)" -notmatch $t.ExcludeRegex) } | Select-Object -First 1 }
         }
-        $cvadRelease = ''; $cvadVersion = ''
+        $cvadRelease = ''; $cvadVersion = ''; $cvadProduct = ''
         if ($t.CvadLabel) {
             $cv = $apps | Where-Object { "$($_.DisplayName)" -match "Citrix Virtual Apps and Desktops.*-\s*$([regex]::Escape($t.CvadLabel))$" } | Select-Object -First 1
             if ($cv) {
+                $cvadProduct = "$($cv.DisplayName)"   # carries the LTSR/CU wording verbatim, so the
+                                                      # report never has to infer the track when offline
                 $cvadVersion = "$($cv.DisplayVersion)"
                 if     ("$($cv.DisplayVersion)" -match '^(\d{4})\.') { $cvadRelease = $matches[1] }
                 elseif ("$($cv.DisplayName)"    -match '\b(\d{4})\b') { $cvadRelease = $matches[1] }
                 if (-not $m) { $m = $cv }   # only the CVAD-named entry exists on some installs
+            }
+            # Fall back to the BARE CVAD bundle entry - "Citrix Virtual Apps and Desktops 7 2402 LTSR CU4"
+            # (DisplayVersion 2402.0.4100.4597). A 2402 LTSR controller carries no "- Delivery Controller"
+            # suffixed entry at all, so the match above finds nothing and the release was silently blank -
+            # which is why the report could only ever show the raw 7.41.4100 broker build.
+            #
+            # REQUIRES $m: the bundle entry exists on EVERY CVAD box, so it may only ever NAME THE RELEASE
+            # of a component already detected in its own right - never stand in as evidence of presence.
+            # Without this guard it matched for StoreFront/FAS/VDA too and invented all three on a plain
+            # controller, reporting them at the bundle's version.
+            if (-not $cvadRelease -and $m) {
+                $cvb = $apps | Where-Object {
+                    "$($_.DisplayName)" -match '^Citrix Virtual Apps and Desktops\b' -and "$($_.DisplayName)" -notmatch '\s-\s'
+                } | Select-Object -First 1
+                if ($cvb) {
+                    $cvadProduct = "$($cvb.DisplayName)"
+                    $cvadVersion = "$($cvb.DisplayVersion)"
+                    if     ("$($cvb.DisplayVersion)" -match '^(\d{4})\.') { $cvadRelease = $matches[1] }
+                    elseif ("$($cvb.DisplayName)"    -match '\b(\d{4})\b') { $cvadRelease = $matches[1] }
+                }
             }
         }
         if ($m -or $cvadRelease) {
@@ -1140,6 +1214,11 @@ $script:_versionBlock = {
                 Product     = if ($m) { "$($m.DisplayName)" } else { '' }
                 Version     = if ($m) { "$($m.DisplayVersion)" } else { $cvadVersion }
                 CvadRelease = $cvadRelease   # YYMM (e.g. '2407'); '' when not a CVAD-bundled component
+                # The CVAD bundle's own build (e.g. 2402.0.4100.4597) and product name (e.g. "Citrix
+                # Virtual Apps and Desktops 7 2402 LTSR CU4). The build decodes to the CU with the
+                # report's existing Get-VdaCu; the name states the LTSR/CU track without inference.
+                CvadVersion = $cvadVersion
+                CvadProduct = $cvadProduct
             }
         }
     }
@@ -1782,6 +1861,10 @@ $script:_brokerBlock = {
         SiteId             = ''
         ProductEdition     = ''
         ProductVersion     = ''
+        # CVAD release of the controller this was collected from (YYMM + bundle build + product name).
+        CvadRelease        = ''
+        CvadVersion        = ''
+        CvadProduct        = ''
         Settings           = [ordered]@{}
         Controllers        = @()
         Zones              = @()
@@ -1815,6 +1898,24 @@ $script:_brokerBlock = {
         return [pscustomobject]$site
     }
     $site['SdkAvailable'] = $true
+
+    # CVAD release of THIS controller, from the bundle's uninstall entry ("Citrix Virtual Apps and
+    # Desktops 7 2402 LTSR CU4", DisplayVersion 2402.0.4100.4597). The Broker build (7.41.4100) does not
+    # map to the YYMM release on its own, so the site file states the release explicitly rather than
+    # leaving the report to guess it from a hardcoded build table that would rot every release.
+    try {
+        $uninstallKeys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        $cvBundle = Get-ItemProperty $uninstallKeys -ErrorAction SilentlyContinue |
+            Where-Object { "$($_.DisplayName)" -match '^Citrix Virtual Apps and Desktops\b' -and "$($_.DisplayName)" -notmatch '\s-\s' } |
+            Select-Object -First 1
+        if ($cvBundle) {
+            $site['CvadProduct'] = "$($cvBundle.DisplayName)"
+            $site['CvadVersion'] = "$($cvBundle.DisplayVersion)"
+            if     ("$($cvBundle.DisplayVersion)" -match '^(\d{4})\.') { $site['CvadRelease'] = $matches[1] }
+            elseif ("$($cvBundle.DisplayName)"    -match '\b(\d{4})\b') { $site['CvadRelease'] = $matches[1] }
+        }
+    } catch { $site['Messages'] += "CVAD release lookup: $($_.Exception.Message)" }
     $str = { param($v) if ($null -eq $v) { '' } else { "$v" } }
     $iso = { param($v) if ($v) { try { ([datetime]$v).ToString('o') } catch { "$v" } } else { '' } }
     $utc = { param($v) if ($v) { try { ([datetime]$v).ToUniversalTime() } catch { $null } } else { $null } }
@@ -3269,7 +3370,7 @@ function Invoke-OnPremCollection ([string[]]$ServerList, [int]$DurationMin, [Sys
 # Writes the site-wide Broker inventory as its OWN file in the SAME top-level shape the cloud collector
 # produces, so the report consumes it via -DataFile with no changes. Cloud-only collections are emitted
 # empty (arrays) or omitted (WorkspaceConfig/Licensing) so their sections/checks stay absent - never a
-# vacuous pass. Written ONCE (not per perf tick). Honours -EncryptPassword via Protect-CitrixData.
+# vacuous pass. Written ONCE (not per perf tick). Protected via Protect-CollectorOutput.
 function Write-OnPremSiteJson ($Site, $Files) {
     $now = Get-Date
     # Label for the file name AND CustomerName. When -Customer was not supplied, fall back to the SITE
@@ -3299,7 +3400,7 @@ function Write-OnPremSiteJson ($Site, $Files) {
         ProductRegistrations    = @()
         IdentityDomains         = @()
         # Site collections from the Delivery Controller.
-        Sites = @([ordered]@{ SiteId = "$($Site.SiteId)"; SiteName = "$($Site.SiteName)"; ProductCode = 'XDT'; ProductEdition = "$($Site.ProductEdition)"; ProductVersion = "$($Site.ProductVersion)"; Settings = $Site.Settings })
+        Sites = @([ordered]@{ SiteId = "$($Site.SiteId)"; SiteName = "$($Site.SiteName)"; ProductCode = 'XDT'; ProductEdition = "$($Site.ProductEdition)"; ProductVersion = "$($Site.ProductVersion)"; CvadRelease = "$($Site.CvadRelease)"; CvadVersion = "$($Site.CvadVersion)"; CvadProduct = "$($Site.CvadProduct)"; Settings = $Site.Settings })
         Zones              = @($Site.Zones)
         DeliveryGroups     = @($Site.DeliveryGroups)
         MachineCatalogs    = @($Site.MachineCatalogs)
@@ -3322,11 +3423,11 @@ function Write-OnPremSiteJson ($Site, $Files) {
     # 'OnPrem' remains the last resort for the pathological case of no customer AND no site name.
     $safe = ("$custName" -replace '[^\w\-]', '_').Trim('_'); if (-not $safe) { $safe = 'OnPrem' }
     $outFile = Join-Path $script:_outputDir "$safe-CVAD-Site-$($now.ToString('yyyyMMdd-HHmmss')).json"
-    $encrypt = ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
-    if ($encrypt) { $outFile = [System.IO.Path]::ChangeExtension($outFile, 'cdenc') }
     try {
         $json = $output | ConvertTo-Json -Depth 20
-        if ($encrypt) { $json = Protect-CitrixData $json $script:_encryptPassword }
+        $prot = Protect-CollectorOutput $json
+        $json = $prot.Json
+        $outFile = [System.IO.Path]::ChangeExtension($outFile, $prot.Ext)
         Set-Content -Path $outFile -Value $json -Encoding UTF8
         if (-not $Files.Contains($outFile)) { Write-Log "Site data written: $outFile (site '$($Site.SiteName)', controllers=$(@($Site.Controllers).Count), DGs=$(@($Site.DeliveryGroups).Count))"; [void]$Files.Add($outFile) }
     } catch { Write-Log "Failed to write site JSON: $_" 'ERROR' }
@@ -3360,7 +3461,7 @@ function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Ro
         }
         Roles = @($Roles | Where-Object { $_ })
         CitrixComponents = @(@($Components) | Where-Object { $_ -and "$($_.Name)" } | ForEach-Object {
-            [ordered]@{ Name = "$($_.Name)"; Product = "$($_.Product)"; Version = "$($_.Version)"; CvadRelease = "$($_.CvadRelease)" }
+            [ordered]@{ Name = "$($_.Name)"; Product = "$($_.Product)"; Version = "$($_.Version)"; CvadRelease = "$($_.CvadRelease)"; CvadVersion = "$($_.CvadVersion)"; CvadProduct = "$($_.CvadProduct)" }
         })
         Monitoring = [ordered]@{
             IntervalSeconds = 30
@@ -3422,12 +3523,12 @@ function Write-OnPremJson ($Server, [string]$ReachedVia, $Spec, $Components, $Ro
         $safeName = $name -replace '[^\w\-]', '_'
         $outFile  = Join-Path $script:_outputDir "OnPrem-$safeName-$($now.ToString('yyyyMMdd-HHmmss')).json"
     }
-    # Opt-in encryption: swap the extension to .cdenc and wrap the JSON with the run password.
-    $encrypt = ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
-    if ($encrypt) { $outFile = [System.IO.Path]::ChangeExtension($outFile, 'cdenc') }
+    # Protection is decided in ONE place for both output files, so they cannot drift apart.
     try {
         $json = $output | ConvertTo-Json -Depth 12
-        if ($encrypt) { $json = Protect-CitrixData $json $script:_encryptPassword }
+        $prot = Protect-CollectorOutput $json
+        $json = $prot.Json
+        $outFile = [System.IO.Path]::ChangeExtension($outFile, $prot.Ext)
         Set-Content -Path $outFile -Value $json -Encoding UTF8
         # Each server's file is rewritten every tick; record it in $Files only once.
         if (-not $Files.Contains($outFile)) {
@@ -3456,7 +3557,7 @@ $customer = $Customer
 $liveView = [bool]$LiveView
 # Perf is opt-in: off unless -Perf was given, and -NoPerf always wins.
 $noPerf   = if ($NoPerf) { $true } else { -not [bool]$Perf }
-$script:_encryptPassword = $EncryptPassword   # CLI param; the dialog can also set it below
+$script:_noProtect       = [bool]$NoProtect   # -NoProtect: opt out of certificate protection entirely
 if (-not $targets) {
     $sel = Show-OnPremDialog
     if ($sel['Action'] -eq 'Cancel') { Write-Log 'User cancelled at launch dialog'; exit 0 }
@@ -3466,12 +3567,11 @@ if (-not $targets) {
     if (-not $customer) { $customer = $sel['Customer'] }
     $liveView = [bool]$sel['LiveView']
     $noPerf   = [bool]$sel['NoPerf']
-    if ($sel['EncryptPassword']) { $script:_encryptPassword = $sel['EncryptPassword'] }
-} else {
+    } else {
     $targets = @($targets | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
     if ($targets.Count -eq 0) { $targets = @('localhost') }
 }
-Write-Log "Output encryption: $(if ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0) { 'on (.cdenc)' } else { 'off (plaintext .json)' })"
+Write-Log "Output protection: $(if ($script:_noProtect) { 'OFF (-NoProtect: plaintext .json)' } else { 'certificate (.cdenc - readable only with the data-protection private key)' })"
 
 # De-duplicate the target list (case-insensitive, order-preserving) so a server entered twice
 # doesn't double-collect or create an orphan "Pending" row in the live view.

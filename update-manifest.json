@@ -1,54 +1,47 @@
 {
-  "generated": "2026-07-31",
-  "files": [
-    {
-      "name": "Get-AVDData.ps1",
-      "version": "2026-07-23.2",
-      "sha256": "69CA581014C68277CD991671D2DE1EBF3F7E065E02FD1DCF85E21B1F29D74F70",
-      "size": 184993,
-      "signed": false
-    },
-    {
-      "name": "Get-CitrixCloudData-Signed.ps1",
-      "version": "2026-07-24.2",
-      "sha256": "BCB88579C15A6944B696100E29316B0E4B4B49ED029BF1EDECCD44FCDA54AA20",
-      "size": 220260,
-      "signed": true
-    },
-    {
-      "name": "Get-CitrixCloudData.ps1",
-      "version": "2026-07-31",
-      "sha256": "EEF6DEB77378E2E462131E75019849BC9885E63632013EA70131815F4FF9AA54",
-      "size": 205326,
-      "signed": false
-    },
-    {
-      "name": "Get-NetScalerData.ps1",
-      "version": "2026-07-31.7",
-      "sha256": "7018698A4679F390BE66C35358D651606F42EF682E39241B537E52ECDD581427",
-      "size": 86105,
-      "signed": false
-    },
-    {
-      "name": "Get-OnPremComponentsData.ps1",
-      "version": "2026-07-31.3",
-      "sha256": "877C0C68EEEEB9E5684220AC6EF77FE62E5965D54DFCF5F4A5B34B7954452C5B",
-      "size": 233479,
-      "signed": false
-    },
-    {
-      "name": "Get-ProfilesData.ps1",
-      "version": "2026-07-23.3",
-      "sha256": "1CC600AE6F137CC294D126A7809393A30F5A4DEABBE57F6229E28F22FF2CD4AE",
-      "size": 101507,
-      "signed": false
-    },
-    {
-      "name": "Get-VsphereData.ps1",
-      "version": "2026-07-23.2",
-      "sha256": "D8C574B6D4F0A11F14F2CE600A40A6AAD0699B9F85EA74EB30FE8A3F5B466186",
-      "size": 94235,
-      "signed": false
-    }
-  ]
+    "generated":  "2026-08-03",
+    "files":  [
+                  {
+                      "name":  "Get-AVDData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "A9088932AFFD786B4B7178F2CC193742DD9E090BCE0023C03001A8FD271E41A5",
+                      "size":  193439,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-CitrixCloudData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "C886EFA29811B51F6EF6850E05D9253703565024ACE5169C7076591264054218",
+                      "size":  208806,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-NetScalerData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "7A8449D1B932E02291B5DC4E779C2E84FEB8ECC9B8A043C6336CBE6A471F3DFF",
+                      "size":  92029,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-OnPremComponentsData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "37C5954C7C025AF03FE921BC9E7BE5A43BD41A8BB68A129545ED2FA9D3BD76DF",
+                      "size":  241015,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-ProfilesData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "AB1E4EBFC8F3671A06588FBEFCA083301254A5C6B1B081637FABF5BC142CF774",
+                      "size":  106617,
+                      "signed":  false
+                  },
+                  {
+                      "name":  "Get-VsphereData.ps1",
+                      "version":  "2026-08-03",
+                      "sha256":  "A97BD025EDB3E5DE97588EA169C2A46964709ED2A22C77042FED0D90D61D3F34",
+                      "size":  100640,
+                      "signed":  false
+                  }
+              ]
 }

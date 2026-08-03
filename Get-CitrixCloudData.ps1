@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# Version: 2026-07-31   (keep in lock-step with $script:_version below)
+﻿#Requires -Version 5.1
+# Version: 2026-08-03   (keep in lock-step with $script:_version below)
 
 <#
 .SYNOPSIS
@@ -46,12 +46,19 @@ param(
     [string]$OutputPath,
     # Optional: encrypt the collected data file with this password (writes <name>.cdenc instead of
     # .json). OFF by default - omit it and the output stays plaintext .json exactly as before.
-    [System.Security.SecureString]$EncryptPassword,
     # Skip the Citrix Advisor site check (it runs by default - the one on-demand scan in the collection).
     # Interactive runs untick the dialog checkbox instead (saved per customer). See .PARAMETER SkipAdvisor.
     [switch]$SkipAdvisor,
     # Skip the launch-time self-update check (mirrors the on-prem collector's -SkipUpdateCheck).
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    # Directory this script should treat as its own location. Only needed when the collector is run from
+    # inside an EXE wrapper (PS2EXE and similar), where PowerShell cannot work out where the script is.
+    # Must be WRITABLE - the Outputs\ folder, the debug log and configs\ are all created under it.
+    [string]$ScriptDir,
+    # Write plain, unencrypted .json instead of a certificate-protected .cdenc.
+    # TODO (agreed 2026-08-01): REMOVE once certificate protection has been used on a real
+    # engagement - a documented way to turn protection off defeats defaulting it on.
+    [switch]$NoProtect
 )
 
 Set-StrictMode -Off
@@ -64,58 +71,90 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Web
 
 #region ── Data-file encryption (opt-in, self-contained) ──────────────────────
-# Portable password-based encryption for the output data file. OFF unless -EncryptPassword is given.
 # AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC); PBKDF2 key derivation (Rfc2898DeriveBytes 3-arg SHA1
 # form - identical output on .NET Framework 5.1 and .NET Core 7, so a file encrypted here decrypts on
 # the report/app service). No AesGcm (PS7-only). The password is never written to the file or a log.
-$script:_cdEncMarker = '_cdenc'; $script:_cdEncVer = 1; $script:_cdEncIter = 200000
-function ConvertFrom-SecureStringPlain ([System.Security.SecureString]$Secure) {
-    if (-not $Secure) { return '' }
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
-    try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+$script:_cdEncMarker = '_cdenc'
+$script:_noProtect   = $false   # -NoProtect: write plain .json instead of a protected .cdenc
+# v2 - CERTIFICATE mode, the only mode. A random AES key encrypts the data and is RSA-wrapped to OUR
+# public key, so collected data can only be opened by the holder of the private key. The customer running
+# this script cannot read its own output: nothing here is capable of decryption, which is the point.
+# There is deliberately NO password option - a second, weaker way to protect a file is one that
+# eventually gets used by accident. -NoProtect writes plain .json instead.
+$script:_cdEncVerCert = 2; $script:_cdEncAlg = 'AES-256-CBC+HMAC-SHA256'
+# PUBLIC certificate (base64 DER), written here by encryption\New-DataProtectionCert.ps1. Public-only:
+# it can lock a file and nothing more, so shipping it inside this script gives an attacker nothing.
+$script:_dpCertB64 = 'MIIEHTCCAoWgAwIBAgIQERPpywxj96FC80CeAsKOSzANBgkqhkiG9w0BAQsFADAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wHhcNMjYwODAzMDYyMjA0WhcNMzEwODAzMDYzMTU5WjAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDHxMuRIxWSyzTF6CEXXBtzPxgesxcdThK/PORvQ+CWar/b/gIaB63DDqGz0OvUsWyAAVPGiaaElmxQxux62x0J5ZpbVfRSwLbFbksrXq+fUMJI/fYDG49Klj/PKeTYX0lOCwr5rDI1JPSWuunp+3KK0Flvt8kx8HLVwGaHIbYCjxZ2k3d9yyHueSkGfDDoou28rVRVMH+3BZYNM7vD/fLk2AbkD7utM+D2eSvzNs/x1B8fzSTlOFCT5lDiY9N51GIR1tf2wxt/ft6gpz/YS7G5ECqKwMGcGDe1aNwSdnDjmZuA7e+AXIr0An0/xRGgwjY2ScjCpwhXdQwARBkGWcsTZG4VN9m4GM5iCDo+R95h9PG39jbRVdHPUqlSN+FF/rIwqYdzS//MG2xF7J8zg/ApygxKBEUSNT37eV/bgRAclEJqnR/SvHEXVZJI/J4/DmO/vhSZr/qV1szaZJU2Z2J+xlyML3f9+9O77sEE/hhOEgOQw5c+z4YYFtpyndIlJt0CAwEAAaNHMEUwDgYDVR0PAQH/BAQDAgQwMBQGA1UdJQQNMAsGCSsGAQQBgjdQATAdBgNVHQ4EFgQUrcDSJBxwg9rxEU/tavdbA4ZcByAwDQYJKoZIhvcNAQELBQADggGBABMmhGsPDt5zr4Lw5E7dZFrqoM2wvT+wXGjFSNc80cir6Mc/79fmxZrP5Ll0ws44m15UmybwOvm2JXTvXBeVWc5pBSiLVNQCMe+vWl1PUGSiQgQLt9lu+/lai6aDBhcAeV7ZoaPEVvN/PX+FQuvqiHD3muO29RKAwOuvSaYupftqPQ42qn1cSN8NQt1dXdyMV2uAdNVORmUKlobB9kP5F3Dd7Z8vqxlSlJcDBbGF+nAwr0ZRGP3Tz0ngCum/Lm23R4ilktvblGOxEzLaZRVtYnAKgq7UfefSo6lIf1gBhIvEiJH8dm2BIzCDWTDUYVH3lqLHNAtOJc24jGNH4Sc45aS1geY0smapvBopLKUbLJ/HruSeNiClhBPmdpDExvQMD+DJgFm44rBKZvHU+BymTNxn3XzsTEd9ePlBzGv/dLHq8s6zWlsITSu21bnFiorS1+EWKRIEJaA7FSte5sRNn66XD1c3uWAGHq9ytuoM2WLBFsJHrJJ+4Cl7Yy774etZPQ=='
+# Length-prefixed fields, so the MAC input cannot be made ambiguous by shifting bytes between fields.
+function Add-CdEncMacField ([System.IO.MemoryStream]$Stream, [byte[]]$Bytes) {
+    $len = [BitConverter]::GetBytes([int]$Bytes.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+    $Stream.Write($len, 0, 4)
+    if ($Bytes.Length) { $Stream.Write($Bytes, 0, $Bytes.Length) }
 }
-function Get-CdEncKeys ([string]$PwText, [byte[]]$Salt) {
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PwText, $Salt, $script:_cdEncIter)
-    try { $b = $kdf.GetBytes(64); @{ Aes = $b[0..31]; Mac = $b[32..63] } } finally { $kdf.Dispose() }
+# Authenticates the WHOLE header - ver, alg, kid, wkey, iv, ct - so no metadata can be altered undetected.
+function Get-CdEncMacInput ([int]$Ver, [string]$Alg, [string]$Kid, [byte[]]$WKey, [byte[]]$Iv, [byte[]]$Ct) {
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        Add-CdEncMacField $ms ([byte[]]@([byte]$Ver))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Alg))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Kid))
+        Add-CdEncMacField $ms $WKey; Add-CdEncMacField $ms $Iv; Add-CdEncMacField $ms $Ct
+        $ms.ToArray()
+    } finally { $ms.Dispose() }
 }
-function Test-CitrixDataEncrypted ([string]$Raw) {
-    if (-not $Raw) { return $false }
-    $t = $Raw.TrimStart([char]0xFEFF, ' ', "`t", "`r", "`n")
-    if (-not $t.StartsWith('{')) { return $false }
-    try { [bool]((($t | ConvertFrom-Json) | Get-Member -Name $script:_cdEncMarker -ErrorAction SilentlyContinue)) } catch { $false }
-}
-function Protect-CitrixData ([string]$PlainJson, [System.Security.SecureString]$Password) {
-    if (-not $Password -or $Password.Length -eq 0) { throw 'Protect-CitrixData: a password is required.' }
-    $pw = ConvertFrom-SecureStringPlain $Password
+function Clear-CdEncBytes ([byte[]]$B) { if ($B) { [Array]::Clear($B, 0, $B.Length) } }
+
+function Protect-CitrixDataCert ([string]$PlainJson) {
+    if (-not $script:_dpCertB64) {
+        throw 'No data-protection certificate is embedded in this collector, so the output cannot be protected. Re-run with -NoProtect to write plain JSON, or use a collector built after the certificate was issued.'
+    }
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, [byte[]][Convert]::FromBase64String($script:_dpCertB64))
+    if ($cert.HasPrivateKey) { throw 'The embedded data-protection certificate contains a private key - it must be public-only.' }
+
+    # Expiry is a PROMPT TO ROTATE, never a reason to stop: nothing validates a chain or a date, so an
+    # expired key encrypts and decrypts exactly as before, and files already written stay readable.
+    $daysLeft = [int]([math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays))
+    if ($daysLeft -lt 0)      { Write-Log "Data-protection certificate EXPIRED on $($cert.NotAfter.ToString('yyyy-MM-dd')) - output is still protected and still readable, but the certificate should be rotated." 'WARN' }
+    elseif ($daysLeft -lt 90) { Write-Log "Data-protection certificate expires in $daysLeft day(s) - plan a rotation." 'WARN' }
+
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $salt = New-Object byte[] 16; $rng.GetBytes($salt); $iv = New-Object byte[] 16; $rng.GetBytes($iv); $rng.Dispose()
-    $keys = Get-CdEncKeys $pw $salt
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() } finally { $aes.Dispose() }
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $mac = $hmac.ComputeHash([byte[]](@([byte]$script:_cdEncVer) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVer; alg = 'AES-256-CBC+HMAC-SHA256'; kdf = 'PBKDF2-SHA1'; iter = $script:_cdEncIter
-        salt = [Convert]::ToBase64String($salt); iv = [Convert]::ToBase64String($iv); ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+    try {
+        $km = New-Object byte[] 64   # 32 bytes AES + 32 bytes HMAC: one key never does two jobs
+        $rng.GetBytes($km)
+        $iv = New-Object byte[] 16; $rng.GetBytes($iv)
+    } finally { $rng.Dispose() }
+    $aesKey = $km[0..31]; $macKey = $km[32..63]
+
+    # GetRSAPublicKey, NOT $cert.PublicKey.Key: on PS 5.1 the latter returns the legacy
+    # RSACryptoServiceProvider, which rejects OaepSHA256 - and that fails only on the customer's machine.
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert)
+    try { $wkey = $rsa.Encrypt($km, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256) }
+    finally { if ($rsa) { $rsa.Dispose() } }
+
+    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $aesKey; $aes.IV = $iv
+    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() }
+    finally { $aes.Dispose() }
+
+    $kid = $cert.Thumbprint
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$macKey)
+    try { $mac = $hmac.ComputeHash((Get-CdEncMacInput $script:_cdEncVerCert $script:_cdEncAlg $kid $wkey $iv $ct)) } finally { $hmac.Dispose() }
+
+    Clear-CdEncBytes $km; Clear-CdEncBytes $aesKey; Clear-CdEncBytes $macKey
+
+    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVerCert; alg = $script:_cdEncAlg; kid = $kid
+        wkey = [Convert]::ToBase64String($wkey); iv = [Convert]::ToBase64String($iv)
+        ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
 }
-function Unprotect-CitrixData ([string]$Raw, [System.Security.SecureString]$Password) {
-    if (-not (Test-CitrixDataEncrypted $Raw)) { return $Raw }
-    if (-not $Password -or $Password.Length -eq 0) { throw 'This data file is encrypted - a password is required to open it.' }
-    $env = $Raw | ConvertFrom-Json; $pw = ConvertFrom-SecureStringPlain $Password
-    $salt = [Convert]::FromBase64String($env.salt); $iv = [Convert]::FromBase64String($env.iv)
-    $ct = [Convert]::FromBase64String($env.ct); $mac = [Convert]::FromBase64String($env.mac); $ver = [byte][int]$env.$($script:_cdEncMarker)
-    $keys = Get-CdEncKeys $pw $salt
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $expected = $hmac.ComputeHash([byte[]](@($ver) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    $ok = $mac.Length -eq $expected.Length; for ($i = 0; $i -lt $expected.Length; $i++) { if ($i -lt $mac.Length) { $ok = $ok -and ($mac[$i] -eq $expected[$i]) } }
-    if (-not $ok) { throw 'Could not decrypt the data file - the password is incorrect (or the file has been altered).' }
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $d = $aes.CreateDecryptor(); $pb = $d.TransformFinalBlock($ct, 0, $ct.Length); $d.Dispose() } finally { $aes.Dispose() }
-    [System.Text.Encoding]::UTF8.GetString($pb)
+
+# ONE decision point for every output this collector writes, so separate write paths cannot drift apart.
+function Protect-CollectorOutput ([string]$PlainJson) {
+    if ($script:_noProtect) { return @{ Json = $PlainJson; Ext = 'json' } }
+    return @{ Json = (Protect-CitrixDataCert $PlainJson); Ext = 'cdenc' }
 }
 #endregion
 
-$script:_version      = '2026-07-31'
+$script:_version      = '2026-08-03'
 # Version format is YYYY-MM-DD; add a .N suffix ONLY for a second or later release on the SAME day
 # (e.g. 2026-07-15, then 2026-07-15.1, .2 ...). A new day's first release needs no suffix.
 # Self-update: the launch check fetches update-manifest.json from euc-reports-collectors, compares this
@@ -126,7 +165,19 @@ $script:_version      = '2026-07-31'
 $script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
 $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
 $script:_selfName       = 'Get-CitrixCloudData.ps1'
-$script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Where this script lives. Inside an EXE wrapper none of the automatic variables that normally reveal it
+# are populated, which is why -ScriptDir exists: the EXE tells us. Most reliable source first.
+# This only RESOLVES the path - deliberately no Set-Location, because changing the process working
+# directory would alter how a relative -OutputPath resolves and would persist after the script exits.
+$script:_scriptDir =
+    if ($ScriptDir) {
+        if (-not (Test-Path -LiteralPath $ScriptDir)) { throw "-ScriptDir '$ScriptDir' does not exist." }
+        (Resolve-Path -LiteralPath $ScriptDir).Path
+    }
+    elseif ($PSScriptRoot)                { $PSScriptRoot }
+    elseif ($PSCommandPath)               { Split-Path -Parent $PSCommandPath }
+    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { throw 'Cannot determine the script directory (running from an EXE?). Pass -ScriptDir <path>.' }
 # Configs (including the DPAPI-encrypted client secret) live in the user's
 # local profile, not in the repo. LocalAppData is per-user + per-machine,
 # which matches DPAPI's protection scope. All EUC-report collectors share this
@@ -731,9 +782,6 @@ function Show-CustomerDialog {
                   Content="Run Citrix Advisor site check (on by default; extra ~15-60s, triggers a scan in the console)"
                   FontSize="11" Foreground="#555" IsChecked="True" Margin="0,0,0,16"/>
 
-        <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
-        <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
-
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
             <Button x:Name="CancelBtn" Content="Cancel" Width="80" Padding="0,7"
                     Style="{StaticResource GreyBtn}" Margin="0,0,8,0"/>
@@ -751,7 +799,6 @@ function Show-CustomerDialog {
     $newName  = $win.FindName('NewNameBox')
     $chkSession = $win.FindName('ChkSessionDetail')
     $chkAdvisor = $win.FindName('ChkAdvisor')
-    $encryptBox = $win.FindName('EncryptBox')
     $okBtn    = $win.FindName('OkBtn')
     $cancel   = $win.FindName('CancelBtn')
 
@@ -779,19 +826,18 @@ function Show-CustomerDialog {
         }
     }
 
-    $script:_dlgResult = [ordered]@{ Action = 'Cancel'; CustomerName = ''; IsNew = $false; CollectSessionDetail = $false; IncludeAdvisor = $false; EncryptPassword = $null }
+    $script:_dlgResult = [ordered]@{ Action = 'Cancel'; CustomerName = ''; IsNew = $false; CollectSessionDetail = $false; IncludeAdvisor = $false}
 
     $okBtn.Add_Click({
-        $encPw = if ($encryptBox.Password) { ConvertTo-SecureString $encryptBox.Password -AsPlainText -Force } else { $null }
         $newText = $newName.Text.Trim()
         if ($newText) {
             Write-Log "Customer dialog: 'New' chosen - '$newText'"
-            $script:_dlgResult = [ordered]@{ Action = 'New'; CustomerName = $newText; IsNew = $true; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked; EncryptPassword = $encPw }
+            $script:_dlgResult = [ordered]@{ Action = 'New'; CustomerName = $newText; IsNew = $true; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked}
             $win.DialogResult = $true
             $win.Close()
         } elseif ($combo.SelectedItem) {
             Write-Log "Customer dialog: 'Load' chosen - '$($combo.SelectedItem)'"
-            $script:_dlgResult = [ordered]@{ Action = 'Load'; CustomerName = "$($combo.SelectedItem)"; IsNew = $false; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked; EncryptPassword = $encPw }
+            $script:_dlgResult = [ordered]@{ Action = 'Load'; CustomerName = "$($combo.SelectedItem)"; IsNew = $false; CollectSessionDetail = [bool]$chkSession.IsChecked; IncludeAdvisor = [bool]$chkAdvisor.IsChecked}
             $win.DialogResult = $true
             $win.Close()
         } else {
@@ -2363,7 +2409,7 @@ function Get-CitrixSites {
             EnabledOnDeliveryGroups     = @(if ($a.EnabledOnDeliveryGroups) { $a.EnabledOnDeliveryGroups | ForEach-Object { "$_" } })
             ResourceLocationId          = "$($a.LogServerResourceLocationId)"
             # LogServerApiKey is a CREDENTIAL for the log service - record only that one is set. The JSON
-            # is a customer deliverable and is not encrypted unless -EncryptPassword was used.
+            # is a customer deliverable and is never certificate-protected.
             HasApiKey                   = [bool]$a.LogServerApiKey
         }
     }
@@ -3261,14 +3307,16 @@ function Invoke-Collection ([hashtable]$Config) {
     # Group outputs in a per-customer subfolder under the Outputs root.
     $custDir   = Join-Path $outPath $safeName
     if (-not (Test-Path $custDir)) { New-Item -ItemType Directory -Path $custDir -Force | Out-Null }
-    $encrypt   = ($EncryptPassword -and $EncryptPassword.Length -gt 0)
-    $outFile   = Join-Path $custDir ("$safeName-Citrix-Data-$timestamp." + $(if ($encrypt) { 'cdenc' } else { 'json' }))
+
+    $prot      = $null   # set below once the JSON exists; decides both content and extension
 
     try {
         $json = $output | ConvertTo-Json -Depth 20
-        if ($encrypt) { $json = Protect-CitrixData $json $EncryptPassword }
+        $prot    = Protect-CollectorOutput $json
+        $json    = $prot.Json
+        $outFile = Join-Path $custDir ("$safeName-Citrix-Data-$timestamp." + $prot.Ext)
         Set-Content -Path $outFile -Value $json -Encoding UTF8
-        Write-Log "Output written: $outFile ($([Math]::Round((Get-Item $outFile).Length / 1KB, 1)) KB)$(if ($encrypt) { ' [encrypted]' })"
+        Write-Log "Output written: $outFile ($([Math]::Round((Get-Item $outFile).Length / 1KB, 1)) KB)$(if ($prot.Ext -eq 'cdenc') { ' [certificate-protected]' })"
     } catch {
         Write-Log "Failed to write JSON: $_" 'ERROR'
         $errors++
@@ -3317,8 +3365,6 @@ if ($ConfigFile -and (Test-Path $ConfigFile)) {
 } else {
     $sel = Show-CustomerDialog
     if ($sel['Action'] -eq 'Cancel') { Write-Log 'User cancelled at customer dialog'; exit 0 }
-    # Dialog password box wins only if -EncryptPassword wasn't already passed on the command line.
-    if (-not $EncryptPassword -and $sel['EncryptPassword']) { $EncryptPassword = $sel['EncryptPassword'] }
 
     if ($sel['IsNew']) {
         Write-Log "Launching cloud setup dialog for new customer '$($sel['CustomerName'])'"

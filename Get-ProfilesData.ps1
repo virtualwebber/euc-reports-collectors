@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# Version: 2026-07-23.3   (keep in lock-step with $script:_version below)
+﻿#Requires -Version 5.1
+# Version: 2026-08-03   (keep in lock-step with $script:_version below)
 <#
 .SYNOPSIS
     Collects raw data about user-profile storage shares (FSLogix / Citrix Profile Management) for
@@ -39,10 +39,6 @@
     List EVERY file recursively (relative path + size) per top-level folder, instead of only the
     immediate files/subfolders. Can be slow and produce large JSON on big CPM shares.
 
-.PARAMETER EncryptPassword
-    Optional: encrypt the output with this password (writes <name>.cdenc instead of .json).
-    OFF by default - omit it and the output stays plaintext .json.
-
 .PARAMETER NoSplash
     Headless - suppress the WPF splash and message boxes (status still goes to the console and
     ProfilesData-Debug.log). For command-line / scripted use.
@@ -63,10 +59,17 @@ param(
     [switch]$FullInventory,
     # Optional: encrypt the collected data file with this password (writes <name>.cdenc instead of
     # .json). OFF by default - omit it and output stays plaintext .json.
-    [System.Security.SecureString]$EncryptPassword,
     [switch]$NoSplash,
     # Skip the launch-time GitHub self-update check (also skipped automatically with -NoSplash).
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    # Directory this script should treat as its own location. Only needed when the collector is run from
+    # inside an EXE wrapper (PS2EXE and similar), where PowerShell cannot work out where the script is.
+    # Must be WRITABLE - the Outputs\ folder, the debug log and configs\ are all created under it.
+    [string]$ScriptDir,
+    # Write plain, unencrypted .json instead of a certificate-protected .cdenc.
+    # TODO (agreed 2026-08-01): REMOVE once certificate protection has been used on a real
+    # engagement - a documented way to turn protection off defeats defaulting it on.
+    [switch]$NoProtect
 )
 
 Set-StrictMode -Off
@@ -76,7 +79,7 @@ $ErrorActionPreference = 'Continue'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-$script:_version      = '2026-07-23.3'
+$script:_version      = '2026-08-03'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # (a few bytes); the full script downloads only when a newer version exists AND the user accepts. Keep
 # the '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -86,7 +89,19 @@ $script:_version      = '2026-07-23.3'
 $script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
 $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
 $script:_selfName       = 'Get-ProfilesData.ps1'
-$script:_scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Where this script lives. Inside an EXE wrapper none of the automatic variables that normally reveal it
+# are populated, which is why -ScriptDir exists: the EXE tells us. Most reliable source first.
+# This only RESOLVES the path - deliberately no Set-Location, because changing the process working
+# directory would alter how a relative -OutputPath resolves and would persist after the script exits.
+$script:_scriptDir =
+    if ($ScriptDir) {
+        if (-not (Test-Path -LiteralPath $ScriptDir)) { throw "-ScriptDir '$ScriptDir' does not exist." }
+        (Resolve-Path -LiteralPath $ScriptDir).Path
+    }
+    elseif ($PSScriptRoot)                { $PSScriptRoot }
+    elseif ($PSCommandPath)               { Split-Path -Parent $PSCommandPath }
+    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { throw 'Cannot determine the script directory (running from an EXE?). Pass -ScriptDir <path>.' }
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
 $script:_debugLogPath = Join-Path $script:_scriptDir "ProfilesData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_splash       = $null
@@ -99,7 +114,6 @@ $script:_splashHandle = $null
 $script:_splashLogoB64 = @'
 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
 '@
-$script:_encryptPassword = $null   # set from -EncryptPassword or the launch dialog; $null = plaintext
 
 if (-not (Test-Path $script:_outputDir)) { New-Item -ItemType Directory -Path $script:_outputDir -Force | Out-Null }
 
@@ -295,33 +309,86 @@ function Invoke-ProfilesUpdateCheck {
 #endregion
 
 #region ── Data-file encryption (opt-in, self-contained) ──────────────────────
-# Portable password-based encryption for the output data file. OFF unless -EncryptPassword is given.
 # AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC); PBKDF2 (Rfc2898DeriveBytes 3-arg SHA1 form - identical
 # on .NET Framework 5.1 and .NET Core 7, so a .cdenc file decrypts on the report/app service). Shared
 # .cdenc format with the other EUC reports. The password is never written to the file or a log.
-$script:_cdEncMarker = '_cdenc'; $script:_cdEncVer = 1; $script:_cdEncIter = 200000
-function ConvertFrom-SecureStringPlain ([System.Security.SecureString]$Secure) {
-    if (-not $Secure) { return '' }
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
-    try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-    finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+$script:_cdEncMarker = '_cdenc'
+$script:_noProtect   = $false   # -NoProtect: write plain .json instead of a protected .cdenc
+# v2 - CERTIFICATE mode, the only mode. A random AES key encrypts the data and is RSA-wrapped to OUR
+# public key, so collected data can only be opened by the holder of the private key. The customer running
+# this script cannot read its own output: nothing here is capable of decryption, which is the point.
+# There is deliberately NO password option - a second, weaker way to protect a file is one that
+# eventually gets used by accident. -NoProtect writes plain .json instead.
+$script:_cdEncVerCert = 2; $script:_cdEncAlg = 'AES-256-CBC+HMAC-SHA256'
+# PUBLIC certificate (base64 DER), written here by encryption\New-DataProtectionCert.ps1. Public-only:
+# it can lock a file and nothing more, so shipping it inside this script gives an attacker nothing.
+$script:_dpCertB64 = 'MIIEHTCCAoWgAwIBAgIQERPpywxj96FC80CeAsKOSzANBgkqhkiG9w0BAQsFADAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wHhcNMjYwODAzMDYyMjA0WhcNMzEwODAzMDYzMTU5WjAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDHxMuRIxWSyzTF6CEXXBtzPxgesxcdThK/PORvQ+CWar/b/gIaB63DDqGz0OvUsWyAAVPGiaaElmxQxux62x0J5ZpbVfRSwLbFbksrXq+fUMJI/fYDG49Klj/PKeTYX0lOCwr5rDI1JPSWuunp+3KK0Flvt8kx8HLVwGaHIbYCjxZ2k3d9yyHueSkGfDDoou28rVRVMH+3BZYNM7vD/fLk2AbkD7utM+D2eSvzNs/x1B8fzSTlOFCT5lDiY9N51GIR1tf2wxt/ft6gpz/YS7G5ECqKwMGcGDe1aNwSdnDjmZuA7e+AXIr0An0/xRGgwjY2ScjCpwhXdQwARBkGWcsTZG4VN9m4GM5iCDo+R95h9PG39jbRVdHPUqlSN+FF/rIwqYdzS//MG2xF7J8zg/ApygxKBEUSNT37eV/bgRAclEJqnR/SvHEXVZJI/J4/DmO/vhSZr/qV1szaZJU2Z2J+xlyML3f9+9O77sEE/hhOEgOQw5c+z4YYFtpyndIlJt0CAwEAAaNHMEUwDgYDVR0PAQH/BAQDAgQwMBQGA1UdJQQNMAsGCSsGAQQBgjdQATAdBgNVHQ4EFgQUrcDSJBxwg9rxEU/tavdbA4ZcByAwDQYJKoZIhvcNAQELBQADggGBABMmhGsPDt5zr4Lw5E7dZFrqoM2wvT+wXGjFSNc80cir6Mc/79fmxZrP5Ll0ws44m15UmybwOvm2JXTvXBeVWc5pBSiLVNQCMe+vWl1PUGSiQgQLt9lu+/lai6aDBhcAeV7ZoaPEVvN/PX+FQuvqiHD3muO29RKAwOuvSaYupftqPQ42qn1cSN8NQt1dXdyMV2uAdNVORmUKlobB9kP5F3Dd7Z8vqxlSlJcDBbGF+nAwr0ZRGP3Tz0ngCum/Lm23R4ilktvblGOxEzLaZRVtYnAKgq7UfefSo6lIf1gBhIvEiJH8dm2BIzCDWTDUYVH3lqLHNAtOJc24jGNH4Sc45aS1geY0smapvBopLKUbLJ/HruSeNiClhBPmdpDExvQMD+DJgFm44rBKZvHU+BymTNxn3XzsTEd9ePlBzGv/dLHq8s6zWlsITSu21bnFiorS1+EWKRIEJaA7FSte5sRNn66XD1c3uWAGHq9ytuoM2WLBFsJHrJJ+4Cl7Yy774etZPQ=='
+# Length-prefixed fields, so the MAC input cannot be made ambiguous by shifting bytes between fields.
+function Add-CdEncMacField ([System.IO.MemoryStream]$Stream, [byte[]]$Bytes) {
+    $len = [BitConverter]::GetBytes([int]$Bytes.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+    $Stream.Write($len, 0, 4)
+    if ($Bytes.Length) { $Stream.Write($Bytes, 0, $Bytes.Length) }
 }
-function Get-CdEncKeys ([string]$PwText, [byte[]]$Salt) {
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PwText, $Salt, $script:_cdEncIter)
-    try { $b = $kdf.GetBytes(64); @{ Aes = $b[0..31]; Mac = $b[32..63] } } finally { $kdf.Dispose() }
+# Authenticates the WHOLE header - ver, alg, kid, wkey, iv, ct - so no metadata can be altered undetected.
+function Get-CdEncMacInput ([int]$Ver, [string]$Alg, [string]$Kid, [byte[]]$WKey, [byte[]]$Iv, [byte[]]$Ct) {
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        Add-CdEncMacField $ms ([byte[]]@([byte]$Ver))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Alg))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Kid))
+        Add-CdEncMacField $ms $WKey; Add-CdEncMacField $ms $Iv; Add-CdEncMacField $ms $Ct
+        $ms.ToArray()
+    } finally { $ms.Dispose() }
 }
-function Protect-ReportData ([string]$PlainJson, [System.Security.SecureString]$Password) {
-    if (-not $Password -or $Password.Length -eq 0) { throw 'Protect-ReportData: a password is required.' }
-    $pw = ConvertFrom-SecureStringPlain $Password
+function Clear-CdEncBytes ([byte[]]$B) { if ($B) { [Array]::Clear($B, 0, $B.Length) } }
+
+function Protect-ReportDataCert ([string]$PlainJson) {
+    if (-not $script:_dpCertB64) {
+        throw 'No data-protection certificate is embedded in this collector, so the output cannot be protected. Re-run with -NoProtect to write plain JSON, or use a collector built after the certificate was issued.'
+    }
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, [byte[]][Convert]::FromBase64String($script:_dpCertB64))
+    if ($cert.HasPrivateKey) { throw 'The embedded data-protection certificate contains a private key - it must be public-only.' }
+
+    # Expiry is a PROMPT TO ROTATE, never a reason to stop: nothing validates a chain or a date, so an
+    # expired key encrypts and decrypts exactly as before, and files already written stay readable.
+    $daysLeft = [int]([math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays))
+    if ($daysLeft -lt 0)      { Write-Log "Data-protection certificate EXPIRED on $($cert.NotAfter.ToString('yyyy-MM-dd')) - output is still protected and still readable, but the certificate should be rotated." 'WARN' }
+    elseif ($daysLeft -lt 90) { Write-Log "Data-protection certificate expires in $daysLeft day(s) - plan a rotation." 'WARN' }
+
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $salt = New-Object byte[] 16; $rng.GetBytes($salt); $iv = New-Object byte[] 16; $rng.GetBytes($iv); $rng.Dispose()
-    $keys = Get-CdEncKeys $pw $salt
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() } finally { $aes.Dispose() }
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $mac = $hmac.ComputeHash([byte[]](@([byte]$script:_cdEncVer) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVer; alg = 'AES-256-CBC+HMAC-SHA256'; kdf = 'PBKDF2-SHA1'; iter = $script:_cdEncIter
-        salt = [Convert]::ToBase64String($salt); iv = [Convert]::ToBase64String($iv); ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+    try {
+        $km = New-Object byte[] 64   # 32 bytes AES + 32 bytes HMAC: one key never does two jobs
+        $rng.GetBytes($km)
+        $iv = New-Object byte[] 16; $rng.GetBytes($iv)
+    } finally { $rng.Dispose() }
+    $aesKey = $km[0..31]; $macKey = $km[32..63]
+
+    # GetRSAPublicKey, NOT $cert.PublicKey.Key: on PS 5.1 the latter returns the legacy
+    # RSACryptoServiceProvider, which rejects OaepSHA256 - and that fails only on the customer's machine.
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert)
+    try { $wkey = $rsa.Encrypt($km, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256) }
+    finally { if ($rsa) { $rsa.Dispose() } }
+
+    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $aesKey; $aes.IV = $iv
+    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() }
+    finally { $aes.Dispose() }
+
+    $kid = $cert.Thumbprint
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$macKey)
+    try { $mac = $hmac.ComputeHash((Get-CdEncMacInput $script:_cdEncVerCert $script:_cdEncAlg $kid $wkey $iv $ct)) } finally { $hmac.Dispose() }
+
+    Clear-CdEncBytes $km; Clear-CdEncBytes $aesKey; Clear-CdEncBytes $macKey
+
+    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVerCert; alg = $script:_cdEncAlg; kid = $kid
+        wkey = [Convert]::ToBase64String($wkey); iv = [Convert]::ToBase64String($iv)
+        ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+}
+
+# ONE decision point for every output this collector writes, so separate write paths cannot drift apart.
+function Protect-CollectorOutput ([string]$PlainJson) {
+    if ($script:_noProtect) { return @{ Json = $PlainJson; Ext = 'json' } }
+    return @{ Json = (Protect-ReportDataCert $PlainJson); Ext = 'cdenc' }
 }
 #endregion
 
@@ -1217,9 +1284,6 @@ function Show-ProfilesDialog {
         <CheckBox x:Name="FullChk" Content="Full file inventory (every file recursively - slower, larger output)"
                   Foreground="#1F2937" FontSize="12" Margin="0,0,0,12"/>
 
-        <TextBlock Text="Encrypt output (optional - leave blank for plaintext .json; a password writes .cdenc)" FontSize="11" FontWeight="SemiBold" Foreground="#555" Margin="0,0,0,6"/>
-        <PasswordBox x:Name="EncryptBox" Padding="8,6" BorderBrush="#CDD0D6" BorderThickness="1" Background="White" FontSize="12" Margin="0,0,0,16"/>
-
         <Grid>
             <TextBlock x:Name="VersionText" Text="" FontSize="10" Foreground="#8a8f98" VerticalAlignment="Center" HorizontalAlignment="Left"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -1235,11 +1299,10 @@ function Show-ProfilesDialog {
     $customerBox = $win.FindName('CustomerBox')
     $sharesBox   = $win.FindName('SharesBox')
     $fullChk     = $win.FindName('FullChk')
-    $encryptBox  = $win.FindName('EncryptBox')
     $okBtn       = $win.FindName('OkBtn')
     $cancel      = $win.FindName('CancelBtn')
 
-    $result = [ordered]@{ Action = 'Cancel'; Shares = @(); Customer = ''; FullInventory = $false; EncryptPassword = $null }
+    $result = [ordered]@{ Action = 'Cancel'; Shares = @(); Customer = ''; FullInventory = $false}
 
     $okBtn.Add_Click({
         $lines = @($sharesBox.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1251,7 +1314,6 @@ function Show-ProfilesDialog {
         $result['Shares']  = $lines
         $result['Customer'] = $customerBox.Text.Trim()
         $result['FullInventory'] = [bool]$fullChk.IsChecked
-        if ($encryptBox.Password) { $result['EncryptPassword'] = ConvertTo-SecureString $encryptBox.Password -AsPlainText -Force }
         $win.Close()
     })
     $cancel.Add_Click({ $result['Action'] = 'Cancel'; $win.Close() })
@@ -1453,7 +1515,6 @@ Invoke-ProfilesUpdateCheck
 $targets  = @($Shares | Where-Object { "$_".Trim() })
 $customer = $Customer
 $full     = [bool]$FullInventory
-$script:_encryptPassword = $EncryptPassword
 
 if ($targets.Count -eq 0) {
     $sel = Show-ProfilesDialog
@@ -1461,9 +1522,8 @@ if ($targets.Count -eq 0) {
     $targets = @($sel['Shares'])
     if (-not $customer) { $customer = $sel['Customer'] }
     $full = [bool]$sel['FullInventory']
-    if ($sel['EncryptPassword']) { $script:_encryptPassword = $sel['EncryptPassword'] }
 }
-Write-Log "Targets: $($targets -join ', '); full=$full; encrypt=$(if ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0) { 'on (.cdenc)' } else { 'off (plaintext .json)' })"
+Write-Log "Targets: $($targets -join ', '); full=$full; protection=$(if ($script:_noProtect) { 'off (-NoProtect: plaintext .json)' } else { 'certificate (.cdenc)' })"
 
 # Group outputs in a per-customer subfolder (when a customer is supplied).
 $safeCustomer = ("$customer" -replace '[^\w\-. ]', '_').Trim().TrimEnd('.')
@@ -1530,13 +1590,14 @@ $output = [ordered]@{
 Set-SplashStatus 'Writing output file...'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $prefix    = if ($safeCustomer) { $safeCustomer } else { 'Profiles' }
-$encrypt   = ($script:_encryptPassword -and $script:_encryptPassword.Length -gt 0)
-$outFile   = Join-Path $script:_outputDir ("$prefix-Profiles-Data-$timestamp." + $(if ($encrypt) { 'cdenc' } else { 'json' }))
+    $outFile   = Join-Path $script:_outputDir "$prefix-Profiles-Data-$timestamp.json"   # extension set by Protect-CollectorOutput below
 try {
     $json = $output | ConvertTo-Json -Depth 12
-    if ($encrypt) { $json = Protect-ReportData $json $script:_encryptPassword }
+        $prot    = Protect-CollectorOutput $json
+        $json    = $prot.Json
+        $outFile = [System.IO.Path]::ChangeExtension($outFile, $prot.Ext)
     Set-Content -Path $outFile -Value $json -Encoding UTF8
-    Write-Log "Output written: $outFile ($([Math]::Round((Get-Item $outFile).Length / 1KB, 1)) KB)$(if ($encrypt) { ' [encrypted]' })"
+        Write-Log "Output written: $outFile ($([Math]::Round((Get-Item $outFile).Length / 1KB, 1)) KB)$(if ($prot.Ext -eq 'cdenc') { ' [certificate-protected]' })"
 } catch {
     Write-Log "Failed to write output: $_" 'ERROR'
 }

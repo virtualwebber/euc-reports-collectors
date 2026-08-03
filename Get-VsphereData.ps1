@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# Version: 2026-07-23.2   (keep in lock-step with $script:_version below and the published .version file)
+﻿#Requires -Version 5.1
+# Version: 2026-08-03   (keep in lock-step with $script:_version below and the published .version file)
 <#
 .SYNOPSIS
     Collects VMware vSphere host + VM utilisation data from a vCenter (VCSA) for the Hosting report.
@@ -27,7 +27,6 @@
 .PARAMETER Customer       Customer name; groups output under Outputs\<Customer>.
 .PARAMETER OutputPath     Override the output root (default: Outputs\ next to this script).
 .PARAMETER ReadySamples   Real-time (20s) samples to average for CPU Ready (default 15 = ~5 min).
-.PARAMETER EncryptPassword  Encrypt the output with this password (writes .cdenc instead of .json).
 .PARAMETER NoSplash       Headless - no WPF splash/dialog (needs -VCenter/-Username/-Password/scope).
 .PARAMETER SkipUpdateCheck  Skip the launch-time GitHub self-update check.
 
@@ -48,15 +47,22 @@ param(
     [switch]$NoPerf,
     [switch]$HostsOnly,
     [switch]$NoLiveView,
-    [System.Security.SecureString]$EncryptPassword,
     [switch]$NoSplash,
-    [switch]$SkipUpdateCheck
+    [switch]$SkipUpdateCheck,
+    # Directory this script should treat as its own location. Only needed when the collector is run from
+    # inside an EXE wrapper (PS2EXE and similar), where PowerShell cannot work out where the script is.
+    # Must be WRITABLE - the Outputs\ folder, the debug log and configs\ are all created under it.
+    [string]$ScriptDir,
+    # Write plain, unencrypted .json instead of a certificate-protected .cdenc.
+    # TODO (agreed 2026-08-01): REMOVE once certificate protection has been used on a real
+    # engagement - a documented way to turn protection off defeats defaulting it on.
+    [switch]$NoProtect
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-$script:_version = '2026-07-23.2'
+$script:_version = '2026-08-03'
 # Self-update source (public euc-reports-collectors repo): the launch check reads a TINY .version file
 # and downloads the full script only when a newer version exists AND the user accepts. Keep the
 # '# Version:' header, this $script:_version, and the published .version file in lock-step per release.
@@ -67,8 +73,19 @@ $script:_manifestUrl    = 'https://raw.githubusercontent.com/virtualwebber/euc-r
 $script:_updateRawBase  = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main'
 $script:_selfName       = 'Get-VsphereData.ps1'
 
-$script:_scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $script:_scriptDir) { $script:_scriptDir = (Get-Location).Path }
+# Where this script lives. Inside an EXE wrapper none of the automatic variables that normally reveal it
+# are populated, which is why -ScriptDir exists: the EXE tells us. Most reliable source first.
+# This only RESOLVES the path - deliberately no Set-Location, because changing the process working
+# directory would alter how a relative -OutputPath resolves and would persist after the script exits.
+$script:_scriptDir =
+    if ($ScriptDir) {
+        if (-not (Test-Path -LiteralPath $ScriptDir)) { throw "-ScriptDir '$ScriptDir' does not exist." }
+        (Resolve-Path -LiteralPath $ScriptDir).Path
+    }
+    elseif ($PSScriptRoot)                { $PSScriptRoot }
+    elseif ($PSCommandPath)               { Split-Path -Parent $PSCommandPath }
+    elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    else { throw 'Cannot determine the script directory (running from an EXE?). Pass -ScriptDir <path>.' }
 $script:_outputDir    = if ($OutputPath) { $OutputPath } else { Join-Path $script:_scriptDir 'Outputs' }
 $script:_debugLogPath = Join-Path $script:_scriptDir "VsphereData-Debug-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:_noSplash     = [bool]$NoSplash
@@ -104,30 +121,92 @@ public static class VsphereCertBypass {
 
 #region -- Data-file encryption (opt-in, self-contained) ----------------------
 # AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC); PBKDF2 (Rfc2898DeriveBytes 3-arg SHA1 form - identical
-# on 5.1 and 7). Shared .cdenc format with the other EUC reports. Off unless -EncryptPassword given.
-$script:_cdEncMarker = '_cdenc'; $script:_cdEncVer = 1; $script:_cdEncIter = 200000
+# on 5.1 and 7). Shared .cdenc format with the other EUC reports.
+# Unwraps a SecureString safely (frees the BSTR). Used for the appliance/host credential - NOT for file
+# encryption, which is certificate-based and never handles a password.
 function ConvertFrom-SecureStringPlain ([System.Security.SecureString]$Secure) {
     if (-not $Secure) { return '' }
     $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
     try { [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
     finally { [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
-function Get-CdEncKeys ([string]$PwText, [byte[]]$Salt) {
-    $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($PwText, $Salt, $script:_cdEncIter)
-    try { $b = $kdf.GetBytes(64); @{ Aes = $b[0..31]; Mac = $b[32..63] } } finally { $kdf.Dispose() }
+$script:_cdEncMarker = '_cdenc'
+$script:_noProtect   = $false   # -NoProtect: write plain .json instead of a protected .cdenc
+# v2 - CERTIFICATE mode, the only mode. A random AES key encrypts the data and is RSA-wrapped to OUR
+# public key, so collected data can only be opened by the holder of the private key. The customer running
+# this script cannot read its own output: nothing here is capable of decryption, which is the point.
+# There is deliberately NO password option - a second, weaker way to protect a file is one that
+# eventually gets used by accident. -NoProtect writes plain .json instead.
+$script:_cdEncVerCert = 2; $script:_cdEncAlg = 'AES-256-CBC+HMAC-SHA256'
+# PUBLIC certificate (base64 DER), written here by encryption\New-DataProtectionCert.ps1. Public-only:
+# it can lock a file and nothing more, so shipping it inside this script gives an attacker nothing.
+$script:_dpCertB64 = 'MIIEHTCCAoWgAwIBAgIQERPpywxj96FC80CeAsKOSzANBgkqhkiG9w0BAQsFADAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wHhcNMjYwODAzMDYyMjA0WhcNMzEwODAzMDYzMTU5WjAmMSQwIgYDVQQDDBtFVUMgUmVwb3J0cyBEYXRhIFByb3RlY3Rpb24wggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGKAoIBgQDHxMuRIxWSyzTF6CEXXBtzPxgesxcdThK/PORvQ+CWar/b/gIaB63DDqGz0OvUsWyAAVPGiaaElmxQxux62x0J5ZpbVfRSwLbFbksrXq+fUMJI/fYDG49Klj/PKeTYX0lOCwr5rDI1JPSWuunp+3KK0Flvt8kx8HLVwGaHIbYCjxZ2k3d9yyHueSkGfDDoou28rVRVMH+3BZYNM7vD/fLk2AbkD7utM+D2eSvzNs/x1B8fzSTlOFCT5lDiY9N51GIR1tf2wxt/ft6gpz/YS7G5ECqKwMGcGDe1aNwSdnDjmZuA7e+AXIr0An0/xRGgwjY2ScjCpwhXdQwARBkGWcsTZG4VN9m4GM5iCDo+R95h9PG39jbRVdHPUqlSN+FF/rIwqYdzS//MG2xF7J8zg/ApygxKBEUSNT37eV/bgRAclEJqnR/SvHEXVZJI/J4/DmO/vhSZr/qV1szaZJU2Z2J+xlyML3f9+9O77sEE/hhOEgOQw5c+z4YYFtpyndIlJt0CAwEAAaNHMEUwDgYDVR0PAQH/BAQDAgQwMBQGA1UdJQQNMAsGCSsGAQQBgjdQATAdBgNVHQ4EFgQUrcDSJBxwg9rxEU/tavdbA4ZcByAwDQYJKoZIhvcNAQELBQADggGBABMmhGsPDt5zr4Lw5E7dZFrqoM2wvT+wXGjFSNc80cir6Mc/79fmxZrP5Ll0ws44m15UmybwOvm2JXTvXBeVWc5pBSiLVNQCMe+vWl1PUGSiQgQLt9lu+/lai6aDBhcAeV7ZoaPEVvN/PX+FQuvqiHD3muO29RKAwOuvSaYupftqPQ42qn1cSN8NQt1dXdyMV2uAdNVORmUKlobB9kP5F3Dd7Z8vqxlSlJcDBbGF+nAwr0ZRGP3Tz0ngCum/Lm23R4ilktvblGOxEzLaZRVtYnAKgq7UfefSo6lIf1gBhIvEiJH8dm2BIzCDWTDUYVH3lqLHNAtOJc24jGNH4Sc45aS1geY0smapvBopLKUbLJ/HruSeNiClhBPmdpDExvQMD+DJgFm44rBKZvHU+BymTNxn3XzsTEd9ePlBzGv/dLHq8s6zWlsITSu21bnFiorS1+EWKRIEJaA7FSte5sRNn66XD1c3uWAGHq9ytuoM2WLBFsJHrJJ+4Cl7Yy774etZPQ=='
+# Length-prefixed fields, so the MAC input cannot be made ambiguous by shifting bytes between fields.
+function Add-CdEncMacField ([System.IO.MemoryStream]$Stream, [byte[]]$Bytes) {
+    $len = [BitConverter]::GetBytes([int]$Bytes.Length)
+    if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+    $Stream.Write($len, 0, 4)
+    if ($Bytes.Length) { $Stream.Write($Bytes, 0, $Bytes.Length) }
 }
-function Protect-ReportData ([string]$PlainJson, [System.Security.SecureString]$Password) {
-    if (-not $Password -or $Password.Length -eq 0) { throw 'Protect-ReportData: a password is required.' }
-    $pw = ConvertFrom-SecureStringPlain $Password
+# Authenticates the WHOLE header - ver, alg, kid, wkey, iv, ct - so no metadata can be altered undetected.
+function Get-CdEncMacInput ([int]$Ver, [string]$Alg, [string]$Kid, [byte[]]$WKey, [byte[]]$Iv, [byte[]]$Ct) {
+    $ms = New-Object System.IO.MemoryStream
+    try {
+        Add-CdEncMacField $ms ([byte[]]@([byte]$Ver))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Alg))
+        Add-CdEncMacField $ms ([System.Text.Encoding]::UTF8.GetBytes($Kid))
+        Add-CdEncMacField $ms $WKey; Add-CdEncMacField $ms $Iv; Add-CdEncMacField $ms $Ct
+        $ms.ToArray()
+    } finally { $ms.Dispose() }
+}
+function Clear-CdEncBytes ([byte[]]$B) { if ($B) { [Array]::Clear($B, 0, $B.Length) } }
+
+function Protect-ReportDataCert ([string]$PlainJson) {
+    if (-not $script:_dpCertB64) {
+        throw 'No data-protection certificate is embedded in this collector, so the output cannot be protected. Re-run with -NoProtect to write plain JSON, or use a collector built after the certificate was issued.'
+    }
+    $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(, [byte[]][Convert]::FromBase64String($script:_dpCertB64))
+    if ($cert.HasPrivateKey) { throw 'The embedded data-protection certificate contains a private key - it must be public-only.' }
+
+    # Expiry is a PROMPT TO ROTATE, never a reason to stop: nothing validates a chain or a date, so an
+    # expired key encrypts and decrypts exactly as before, and files already written stay readable.
+    $daysLeft = [int]([math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays))
+    if ($daysLeft -lt 0)      { Write-Log "Data-protection certificate EXPIRED on $($cert.NotAfter.ToString('yyyy-MM-dd')) - output is still protected and still readable, but the certificate should be rotated." 'WARN' }
+    elseif ($daysLeft -lt 90) { Write-Log "Data-protection certificate expires in $daysLeft day(s) - plan a rotation." 'WARN' }
+
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $salt = New-Object byte[] 16; $rng.GetBytes($salt); $iv = New-Object byte[] 16; $rng.GetBytes($iv); $rng.Dispose()
-    $keys = Get-CdEncKeys $pw $salt
-    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $keys.Aes; $aes.IV = $iv
-    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() } finally { $aes.Dispose() }
-    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$keys.Mac)
-    try { $mac = $hmac.ComputeHash([byte[]](@([byte]$script:_cdEncVer) + $salt + $iv + $ct)) } finally { $hmac.Dispose() }
-    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVer; alg = 'AES-256-CBC+HMAC-SHA256'; kdf = 'PBKDF2-SHA1'; iter = $script:_cdEncIter
-        salt = [Convert]::ToBase64String($salt); iv = [Convert]::ToBase64String($iv); ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+    try {
+        $km = New-Object byte[] 64   # 32 bytes AES + 32 bytes HMAC: one key never does two jobs
+        $rng.GetBytes($km)
+        $iv = New-Object byte[] 16; $rng.GetBytes($iv)
+    } finally { $rng.Dispose() }
+    $aesKey = $km[0..31]; $macKey = $km[32..63]
+
+    # GetRSAPublicKey, NOT $cert.PublicKey.Key: on PS 5.1 the latter returns the legacy
+    # RSACryptoServiceProvider, which rejects OaepSHA256 - and that fails only on the customer's machine.
+    $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($cert)
+    try { $wkey = $rsa.Encrypt($km, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256) }
+    finally { if ($rsa) { $rsa.Dispose() } }
+
+    $aes = [System.Security.Cryptography.Aes]::Create(); $aes.KeySize = 256; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'; $aes.Key = $aesKey; $aes.IV = $iv
+    try { $e = $aes.CreateEncryptor(); $pb = [System.Text.Encoding]::UTF8.GetBytes($PlainJson); $ct = $e.TransformFinalBlock($pb, 0, $pb.Length); $e.Dispose() }
+    finally { $aes.Dispose() }
+
+    $kid = $cert.Thumbprint
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256(, [byte[]]$macKey)
+    try { $mac = $hmac.ComputeHash((Get-CdEncMacInput $script:_cdEncVerCert $script:_cdEncAlg $kid $wkey $iv $ct)) } finally { $hmac.Dispose() }
+
+    Clear-CdEncBytes $km; Clear-CdEncBytes $aesKey; Clear-CdEncBytes $macKey
+
+    ([ordered]@{ $script:_cdEncMarker = $script:_cdEncVerCert; alg = $script:_cdEncAlg; kid = $kid
+        wkey = [Convert]::ToBase64String($wkey); iv = [Convert]::ToBase64String($iv)
+        ct = [Convert]::ToBase64String($ct); mac = [Convert]::ToBase64String($mac) } | ConvertTo-Json)
+}
+
+# ONE decision point for every output this collector writes, so separate write paths cannot drift apart.
+function Protect-CollectorOutput ([string]$PlainJson) {
+    if ($script:_noProtect) { return @{ Json = $PlainJson; Ext = 'json' } }
+    return @{ Json = (Protect-ReportDataCert $PlainJson); Ext = 'cdenc' }
 }
 #endregion
 
@@ -1140,7 +1219,6 @@ if ($needDialog) {
     if ($sel.Action -eq 'Cancel') { Write-Log 'User cancelled at launch dialog'; exit 0 }
     $VCenter = $sel.VCenter; $Username = $sel.Username; $Password = $sel.Password; $Customer = $sel.Customer
     if ($sel.ScopeType -eq 'Cluster') { $Cluster = $sel.Scope; $VMHost = '' } else { $VMHost = $sel.Scope; $Cluster = '' }
-    if ($sel.Encrypt) { $EncryptPassword = $sel.Encrypt }
     $NoPerf = [bool]$sel.NoPerf
     $NoLiveView = [bool]$sel.NoLiveView
     if ($sel.DurationMinutes) { $DurationMinutes = [int]$sel.DurationMinutes }
@@ -1148,18 +1226,17 @@ if ($needDialog) {
 if (-not $VCenter -or -not $Username -or -not $Password -or (-not $Cluster -and -not $VMHost)) { throw 'Missing -VCenter / -Username / -Password / scope (-Cluster or -VMHost).' }
 
 # Output target computed up-front so the monitoring loop can write incrementally (crash-safe long runs).
-$encrypt = ($EncryptPassword -and $EncryptPassword.Length -gt 0)
 $safeCustomer = if ($Customer) { ($Customer -replace '[^\w\-. ]', '_').Trim() } else { '' }
 $outDir = if ($safeCustomer) { Join-Path $script:_outputDir $safeCustomer } else { $script:_outputDir }
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $base = if ($safeCustomer) { "$safeCustomer-Vsphere-Data-$stamp" } else { "Vsphere-Data-$stamp" }
-$ext = if ($encrypt) { '.cdenc' } else { '.json' }
+$prot = $null   # set at write time; decides content and extension together
 $outFile = Join-Path $outDir "$base$ext"
 $writer = {
     param($d)
     $j = $d | ConvertTo-Json -Depth 12
-    if ($encrypt) { Set-Content -Path $outFile -Value (Protect-ReportData $j $EncryptPassword) -Encoding UTF8 }
+    $prot = Protect-CollectorOutput $j; $j = $prot.Json; $ext = '.' + $prot.Ext
     else { Set-Content -Path $outFile -Value $j -Encoding UTF8 }
 }
 
@@ -1189,7 +1266,7 @@ Disconnect-Vsphere
 # Final write (idempotent - the monitoring loop already wrote each tick).
 try {
     & $writer $data
-    Write-Log "Output written: $outFile ($([math]::Round((Get-Item $outFile).Length/1KB,1)) KB)$(if ($encrypt) { ' [encrypted]' })"
+    Write-Log "Output written: $outFile ($([math]::Round((Get-Item $outFile).Length/1KB,1)) KB)$(if ($prot.Ext -eq 'cdenc') { ' [certificate-protected]' })"
 } catch { Write-Log "Failed to write output: $_" 'ERROR'; Show-MsgBox "Failed to write output:`n$($_.Exception.Message)" -Icon Error; exit 1 }
 
 Close-Splash
