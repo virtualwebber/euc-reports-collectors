@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03.3   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-08-03.4   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -83,7 +83,7 @@ param(
     [switch]$NoProtect
 )
 
-$script:CollectorVersion = '2026-08-03.3'
+$script:CollectorVersion = '2026-08-03.4'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -1132,6 +1132,7 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         SystemStats      = [ordered]@{}
         LbVservers       = @()
         ServiceGroups    = @()
+        Services         = @()
         Servers          = @()
         Monitors         = @()
         CsVservers       = @()
@@ -1154,6 +1155,7 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         AuthPolicies     = @()
         AuthPolicyLabels = @()
         NFactorChains    = [ordered]@{}
+        AaaNFactorChains = [ordered]@{}
         AppFwProfiles    = @()
         AppFwPolicies    = @()
         ResponderPolicies = @()
@@ -1267,6 +1269,7 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
     Set-CollectStatus "[$appName] Load balancing..." -Progress ($appBase + 6) -Sub $appHost
     $appData['LbVservers']  = @(Collect 'lbvserver'   'LB vservers')
     $appData['ServiceGroups'] = @(Collect 'servicegroup' 'Service groups')
+    $appData['Services']      = @(Collect 'service' 'Services')
     $appData['Servers']     = @(Collect 'server'       'Servers')
     $appData['Monitors']    = @(Collect 'lbmonitor'    'Monitors')
 
@@ -1293,6 +1296,17 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
             $lb | Add-Member -NotePropertyName 'ServiceGroupBindings' -NotePropertyValue @($bindings) -Force
         } catch {
             $lb | Add-Member -NotePropertyName 'ServiceGroupBindings' -NotePropertyValue @() -Force
+        }
+        # A vserver can also have standalone services bound directly, without a service group in
+        # between - LB-002 (no services bound) needs to see these too, or a vserver with only a
+        # directly-bound service false-positives as having nothing bound.
+        try {
+            $svcBindings = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'lbvserver_service_binding' `
+                -QueryArgs "args=name:$([uri]::EscapeDataString($lbName))"
+            $lb | Add-Member -NotePropertyName 'ServiceBindings' -NotePropertyValue @($svcBindings) -Force
+        } catch {
+            $lb | Add-Member -NotePropertyName 'ServiceBindings' -NotePropertyValue @() -Force
         }
         # WAF policy bindings on LB vserver
         try {
@@ -1640,6 +1654,21 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
             [void]$ancestorPath.Add("VS:$vsName")
             $appData['NFactorChains'][$apName] = @(Get-NFactorSteps -Resource 'authenticationvserver_authenticationpolicy_binding' `
                 -QueryArgs "args=name:$([uri]::EscapeDataString($vsName))" -PolicyField 'policy' `
+                -AncestorPath $ancestorPath -Depth 0)
+        }
+    }
+
+    # Same walk, but rooted directly at every standalone AAA vserver's own name - covers AAA
+    # vservers not referenced by any Gateway vserver's authnProfile, which NFactorChains above
+    # never reaches.
+    $appData['AaaNFactorChains'] = [ordered]@{}
+    foreach ($authv in $appData['AuthVservers']) {
+        $authVsName = Get-NitroProp $authv 'name'
+        if ($authVsName -and -not $appData['AaaNFactorChains'].Contains($authVsName)) {
+            $ancestorPath = [System.Collections.Generic.HashSet[string]]::new()
+            [void]$ancestorPath.Add("VS:$authVsName")
+            $appData['AaaNFactorChains'][$authVsName] = @(Get-NFactorSteps -Resource 'authenticationvserver_authenticationpolicy_binding' `
+                -QueryArgs "args=name:$([uri]::EscapeDataString($authVsName))" -PolicyField 'policy' `
                 -AncestorPath $ancestorPath -Depth 0)
         }
     }
