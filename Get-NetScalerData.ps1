@@ -1,5 +1,5 @@
 ﻿#Requires -Version 5.1
-# Version: 2026-08-03.2   (keep in lock-step with $script:CollectorVersion below and the published .version file)
+# Version: 2026-08-03.3   (keep in lock-step with $script:CollectorVersion below and the published .version file)
 <#
 .SYNOPSIS
     Collects Citrix NetScaler (ADC) configuration data across appliances and saves it as JSON.
@@ -83,7 +83,7 @@ param(
     [switch]$NoProtect
 )
 
-$script:CollectorVersion = '2026-08-03.2'
+$script:CollectorVersion = '2026-08-03.3'
 
 # Self-update source - the public euc-reports-collectors repo (same feed as the other collectors).
 $script:_manifestUrl   = 'https://raw.githubusercontent.com/virtualwebber/euc-reports-collectors/refs/heads/main/update-manifest.json'
@@ -1117,6 +1117,14 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         HaNode           = $null
         Features         = [ordered]@{}
         Modes            = [ordered]@{}
+        License          = [ordered]@{}
+        Interfaces       = @()
+        Vlans            = @()
+        Routes           = @()
+        GslbSites         = @()
+        GslbServices      = @()
+        GslbServiceGroups = @()
+        GslbVservers      = @()
         NsIps            = @()
         NtpServers       = @()
         SnmpCommunities  = @()
@@ -1227,6 +1235,34 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
         if ($ha -and $ha.Count -gt 0) { $appData['HaNode'] = $ha[0] }
     } catch { $appData['CollectionErrors']['hanode'] = $_.ToString() }
 
+    try {
+        $lic = Invoke-NitroGetSingle -Session $session -BaseUri $baseUri -Resource 'nslicense'
+        if ($lic) { $appData['License'] = $lic }
+    } catch { $appData['CollectionErrors']['nslicense'] = $_.ToString() }
+
+    # -- Network --
+    $appData['Interfaces'] = @(Collect 'interface' 'Interfaces')
+    $appData['Routes']     = @(Collect 'route'     'Static routes')
+    $appData['Vlans']      = @(Collect 'vlan'       'VLANs')
+
+    foreach ($vlan in $appData['Vlans']) {
+        $vlanId = $vlan.id
+        $bindings = [System.Collections.Generic.List[object]]::new()
+        try {
+            $ifBindings = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'vlan_interface_binding' `
+                -QueryArgs "args=id:$([uri]::EscapeDataString("$vlanId"))"
+            foreach ($b in $ifBindings) { [void]$bindings.Add([pscustomobject]@{ Type = 'Interface'; Value = $b.ifnum }) }
+        } catch {}
+        try {
+            $ipBindings = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'vlan_nsip_binding' `
+                -QueryArgs "args=id:$([uri]::EscapeDataString("$vlanId"))"
+            foreach ($b in $ipBindings) { [void]$bindings.Add([pscustomobject]@{ Type = 'IPAddress'; Value = $b.ipaddress }) }
+        } catch {}
+        $vlan | Add-Member -NotePropertyName 'Bindings' -NotePropertyValue @($bindings) -Force
+    }
+
     # -- Load Balancing ---
     Set-CollectStatus "[$appName] Load balancing..." -Progress ($appBase + 6) -Sub $appHost
     $appData['LbVservers']  = @(Collect 'lbvserver'   'LB vservers')
@@ -1275,6 +1311,47 @@ for ($ai = 0; $ai -lt $applianceDefs.Count; $ai++) {
             $lb | Add-Member -NotePropertyName 'ResponderPolicyBindings' -NotePropertyValue @($responderBindings) -Force
         } catch {
             $lb | Add-Member -NotePropertyName 'ResponderPolicyBindings' -NotePropertyValue @() -Force
+        }
+    }
+
+    # -- GSLB ---
+    Set-CollectStatus "[$appName] GSLB..." -Progress ($appBase + 8) -Sub $appHost
+    $appData['GslbSites']         = @(Collect 'gslbsite'         'GSLB sites')
+    $appData['GslbServices']      = @(Collect 'gslbservice'      'GSLB services')
+    $appData['GslbServiceGroups'] = @(Collect 'gslbservicegroup' 'GSLB service groups')
+    $appData['GslbVservers']      = @(Collect 'gslbvserver'      'GSLB vservers')
+
+    # Attach members to each GSLB service group
+    foreach ($gsg in $appData['GslbServiceGroups']) {
+        $gsgName = $gsg.servicegroupname
+        try {
+            $members = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'gslbservicegroup_gslbservicegroupmember_binding' `
+                -QueryArgs "args=servicegroupname:$([uri]::EscapeDataString($gsgName))"
+            $gsg | Add-Member -NotePropertyName 'Members' -NotePropertyValue @($members) -Force
+        } catch {
+            $gsg | Add-Member -NotePropertyName 'Members' -NotePropertyValue @() -Force
+        }
+    }
+
+    # Attach bound services and bound domains to each GSLB vserver
+    foreach ($gvs in $appData['GslbVservers']) {
+        $gvsName = $gvs.name
+        try {
+            $svcBindings = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'gslbvserver_gslbservice_binding' `
+                -QueryArgs "args=name:$([uri]::EscapeDataString($gvsName))"
+            $gvs | Add-Member -NotePropertyName 'BoundServices' -NotePropertyValue @($svcBindings) -Force
+        } catch {
+            $gvs | Add-Member -NotePropertyName 'BoundServices' -NotePropertyValue @() -Force
+        }
+        try {
+            $domBindings = Invoke-NitroGet -Session $session -BaseUri $baseUri `
+                -Resource 'gslbvserver_domain_binding' `
+                -QueryArgs "args=name:$([uri]::EscapeDataString($gvsName))"
+            $gvs | Add-Member -NotePropertyName 'BoundDomains' -NotePropertyValue @($domBindings) -Force
+        } catch {
+            $gvs | Add-Member -NotePropertyName 'BoundDomains' -NotePropertyValue @() -Force
         }
     }
 
